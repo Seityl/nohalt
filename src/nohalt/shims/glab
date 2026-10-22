@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+#
+# nohalt's `glab` (GitLab CLI) for agents: everything passes through except the
+# acts that accept work or declare it done -- the GitLab twin of the gh shim.
+#
+# Refused: merging, approving or closing merge requests; closing, deleting or
+# moving issues (a closed issue is the definition of done, which only a merge
+# may produce); releases; deleting or archiving the repository; and the REST
+# equivalents through `glab api`. Opening merge requests, reading, commenting
+# and editing descriptions are the agent's job and pass through.
+#
+# A speed bump, not a wall: protected branches on GitLab are the hard control.
+# The obvious paths are blocked and the rest is logged.
+set -uo pipefail
+
+REAL="${NOHALT_REAL_GLAB:-}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+# Never ourselves: a shim that resolves itself as "the real binary" re-execs forever.
+if [[ -z "$REAL" || "$(readlink -f "$REAL" 2>/dev/null)" == "$SELF" ]]; then
+  REAL=""
+  IFS=: read -ra dirs <<<"$PATH"
+  for d in "${dirs[@]}"; do
+    [[ -x "$d/glab" && "$(readlink -f "$d/glab")" != "$SELF" ]] && { REAL="$d/glab"; break; }
+  done
+fi
+[[ -n "$REAL" ]] || { echo "glab (nohalt guard): the real glab was not found" >&2; exit 127; }
+LOG="${NOHALT_GUARD_LOG:-/dev/null}"
+
+note() { printf '%s  %s  %s\n' "$(date '+%F %T')" "$1" "${*:2}" >>"$LOG" 2>/dev/null || true; }
+
+refuse() {
+  note "REFUSED" "glab $*"
+  cat >&2 <<'WHY'
+
+glab (nohalt guard): refused.
+
+Merging, approving, closing and releasing are not yours. Green CI means your
+work is ready, not that it is accepted -- and a closed issue is the definition
+of done, which only a merge may produce.
+
+Instead: make sure the merge request description says what was wrong, what
+changed and how it was verified with real output, comment on the issue, and
+stop. If you believe this is wrong for your change, say so in the description.
+Do not go around this through the API: attempts are logged.
+WHY
+  exit 1
+}
+
+case "${1:-}" in
+  mr)
+    case "${2:-}" in merge | close | approve | delete) refuse "$@" ;; esac ;;
+  issue)
+    case "${2:-}" in close | delete | move) refuse "$@" ;; esac ;;
+  release) refuse "$@" ;;
+  repo)
+    case "${2:-}" in delete | archive | transfer) refuse "$@" ;; esac ;;
+  api)
+    method=GET
+    for ((i = 2; i <= $#; i++)); do
+      a="${!i}"
+      case "$a" in
+        */merge | */merge\?* | */approve | */approve\?*) refuse "$@" ;;
+        state_event=close | state_event=closed) refuse "$@" ;;
+        -X | --method) j=$((i + 1)); method="${!j:-}" ;;
+        -X*) method="${a#-X}" ;;
+        --method=*) method="${a#--method=}" ;;
+        */repository/tags* | */releases*) [[ "$method" != GET ]] && refuse "$@" ;;
+      esac
+    done
+    ;;
+  auth)
+    [[ "${2:-}" == status && " $* " == *" --show-token "* ]] && note "TOKEN-TAKEN" "glab auth status --show-token" ;;
+  config)
+    [[ "${2:-}" == get && "${3:-}" == token ]] && note "TOKEN-TAKEN" "glab config get token" ;;
+esac
+
+exec "$REAL" "$@"

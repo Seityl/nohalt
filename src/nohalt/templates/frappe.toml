@@ -1,0 +1,54 @@
+# nohalt.toml for a Frappe / ERPNext app on a shared bench.
+# Reference: docs/CONFIGURATION.md and docs/STACKS.md
+
+[project]
+repo = "OWNER/REPO"
+# forge = "github"           # github | gitlab
+# forge_url = ""             # GitLab only: self-hosted URL (default https://gitlab.com)
+path = "/path/to/frappe-bench/apps/myapp"   # the app's clone inside the bench
+base_branch = "develop"
+state_dir = "/path/to/nohalt-state/myapp"
+worktrees = "/path/to/nohalt-work/myapp"    # NOT inside the bench's apps/ directory
+shared_paths = ["myapp/frontend/node_modules"]
+branch_prefixes = { bug = "fix" }
+
+[queue]
+file = "queue.txt"
+blocked_label = "nohalt-blocked"
+held_labels = ["needs-human"]
+
+[agents]
+max_parallel = 3
+min_free_mb = 2500
+phase_timeout = "4h"
+max_attempts = 2
+# copy_files = ["~/.local/share/opencode/auth.json"]
+
+[models]
+default = "opencode:anthropic/claude-sonnet-4-5"
+
+[stack]
+name = "frappe"
+bench = "/path/to/frappe-bench"
+app = "myapp"
+# Agent test sites: copies made for agents only. One verification per site at
+# a time; with several sites, several agents verify at once.
+sites = ["agents1.test", "agents2.test", "agents3.test"]
+
+[verify]
+# The bench builds assets per app for every site at once, and a site wears the
+# schema of whichever branch migrated it last -- hence the lock and the pool.
+
+[integrate]
+mode = "train"
+required_checks = ["build", "tests"]
+# [integrate.train]
+# version_files = [{ path = "myapp/__init__.py", pattern = '__version__ = "([^"]+)"' }]
+# Merge drivers for patches.txt, DocType JSON, fixtures and package.json are
+# on by default for this stack; add your own:
+# [integrate.mergers]
+# "myapp/translations/*.csv" = "keep_both_lines"
+
+[prompt]
+template = "builtin:core"
+extra = []

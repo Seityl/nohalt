@@ -1,0 +1,20 @@
+name: Feature request
+description: A mechanism nohalt should have
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What went wrong (or would go wrong) when running agents unattended? Incidents are the best motivation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed mechanism
+      description: How should nohalt handle it? A rule with no mechanism behind it is a preference.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

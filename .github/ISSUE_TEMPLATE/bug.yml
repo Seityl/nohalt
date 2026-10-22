@@ -1,0 +1,45 @@
+name: Bug report
+description: Something nohalt did (or did not do) that it should not have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Do not paste tokens, hostnames or private repository names** -- redact them.
+        Security problems: please use a private security advisory instead (see SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did nohalt do, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The relevant part of nohalt.toml (redacted), the queue, and the steps.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: From `.nohalt/logs/nohalt.log` and the issue's record in `.nohalt/issues/<n>.json` (redacted).
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: nohalt version
+      placeholder: "nohalt --version"
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent
+      options: [opencode, claude-code, command, other]
+  - type: dropdown
+    id: stack
+    attributes:
+      label: Stack
+      options: [generic, frappe]

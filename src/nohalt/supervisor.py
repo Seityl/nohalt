@@ -1,0 +1,829 @@
+"""The supervisor: one loop that keeps every issue moving until the forge closes it.
+
+Each tick:
+
+1. **reap**   -- agents that exited, ran out of time, or hung are judged;
+2. **watch**  -- finished agents' pull requests are followed through CI; a red
+                or conflicting PR is handed back to an agent;
+3. **integrate** -- green PRs are merged by the integrator (never by agents);
+4. **launch** -- queued issues whose dependencies are closed get an agent, as
+                slots, memory and a model that answers allow;
+5. **budget** -- paid-API spend is checked.
+
+Rules that hold throughout:
+
+* An issue is done when the forge says CLOSED. Nothing else -- not an exit
+  code, not an agent's summary -- is evidence.
+* A failure of the model endpoint is not an attempt on the issue.
+* A forge call that failed is "unknown", never "no PR" or "not found".
+* Work is never discarded: worktrees are rescued before removal.
+* Agents run in their own sessions. Killing or restarting the supervisor does
+  not touch them; a new supervisor adopts them from their records.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import agents, budget, queue, shims, stacks
+from . import forge as forge_mod
+from . import prompt as prompt_mod
+from .config import Config
+from .forge import CLOSED, MISSING, UNKNOWN, Forge, ForgeError, Issue, PullRequest
+from .forge import verdict as ci_verdict
+from .models import Router
+from .state import ACTIVE, BLOCKED, DONE, QUEUED, READY, RUNNING, WAITING_CI, FileLock, IssueRecord, StateStore
+from .util import descendants, kill_tree, mem_available_mb, now, pid_alive, tail
+from .worktree import GitError, Worktrees
+
+EXITED = "exited"  # agent gone; verdict pending (the forge could not be asked)
+
+# Processes that are the agent itself rather than a command it is running: the
+# agent CLIs by name, or a node/bun runtime whose command line names one of them.
+AGENT_NAMES = ("opencode", "claude")
+AGENT_RUNTIMES = {"node", "bun"}
+
+
+def _is_agent_process(pid: int) -> bool:
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return False
+    if comm.lstrip(".") in AGENT_NAMES:
+        return True
+    if comm in AGENT_RUNTIMES:
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            return False
+        return any(name in cmd for name in AGENT_NAMES)
+    return False
+
+
+def _pid_start(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return ""
+
+
+@dataclass
+class TickReport:
+    launched: list[int] = field(default_factory=list)
+    finished: list[int] = field(default_factory=list)
+    running: list[int] = field(default_factory=list)
+    waiting: list[str] = field(default_factory=list)
+    blocked: list[int] = field(default_factory=list)
+    open_: int = 0
+    complete: bool = False
+
+
+class Supervisor:
+    def __init__(
+        self,
+        cfg: Config,
+        forge: Forge | None = None,
+        *,
+        say: Callable[[str], None] | None = None,
+        router: Router | None = None,
+    ):
+        self.cfg = cfg
+        self.state = StateStore(cfg.state_dir)
+        self.forge: Forge = forge or forge_mod.make(cfg.project)
+        self.trees = Worktrees(cfg)
+        self.stack = stacks.get(cfg)
+        self.router = router or Router(cfg, self.state)
+        self._say = say
+        self._procs: dict[int, subprocess.Popen[bytes]] = {}
+        self._issues: dict[int, tuple[float, Issue]] = {}
+        self._pulls: list[PullRequest] | None = None
+        self._pulls_ok = False
+        self.dry_run = False
+        from .integrate import make as make_integrator
+
+        self.integrator = make_integrator(self)
+
+    # -- forge vocabulary ----------------------------------------------------------------------
+    def pr(self, n: int) -> str:
+        """'PR #5' on GitHub, 'MR !5' on GitLab (where '#5' would link to an issue)."""
+        return f"MR !{n}" if self.cfg.project.forge == "gitlab" else f"PR #{n}"
+
+    def pr_long(self, n: int) -> str:
+        return f"merge request !{n}" if self.cfg.project.forge == "gitlab" else f"pull request #{n}"
+
+    # -- output ------------------------------------------------------------------------
+    def say(self, text: str, **fields: object) -> None:
+        self.state.log(text, **fields)
+        if self._say:
+            self._say(text)
+
+    # -- forge reads, cached per tick ---------------------------------------------------------
+    def issue(self, n: int, fresh: bool = False) -> Issue:
+        hit = self._issues.get(n)
+        if hit and not fresh:
+            ttl = 1800 if hit[1].state in (CLOSED, MISSING) else max(60, self.cfg.queue.tick * 2)
+            if now() - hit[0] < ttl:
+                return hit[1]
+        try:
+            iss = self.forge.issue(n)
+        except ForgeError as e:
+            self.state.log(f"#{n}: forge unreachable ({e}); state unknown")
+            return Issue(n, UNKNOWN)
+        self._issues[n] = (now(), iss)
+        return iss
+
+    def pulls(self) -> list[PullRequest] | None:
+        """Open PRs, listed once per tick. None when the forge could not be asked."""
+        if self._pulls is None and not self._pulls_ok:
+            try:
+                self._pulls = self.forge.open_pulls()
+            except ForgeError as e:
+                self.state.log(f"cannot list pull requests: {e}")
+                self._pulls = None
+            self._pulls_ok = True
+        return self._pulls
+
+    def pr_for(self, rec: IssueRecord) -> tuple[bool, PullRequest | None]:
+        """(known, the issue's open PR or None). Not known: the forge could not be asked."""
+        pulls = self.pulls()
+        if pulls is None:
+            return False, None
+        if rec.pr:
+            for p in pulls:
+                if p.number == rec.pr:
+                    return True, p
+        for p in pulls:
+            if rec.branch and p.head_ref == rec.branch:
+                return True, p
+        prefix = f"{rec.issue}-"
+        release = self.cfg.integrate.train.branch_prefix
+        for p in pulls:
+            mine = p.head_ref.split("/", 1)[-1].startswith(prefix) or p.closes() == rec.issue
+            if mine and not p.head_ref.startswith(release):
+                return True, p
+        return True, None
+
+    # -- the loop ------------------------------------------------------------------------------
+    def run(self, *, once: bool = False, exit_when_done: bool = False) -> int:
+        lock = FileLock(self.state.root / "supervisor.lock")
+        if not lock.acquire(blocking=False):
+            print(f"nohalt: a supervisor is already running (pid {lock.held_by()})", file=sys.stderr)
+            return 1
+        stop = {"now": False}
+
+        def on_signal(signum: int, _frame: object) -> None:
+            stop["now"] = True
+
+        signal.signal(signal.SIGTERM, on_signal)
+        signal.signal(signal.SIGINT, on_signal)
+        shims.install(self.state.bin_dir)
+        self.say(
+            f"=== nohalt supervising {self.cfg.project.repo} (base {self.cfg.project.base_branch}, "
+            f"up to {self.cfg.agents.max_parallel} agents, integrate={self.cfg.integrate.mode})"
+        )
+        try:
+            while not stop["now"]:
+                report = self.tick()
+                if self.state.has("STOP") and not report.running:
+                    self.state.clear_flag("STOP")
+                    self.say("=== stopped between issues (STOP)")
+                    return 0
+                if report.complete and exit_when_done:
+                    self.say("=== complete: every queued issue is closed")
+                    return 0
+                if once:
+                    return 0
+                wait = (
+                    self.cfg.queue.poll_when_idle
+                    if (
+                        report.complete
+                        or (not report.running and not report.launched and report.open_ and not self._has_waiting())
+                    )
+                    else self.cfg.queue.tick
+                )
+                for _ in range(int(wait)):
+                    if stop["now"] or self.state.has("WAKE"):
+                        self.state.clear_flag("WAKE")
+                        break
+                    time.sleep(1)
+        finally:
+            lock.release()
+        self.say("=== supervisor exiting; running agents continue and will be adopted on restart")
+        return 0
+
+    def _has_waiting(self) -> bool:
+        return any(r.status in (WAITING_CI, READY, EXITED) for r in self.state.all())
+
+    def tick(self) -> TickReport:
+        self._pulls, self._pulls_ok = None, False
+        report = TickReport()
+        records = {r.issue: r for r in self.state.all()}
+        for rec in records.values():
+            if rec.status in (RUNNING, EXITED):
+                self._reap(rec, report)
+        for rec in self.state.all():
+            if rec.status in (WAITING_CI, READY):
+                self._watch(rec, report)
+        if self.cfg.integrate.mode != "none" and not self.dry_run:
+            try:
+                self.integrator.tick()
+            except (ForgeError, GitError) as e:
+                self.say(f"integrator: {e}")
+        self._launch(report)
+        if self.cfg.budget.enabled and not self.dry_run:
+            self._budget()
+        report.running = [r.issue for r in self.state.all() if r.status == RUNNING]
+        self._snapshot(report)
+        return report
+
+    # -- 1. reap --------------------------------------------------------------------------------
+    def _alive(self, rec: IssueRecord) -> bool:
+        proc = self._procs.get(rec.issue)
+        if proc is not None and proc.poll() is not None:
+            self._procs.pop(rec.issue, None)
+            return False
+        if not pid_alive(rec.pid):
+            return False
+        # A recycled pid is not our agent.
+        start = self.state.load("pids.json", {}).get(str(rec.issue))
+        return not start or start == _pid_start(rec.pid)
+
+    def timeout_for(self, issue: Issue) -> int:
+        a = self.cfg.agents
+        return a.long_timeout if a.long_labels and issue.has_label(*a.long_labels) else a.phase_timeout
+
+    def _busy(self, pid: int) -> bool:
+        """Is the agent running a command of its own (a test, a sleep while it polls CI)?
+
+        The agent is its root process plus any agent CLI process (or node/bun
+        process running one) whose parent is part of the agent. Any other
+        descendant -- a shell, a test runner, even `python -m pytest` that a
+        shell exec'd into -- is a command the agent is running.
+        """
+        agent = {pid}
+        for p in descendants(pid):  # parents always come before their children
+            try:
+                ppid = int(Path(f"/proc/{p}/stat").read_text().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            if ppid in agent and _is_agent_process(p):
+                agent.add(p)
+            else:
+                return True
+        return False
+
+    def _reap(self, rec: IssueRecord, report: TickReport) -> None:
+        if rec.status == RUNNING and self._alive(rec):
+            elapsed = now() - rec.started_at
+            issue = self.issue(rec.issue)
+            limit = self.timeout_for(issue)
+            if elapsed > limit:
+                self._kill(rec, "timeout", f"ran out of time ({limit // 60} min)")
+            else:
+                log = Path(rec.log)
+                idle = now() - log.stat().st_mtime if log.exists() else 0
+                if idle > self.cfg.agents.hung_after and not self._busy(rec.pid):
+                    # Waiting on a model reply that will not come.
+                    self._kill(rec, "hung", f"no output for {int(idle // 60)} min and no command running")
+                else:
+                    return
+        self._judge(rec, report)
+
+    def _kill(self, rec: IssueRecord, reason: str, text: str) -> None:
+        rec.last_exit = reason
+        rec.event(f"stopped: {text}")
+        self.state.put(rec)
+        self.say(f"#{rec.issue}: stopping the agent -- {text}")
+        kill_tree(rec.pid, signal.SIGTERM)
+        for _ in range(20):
+            if not pid_alive(rec.pid):
+                break
+            time.sleep(0.5)
+        else:
+            kill_tree(rec.pid, signal.SIGKILL)
+        proc = self._procs.pop(rec.issue, None)
+        if proc:
+            proc.poll()
+
+    def _judge(self, rec: IssueRecord, report: TickReport) -> None:
+        """The agent is gone. Decide what that means -- asking the forge, not the agent."""
+        killed = rec.last_exit if rec.last_exit in ("timeout", "hung", "handover", "stopped") else ""
+        issue = self.issue(rec.issue, fresh=True)
+        if issue.state == UNKNOWN:
+            if rec.status != EXITED:
+                rec.status = EXITED
+                self.state.put(rec)
+            return
+        if issue.state in (CLOSED, MISSING):
+            self._done(rec, report, "closed" if issue.state == CLOSED else "no longer exists")
+            return
+        a = self.cfg.agents
+        log_tail = tail(Path(rec.log), 6000)
+        agent = self._agent(rec.model)
+        rec.pid = 0
+
+        if killed == "handover":
+            return self._requeue(rec, "moved to another model by the budget guard", resume=True)
+        if killed == "stopped":
+            return self._requeue(rec, "the supervisor was stopped", resume=True)
+        if agent and agent.usage_limited(log_tail):
+            self.router.prober.mark_limited(rec.model)
+            return self._requeue(rec, "the plan's usage limit was reached", resume=True, delay=900)
+        if not killed and agent and agent.provider_failed(log_tail):
+            rec.provider_retries += 1
+            if rec.provider_retries > a.provider_retries:
+                last = [ln for ln in log_tail.splitlines() if "rror" in ln][-1:]
+                return self._block(
+                    rec,
+                    f"the model endpoint failed {rec.provider_retries} times on this issue "
+                    f"(last: {last[0].strip()[:200] if last else '?'}); this was not the issue's fault",
+                )
+            return self._requeue(
+                rec,
+                f"model endpoint error, not counted as an attempt (retry {rec.provider_retries}/{a.provider_retries})",
+                resume=True,
+                delay=a.provider_backoff * rec.provider_retries,
+            )
+        if killed == "timeout":
+            rec.timeouts += 1
+            if rec.timeouts <= a.timeout_continues:
+                return self._requeue(
+                    rec, f"ran out of time; continuing in the same worktree ({rec.timeouts}/{a.timeout_continues})", resume=True
+                )
+        if killed == "hung":
+            rec.revivals += 1
+            if rec.revivals <= a.revive_limit:
+                return self._requeue(rec, f"hung; restarted ({rec.revivals}/{a.revive_limit})", resume=True)
+
+        known, pr = self.pr_for(rec)
+        if not known:
+            rec.status = EXITED
+            self.state.put(rec)
+            return
+        if pr:
+            rec.pr, rec.pr_sha = pr.number, pr.head_sha
+            rec.status = WAITING_CI
+            rec.last_exit = "pr"
+            rec.event(f"agent finished with {self.pr(pr.number)}")
+            self.state.put(rec)
+            self.say(f"#{rec.issue}: agent finished; {self.pr(pr.number)} goes through CI")
+            return
+        rec.attempts += 1
+        if rec.attempts >= a.max_attempts:
+            return self._block(rec, f"still open after {rec.attempts} attempt(s), with no pull request")
+        # A grace period: an agent that stopped to ask a question may get an answer.
+        self._requeue(
+            rec,
+            f"stopped without closing the issue or opening a PR (attempt {rec.attempts}/{a.max_attempts})",
+            resume=True,
+            delay=a.revive_grace,
+            note="You stopped without opening a pull request. If you are blocked, say exactly why in a "
+            "comment on the issue and stop; otherwise continue the work and open the PR.",
+        )
+
+    # -- 2. watch PRs through CI -------------------------------------------------------------------------
+    def _watch(self, rec: IssueRecord, report: TickReport) -> None:
+        issue = self.issue(rec.issue, fresh=rec.status == READY)
+        if issue.state in (CLOSED, MISSING):
+            self._done(rec, report, "closed")
+            return
+        if issue.state == UNKNOWN:
+            return
+        known, pr = self.pr_for(rec)
+        if not known:
+            return
+        if pr is None:
+            merged = False
+            if rec.pr:
+                try:
+                    merged = self.forge.pull(rec.pr).merged
+                except ForgeError:
+                    return
+            if merged:
+                # Merged but the issue is open: closing keywords act only on the
+                # default branch, or the body lacked one. The merge finished it.
+                from .integrate.common import close_merged
+
+                close_merged(self, [rec.issue], f"{self.pr(rec.pr)}")
+                if self.issue(rec.issue, fresh=True).state == CLOSED:
+                    self._done(rec, report, f"closed ({self.pr(rec.pr)} merged)")
+                return
+            return self._requeue(
+                rec,
+                f"{self.pr(rec.pr)} was closed without merging",
+                resume=True,
+                note=f"Your {self.pr_long(rec.pr)} was closed without being merged. Read its "
+                "comments, then continue: fix what was asked and open a new PR.",
+            )
+        if pr.head_sha != rec.pr_sha:
+            rec.pr_sha = pr.head_sha
+            rec.status = WAITING_CI
+            self.state.put(rec)
+        try:
+            checks = self.forge.checks(pr.head_sha)
+        except ForgeError:
+            return
+        v = ci_verdict(checks, self.cfg.integrate.required_checks)
+        if v == forge_mod.base.RED:
+            if pr.head_sha in rec.swept:
+                return
+            bad = [
+                c
+                for c in checks
+                if c.status == "completed" and c.conclusion not in ("success", "skipped", "neutral", "cancelled")
+            ]
+            detail = "\n".join(f"- {c.name}: {c.conclusion} {c.url}" for c in bad[:10])
+            return self._hand_back(
+                rec,
+                pr,
+                "CI is red",
+                f"CI is red on your {self.pr_long(pr.number)} "
+                f"(head {pr.head_sha[:8]}):\n{detail}\n\nRead the failure, check whether it "
+                f"also fails on {self.cfg.project.base_branch}, fix what is yours, run the "
+                "tests you touched, push, and stop once pushed.",
+            )
+        # A conflicted PR may never get CI at all (the forge does not run it), so
+        # mergeability is checked when checks are green or have not started.
+        if v == forge_mod.base.GREEN or not checks:
+            if pr.mergeable is None:
+                try:
+                    pr = self.forge.pull(pr.number)
+                except ForgeError:
+                    return
+            if pr.mergeable is False:
+                if pr.head_sha in rec.swept:
+                    return
+                return self._hand_back(
+                    rec,
+                    pr,
+                    "conflicts with the base branch",
+                    f"Your {self.pr_long(pr.number)} conflicts with "
+                    f"`{self.cfg.project.base_branch}`. Fetch and merge "
+                    f"`origin/{self.cfg.project.base_branch}` into your branch, keeping both "
+                    "sides' behaviour, re-run the tests you touched, push, and stop.",
+                )
+        if v == forge_mod.base.GREEN and rec.status != READY:
+            rec.status = READY
+            rec.event(f"{self.pr(pr.number)} green on {pr.head_sha[:8]}")
+            self.state.put(rec)
+            self.say(f"#{rec.issue}: {self.pr(pr.number)} green -- ready to integrate")
+
+    def _hand_back(self, rec: IssueRecord, pr: PullRequest, why: str, note: str) -> None:
+        rec.swept.append(pr.head_sha)
+        del rec.swept[:-20]
+        rec.ci_rounds += 1
+        if rec.ci_rounds > self.cfg.agents.ci_rounds:
+            return self._block(rec, f"{self.pr(pr.number)}: {why}, after {rec.ci_rounds - 1} rounds handed back")
+        try:
+            self.forge.comment(rec.issue, f"**nohalt:** {note}")
+        except ForgeError:
+            pass
+        self._requeue(
+            rec, f"{self.pr(pr.number)}: {why}; handed back ({rec.ci_rounds}/{self.cfg.agents.ci_rounds})", resume=True, note=note
+        )
+
+    def hand_back(self, issue: int, why: str, note: str) -> None:
+        """Called by the integrator: send an issue back to an agent with a note."""
+        rec = self.state.get(issue)
+        if rec.status == RUNNING:
+            try:
+                self.forge.comment(issue, f"**nohalt:** {note}")
+            except ForgeError:
+                pass
+            return
+        rec.ci_rounds += 1
+        if rec.ci_rounds > self.cfg.agents.ci_rounds:
+            return self._block(rec, f"{why}, after {rec.ci_rounds - 1} rounds handed back")
+        try:
+            self.forge.comment(issue, f"**nohalt:** {note}")
+        except ForgeError:
+            pass
+        self._requeue(rec, why, resume=True, note=note, fresh=True)
+
+    # -- record transitions ---------------------------------------------------------------------------------
+    def _requeue(
+        self, rec: IssueRecord, why: str, *, resume: bool, delay: float = 0, note: str = "", fresh: bool = False
+    ) -> None:
+        rec.status = QUEUED
+        rec.pid = 0
+        rec.resume = resume and not fresh
+        rec.fresh = fresh
+        rec.not_before = now() + delay
+        rec.note = note or why
+        rec.last_exit = ""
+        rec.event(why)
+        self.state.put(rec)
+        self.say(f"#{rec.issue}: {why}" + (f"; again in {int(delay // 60)} min" if delay >= 60 else ""))
+
+    def _block(self, rec: IssueRecord, reason: str) -> None:
+        label = self.cfg.queue.blocked_label
+        rec.status = BLOCKED
+        rec.pid = 0
+        rec.blocked_reason = reason
+        rec.event(f"blocked: {reason}")
+        self.state.put(rec)
+        self.say(f"#{rec.issue} -> {label}: {reason}")
+        if self.dry_run:
+            return
+        try:
+            self.forge.add_label(rec.issue, label)
+            self.forge.comment(
+                rec.issue,
+                f"**nohalt:** skipped -- {reason}.\n\nThe agent's log is on the runner host at "
+                f"`{rec.log}`. Read the agent's own comments above for where it stopped. Work that does not "
+                f"depend on this issue continues. **Remove the `{label}` label to have nohalt try again.**",
+            )
+            rec.labelled = True
+            self.state.put(rec)
+            self._issues.pop(rec.issue, None)
+        except ForgeError as e:
+            self.say(f"#{rec.issue}: could not label it blocked yet ({e}); will retry")
+
+    def _done(self, rec: IssueRecord, report: TickReport, how: str) -> None:
+        if rec.status == RUNNING and self._alive(rec):
+            self._kill(rec, "done", "the issue is closed")
+        rec.status = DONE
+        rec.pid = 0
+        rec.event(how)
+        self.state.put(rec)
+        report.finished.append(rec.issue)
+        self.say(f"#{rec.issue}: {how} -- done")
+        if self.dry_run:
+            return
+        try:
+            rescued = self.trees.remove(rec.issue)
+            if rescued:
+                self.say(f"#{rec.issue}: uncommitted work kept on branch {rescued}")
+        except GitError as e:
+            self.say(f"#{rec.issue}: worktree not removed: {e}")
+        shutil.rmtree(self.state.agent_data / str(rec.issue), ignore_errors=True)
+        self.router.unpin(rec.issue)
+
+    # -- 4. launch ---------------------------------------------------------------------------------------
+    def _pool_of(self, model: str) -> str:
+        for prefix in sorted(self.cfg.agents.pools, key=len, reverse=True):
+            if model.startswith(prefix):
+                return prefix
+        return ""
+
+    def _cap(self, pool: str) -> int:
+        override = self.state.load("caps.json", {})
+        if pool in override:
+            return int(override[pool])
+        return self.cfg.agents.pools[pool] if pool else self.cfg.agents.max_parallel
+
+    def _launch(self, report: TickReport) -> None:
+        try:
+            entries = queue.load(self.cfg.queue_file)
+        except queue.QueueError as e:
+            self.say(f"queue: {e}")
+            return
+        stopping = self.state.has("STOP") or self.state.has("PAUSE")
+        records = {r.issue: r for r in self.state.all()}
+        in_use: dict[str, int] = {}
+        for r in records.values():
+            if r.status == RUNNING:
+                p = self._pool_of(r.model)
+                in_use[p] = in_use.get(p, 0) + 1
+
+        open_count = 0
+        for entry in entries:
+            rec = records.get(entry.issue) or IssueRecord(issue=entry.issue)
+            if rec.status == DONE:
+                continue
+            issue = self.issue(entry.issue)
+            if issue.state == MISSING:
+                if rec.status != DONE:
+                    rec.status = DONE
+                    rec.event("does not exist on the forge; dropped")
+                    self.state.put(rec)
+                    self.say(f"#{entry.issue} does not exist -- dropped from the queue")
+                continue
+            if issue.state == CLOSED:
+                if rec.status not in ACTIVE:
+                    self._done(rec, report, "closed")
+                continue
+            open_count += 1
+            if issue.state == UNKNOWN:
+                continue
+            labelled = issue.has_label(self.cfg.queue.blocked_label)
+            if rec.status == BLOCKED:
+                if labelled:
+                    report.blocked.append(entry.issue)
+                    continue
+                if not rec.labelled and not self.dry_run:
+                    # Labelling failed earlier: try again rather than read its absence as an unblock.
+                    self._block(rec, rec.blocked_reason)
+                    report.blocked.append(entry.issue)
+                    continue
+                rec.attempts = rec.provider_retries = rec.ci_rounds = rec.timeouts = rec.revivals = 0
+                rec.status, rec.resume, rec.not_before, rec.labelled = QUEUED, True, 0, False
+                rec.note = "A human removed the blocked label: try again."
+                rec.event("unblocked by a human")
+                self.state.put(rec)
+                self.say(f"#{entry.issue}: unblocked by a human -- back in the queue")
+            elif labelled:
+                rec.status = BLOCKED
+                rec.event("labelled blocked by a human")
+                rec.labelled = True
+                self.state.put(rec)
+                report.blocked.append(entry.issue)
+                continue
+            if rec.status in ACTIVE or rec.status == EXITED:
+                continue
+            if issue.has_label(*self.cfg.queue.held_labels):
+                report.waiting.append(f"#{entry.issue}(held)")
+                continue
+            pending = [d for d in entry.deps if self.issue(d).state != CLOSED]
+            if pending:
+                report.waiting.append(f"#{entry.issue}<-{','.join('#' + str(d) for d in pending)}")
+                continue
+            if rec.not_before > now() or stopping:
+                continue
+            model, _ = self.router.wanted(issue)
+            pool = self._pool_of(model)
+            if in_use.get(pool, 0) >= self._cap(pool):
+                continue
+            if self.dry_run:
+                report.launched.append(entry.issue)
+                in_use[pool] = in_use.get(pool, 0) + 1
+                continue
+            free = mem_available_mb()
+            if free is not None and free < self.cfg.agents.min_free_mb:
+                self.state.log(f"#{entry.issue} waiting: {free} MB available, need {self.cfg.agents.min_free_mb}")
+                break
+            chosen = self.router.choose(issue)
+            if not chosen:
+                self.state.log(f"#{entry.issue} waiting: {model} is not answering and no fallback is")
+                continue
+            try:
+                self.launch(rec, issue, chosen)
+            except (GitError, prompt_mod.PromptError, OSError, ValueError) as e:
+                rec.not_before = now() + 600
+                rec.event(f"launch failed: {e}")
+                self.state.put(rec)
+                self.say(f"#{entry.issue}: launch failed: {e}")
+                continue
+            report.launched.append(entry.issue)
+            p2 = self._pool_of(chosen)
+            in_use[p2] = in_use.get(p2, 0) + 1
+        report.open_ = open_count
+        report.complete = open_count == 0 and not any(r.status in ACTIVE for r in self.state.all())
+
+    def _agent(self, model: str) -> agents.Agent | None:
+        if not model:
+            return None
+        name, _ = agents.split_model(model)
+        return agents.get(name, self.cfg.agents.options.get(name))
+
+    def render_prompt(self, rec: IssueRecord, issue: Issue, branch: str, tree: Path) -> str:
+        text = prompt_mod.template(self.cfg, self.stack.prompt_addendum)
+        values = prompt_mod.values(self.cfg, issue=issue.number, title=issue.title, branch=branch, worktree=tree)
+        body = prompt_mod.render(text, values)
+        if self.cfg.prompt.inline_issue:
+            try:
+                body += f"\n## The issue, as it read when you were launched\n\n{self.forge.issue_text(issue.number)}\n"
+            except ForgeError as e:
+                self.state.log(f"#{issue.number}: could not inline the issue text ({e})")
+        if rec.note:
+            body += f"\n## Note from the supervisor\n\n{rec.note}\n"
+        return body
+
+    def launch(self, rec: IssueRecord, issue: Issue, model: str) -> None:
+        name, mid = agents.split_model(model)
+        agent = agents.get(name, self.cfg.agents.options.get(name))
+        branch = rec.branch or self.trees.branch_for(issue.number, issue.title, issue.labels)
+        tree = self.trees.prepare(issue.number, branch)
+        data_dir = self.state.agent_data / str(issue.number)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        # Credentials the agent needs in its private data dir (opencode keeps
+        # them under <data>/opencode/).
+        for f in self.cfg.agents.copy_files:
+            src = Path(f).expanduser()
+            dst = data_dir / ("opencode" if name == "opencode" else "") / src.name
+            if src.exists() and not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+
+        resume = rec.resume and not rec.fresh and model == rec.model and rec.started_at > 0
+        if resume:
+            text = agents.RESUME_PROMPT.format(why=rec.note or "restarted")
+            if rec.note:
+                text += f"\n\nNote from the supervisor: {rec.note}"
+        else:
+            text = self.render_prompt(rec, issue, branch, tree)
+        title = f"{self.cfg.agents.title_prefix} #{issue.number}"
+        spec = agent.launch(mid, text, title=title, resume=resume, data_dir=data_dir)
+
+        env = dict(os.environ)
+        for k in spec.unset_env:
+            env.pop(k, None)
+        # The real binaries are resolved BEFORE the shim directory goes first
+        # on PATH, or a shim can find itself and loop forever.
+        env.update(
+            {
+                "NOHALT_REAL_GH": shims.real("gh", env.get("PATH")),
+                "NOHALT_REAL_GIT": shims.real("git", env.get("PATH")),
+                "NOHALT_REAL_GLAB": shims.real("glab", env.get("PATH")),
+                "NOHALT_GUARD_LOG": str(self.state.logs_dir / "guard.log"),
+                "NOHALT_BASE_BRANCH": self.cfg.project.base_branch,
+                "NOHALT_ISSUE": str(issue.number),
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+        if self.cfg.project.forge == "gitlab" and self.cfg.project.forge_url:
+            env.setdefault("GITLAB_HOST", self.cfg.project.forge_url)
+        env.update(spec.env)
+        env["PATH"] = f"{shims.install(self.state.bin_dir)}:{env.get('PATH', '')}"
+
+        log = self.state.issue_log(issue.number)
+        self._rotate(log)
+        with open(log, "ab") as out:
+            out.write(f"\n--- nohalt launch {time.strftime('%F %T')} model={model} resume={resume} ---\n".encode())
+            out.flush()
+            proc = subprocess.Popen(
+                spec.argv,
+                cwd=tree,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        self._procs[issue.number] = proc
+        pids = self.state.load("pids.json", {})
+        pids[str(issue.number)] = _pid_start(proc.pid)
+        self.state.save("pids.json", pids)
+
+        rec.status, rec.pid, rec.model, rec.started_at = RUNNING, proc.pid, model, now()
+        rec.branch, rec.worktree, rec.log = branch, str(tree), str(log)
+        rec.resume = rec.fresh = False
+        rec.note = ""
+        rec.last_exit = ""
+        rec.event(f"launched on {model}" + (" (resumed)" if resume else ""))
+        self.state.put(rec)
+        self.say(f"#{issue.number}: agent launched on {model} in {tree} ({branch})" + (" -- resumed" if resume else ""))
+
+    def _rotate(self, log: Path) -> None:
+        try:
+            if log.stat().st_size > self.cfg.agents.log_max_mb * 1024 * 1024:
+                os.replace(log, log.with_suffix(".log.1"))
+        except OSError:
+            pass
+
+    # -- 5. budget -------------------------------------------------------------------------------------------
+    def _budget(self) -> None:
+        if self.state.flag_age("budget-checked") is not None and (self.state.flag_age("budget-checked") or 0) < 180:
+            return
+        self.state.set_flag("budget-checked")
+        on_api = [r.issue for r in self.state.all() if r.status == RUNNING and budget.is_paid(self.cfg, r.model)]
+        if not on_api:
+            return
+        _, _total, hand = budget.assess(self.cfg, self.state, on_api)
+        fallback = self.cfg.budget.fallback_model
+        for issue, why in hand:
+            rec = self.state.get(issue)
+            if fallback:
+                self.router.pin(issue, fallback)
+            self.say(f"#{issue}: budget -- {why}; " + (f"moving to {fallback}" if fallback else "stopping (no fallback model)"))
+            if fallback:
+                self._kill(rec, "handover", why)
+            else:
+                self._kill(rec, "stopped", why)
+                self._block(self.state.get(issue), f"budget: {why}")
+
+    # -- status ------------------------------------------------------------------------------------------------
+    def _snapshot(self, report: TickReport) -> None:
+        self.state.save(
+            "status.json",
+            {
+                "at": now(),
+                "running": report.running,
+                "launched": report.launched,
+                "finished": report.finished,
+                "waiting": report.waiting,
+                "blocked": report.blocked,
+                "open": report.open_,
+                "complete": report.complete,
+                "forge_calls": getattr(self.forge, "calls", 0),
+            },
+        )
+
+    # -- control --------------------------------------------------------------------------------------------------
+    def stop_now(self) -> list[int]:
+        stopped = []
+        for rec in self.state.all():
+            if rec.status == RUNNING and self._alive(rec):
+                self._kill(rec, "stopped", "stop requested")
+                stopped.append(rec.issue)
+        return stopped

@@ -1,0 +1,225 @@
+"""Integrators: the only thing that merges (INT-*, DEP-*)."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+
+from conftest import git
+from nohalt.forge import Run
+from nohalt.state import DONE, READY
+
+
+def test_direct_merges_green_then_watches_the_pipeline(world):
+    w = world(integrate={"mode": "direct", "ci_workflow": "CI"})
+    w.issue(1, "pr-green")
+    w.drive(3)
+    assert w.rec(1).status in (READY, DONE)
+    w.drive(2)
+    d = w.forge.data()
+    assert d["merged"], "the integrator merged the green PR"
+    assert w.forge.issue(1).state == "CLOSED"
+    assert w.rec(1).status == DONE
+    st = w.sup.state.load("integrate.json", {})
+    assert "watch" in st  # waiting for CI on the base branch
+
+
+def test_direct_red_pipeline_stops_merging_and_opens_fix_forward(world):
+    """DEP-01: nothing builds on a pipeline that cannot deploy."""
+    w = world(integrate={"mode": "direct", "ci_workflow": "CI"})
+    w.issue(1, "pr-green")
+    w.issue(2, "pr-green")
+    w.drive(4)
+    st = w.sup.state.load("integrate.json", {})
+    sha = st["watch"]["sha"]
+    merged_before = list(w.forge.data()["merged"])
+    w.forge.add_run(Run(1, "CI", sha, "completed", "failure", "main", ""))
+    w.drive(2)
+    st = w.sup.state.load("integrate.json", {})
+    fix = st.get("fix_issue")
+    assert fix, w.messages
+    assert w.queue.read_text().splitlines()[0].startswith(f"{fix}:")
+    assert w.forge.data()["merged"] == merged_before  # nothing else merged on top of red
+
+
+def test_direct_never_merges_red(world):
+    w = world(integrate={"mode": "direct"}, agents={"ci_rounds": 0})
+    w.issue(1, "pr-red")
+    w.drive(4)
+    assert not w.forge.data()["merged"]
+
+
+def test_train_batches_resolves_bookkeeping_and_versions(world, repo):
+    """INT-01: batch green PRs; bookkeeping conflicts by rule; version the batch."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg/__init__.py").write_text('__version__ = "0.3.0"\n')
+    (repo / "patches.txt").write_text("base\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "version")
+    git(repo, "tag", "v0.3.0")
+    git(repo, "push", "-q", "origin", "main", "--tags")
+    w = world(
+        integrate={
+            "mode": "train",
+            "mergers": {"patches.txt": "keep_both_lines"},
+            "train": {"version_files": [{"path": "pkg/__init__.py", "pattern": '__version__ = "([^"]+)"'}]},
+        }
+    )
+    # Two branches that both append to patches.txt (a bookkeeping conflict).
+    for n in (1, 2):
+        w.forge.add_issue(n, f"Issue {n}")
+        b = f"feature/{n}-x"
+        git(repo, "checkout", "-q", "-b", b, "main")
+        (repo / "patches.txt").write_text(f"base\npatch-{n}\n")
+        (repo / f"f{n}.txt").write_text("x\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"#{n}")
+        git(repo, "push", "-q", "origin", b)
+        sha = git(repo, "rev-parse", "HEAD")
+        w.forge.add_pull(100 + n, b, sha, body=f"Closes #{n}")
+        w.forge.set_checks(sha, [("ci", "completed", "success")])
+        r = w.sup.state.get(n)
+        r.status, r.pr, r.pr_sha, r.branch = READY, 100 + n, sha, b
+        w.sup.state.put(r)
+    git(repo, "checkout", "-q", "main")
+    w.queue.write_text("1:\n2:\n")
+    w.sup.tick()
+    rel = [p for p in w.forge.open_pulls() if p.head_ref.startswith("release/")]
+    assert len(rel) == 1, w.messages
+    assert "Closes #1" in rel[0].body and "Closes #2" in rel[0].body
+    origin = repo.parent / "origin.git"
+    blob = subprocess.run(
+        ["git", "-C", str(origin), "show", f"{rel[0].head_ref}:patches.txt"], capture_output=True, text=True
+    ).stdout
+    assert blob.split() == ["base", "patch-1", "patch-2"]
+    ver = subprocess.run(
+        ["git", "-C", str(origin), "show", f"{rel[0].head_ref}:pkg/__init__.py"], capture_output=True, text=True
+    ).stdout
+    assert '"0.3.1"' in ver
+    st = w.sup.state.load("train.json")
+    assert st["releases"][rel[0].head_ref]["version"] == "v0.3.1"
+
+
+def test_train_code_conflict_is_left_out_and_handed_back(world, repo):
+    (repo / "app.py").write_text("x = 0\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "app")
+    git(repo, "push", "-q", "origin", "main")
+    w = world(integrate={"mode": "train"})
+    for n in (1, 2):
+        w.forge.add_issue(n)
+        b = f"feature/{n}-x"
+        git(repo, "checkout", "-q", "-b", b, "main")
+        (repo / "app.py").write_text(f"x = {n}\n")
+        git(repo, "commit", "-q", "-am", f"#{n}")
+        git(repo, "push", "-q", "origin", b)
+        sha = git(repo, "rev-parse", "HEAD")
+        w.forge.add_pull(100 + n, b, sha, body=f"Closes #{n}")
+        w.forge.set_checks(sha, [("ci", "completed", "success")])
+        r = w.sup.state.get(n)
+        r.status, r.pr, r.pr_sha, r.branch = READY, 100 + n, sha, b
+        w.sup.state.put(r)
+    git(repo, "checkout", "-q", "main")
+    w.queue.write_text("1:\n2:\n")
+    w.sup.tick()
+    w.wait_agents()
+    rel = [p for p in w.forge.open_pulls() if p.head_ref.startswith("release/")]
+    assert len(rel) == 1 and "Closes #1" in rel[0].body and "Closes #2" not in rel[0].body
+    comments = [c for c in w.forge.data()["comments"] if c[0] == 2]
+    assert comments and "conflicts with `main` in code" in comments[-1][1]
+
+
+def test_train_red_release_reruns_once_then_parks(world, repo):
+    w = world(integrate={"mode": "train"})
+    w.forge.add_issue(1)
+    sha = "abc123"
+    w.forge.add_pull(50, "release/auto-1", sha, body="Closes #1")
+    w.forge.set_checks(sha, [("ci", "completed", "failure")])
+    w.forge.add_run(Run(9, "CI", sha, "completed", "failure", "release/auto-1", "u"))
+    w.sup.state.save(
+        "train.json", {"releases": {"release/auto-1": {"version": "v1", "carried": [[1, 7, "s1"]]}}, "parked": [], "reruns": {}}
+    )
+    w.sup.integrator.tick()
+    assert json.loads(w.forge_path.read_text())["reruns"] == [9]
+    w.sup._pulls, w.sup._pulls_ok = None, False
+    w.sup.integrator.tick()
+    st = w.sup.state.load("train.json")
+    assert "s1" in st["parked"]
+    assert w.forge.data()["pulls"]["50"]["state"] == "closed"
+
+
+def test_train_network_red_is_not_charged_to_the_code(world):
+    w = world(integrate={"mode": "train", "train": {"red_retries": 0}})
+    sha = "def456"
+    w.forge.add_pull(50, "release/auto-2", sha)
+    w.forge.set_checks(sha, [("ci", "completed", "failure")])
+    w.forge.add_run(Run(9, "CI", sha, "completed", "failure", "release/auto-2", ""))
+    with w.forge._db() as d:
+        d["logs"] = {"9": "fatal: Could not resolve host: github.com"}
+    w.sup.integrator.tick()
+    assert w.forge.data()["pulls"]["50"]["state"] == "open"
+    assert w.forge.data()["reruns"] == [9]
+
+
+def test_merge_into_a_non_default_base_closes_the_issue(world, repo):
+    """Closing keywords act only on the default branch; the merge still finishes the issue."""
+    git(repo, "push", "-q", "origin", "main:develop")
+    w = world(project={"base_branch": "develop"}, integrate={"mode": "direct"})
+    w.issue(1, "pr-green")
+    w.drive(5)
+    assert w.forge.data()["merged"]
+    assert w.forge.issue(1).state == "CLOSED"
+    assert w.rec(1).status == DONE
+
+
+def test_human_merge_into_a_non_default_base_finishes_the_issue(world, repo):
+    git(repo, "push", "-q", "origin", "main:develop")
+    w = world(project={"base_branch": "develop"})
+    w.issue(1, "pr-green")
+    w.drive(3)
+    assert w.rec(1).status == READY
+    w.forge.merge_pull(w.rec(1).pr, "merge")  # a human merges; the forge leaves the issue open
+    assert w.forge.issue(1).state == "OPEN"
+    w.drive(2)
+    assert w.forge.issue(1).state == "CLOSED" and w.rec(1).status == DONE
+
+
+def test_failed_deploy_stops_merging(world):
+    w = world(integrate={"mode": "direct"})
+    w.sup.state.set_flag("DEPLOY_BLOCKED", "deploy of x exited 1")
+    w.issue(1, "pr-green")
+    w.drive(4)
+    assert not w.forge.data()["merged"]
+    assert any("merging stopped" in m for m in w.messages)
+
+
+def test_direct_waits_while_mergeability_is_unknown(world):
+    w = world(integrate={"mode": "direct"})
+    w.issue(1, "pr-green")
+    w.sup.tick()
+    w.wait_agents()
+    with w.forge._db() as d:
+        for p in d["pulls"].values():
+            p["mergeable"] = None
+    w.drive(3)
+    assert not w.forge.data()["merged"]
+
+
+def test_no_pipeline_on_the_base_is_not_a_red_pipeline(world):
+    """Many integration branches run no pipeline after a merge: nothing to watch is not a failure."""
+    w = world(integrate={"mode": "direct", "base_pipeline_grace": 0})
+    w.issue(1, "pr-green")
+    w.issue(2, "pr-green")
+    w.drive(8)
+    assert len(w.forge.data()["merged"]) == 2
+    assert not w.sup.state.load("integrate.json", {}).get("fix_issue")
+    assert any("no pipeline ran" in m for m in w.messages)
+
+
+def test_inline_issue_puts_the_issue_text_in_the_prompt(world):
+    w = world(prompt={"inline_issue": True})
+    w.issue(1, "close")
+    with w.forge._db() as d:
+        d["issues"]["1"]["body"] = "The export button does nothing."
+    w.drive(2)
+    assert "The export button does nothing." in w.prompts(1)[0]
