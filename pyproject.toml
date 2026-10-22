@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nohalt"
-version = "0.0.0"
+version = "0.1.0"
 description = "Autonomous coding agents that keep going until the forge says done."
 readme = "README.md"
 license = "MIT"
