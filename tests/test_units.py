@@ -336,3 +336,20 @@ def test_init_creates_the_directory(tmp_path):
     )
     assert cp.returncode == 0, cp.stderr
     assert (d / "nohalt.toml").exists() and (d / "queue.txt").exists()
+
+
+def test_verify_command_runs_without_nohalt_on_path(tmp_path):
+    """The agent's verify command must not depend on `nohalt` being on its PATH."""
+    import shlex
+    import subprocess
+
+    cfg_file = tmp_path / "nohalt.toml"
+    cfg_file.write_text(f'[project]\nrepo = "local:{tmp_path}/f.json"\npath = "{tmp_path}"\nstate_dir = "{tmp_path}/state"\n')
+    cfg = config_mod.load(cfg_file)
+    tree = cfg.worktree_root / "3"
+    tree.mkdir(parents=True)
+    cmd = prompt_mod.verify_command(cfg, tree)
+    assert shlex.split(cmd)[0] == sys.executable
+    cp = subprocess.run(f"{cmd} 'echo verified'", shell=True, capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
+    assert cp.returncode == 0, cp.stderr
+    assert "verified" in cp.stdout
