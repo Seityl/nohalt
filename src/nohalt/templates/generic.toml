@@ -1,0 +1,70 @@
+# nohalt.toml -- every tunable for one project. Durations: 90, "90s", "30m", "4h".
+# Reference: docs/CONFIGURATION.md
+
+[project]
+repo = "OWNER/REPO"          # owner/name (GitHub) or group[/subgroup]/name (GitLab)
+# forge = "github"           # github | gitlab
+# forge_url = ""             # GitLab only: self-hosted URL (default https://gitlab.com)
+# token_env = "GITLAB_TOKEN" # GitLab only: variable holding an api-scoped token
+path = "."                   # the main clone; worktrees are cut from it
+base_branch = "main"
+state_dir = ".nohalt"        # state, logs, worktrees (add it to .gitignore)
+# shared_paths = ["node_modules"]   # symlinked into each worktree (not in git)
+default_prefix = "feature"
+branch_prefixes = { bug = "fix" }   # label -> branch prefix
+
+[queue]
+file = "queue.txt"           # "<issue>: <deps>" -- order is preference, deps are law
+blocked_label = "nohalt-blocked"
+held_labels = ["needs-human"] # never worked while carrying one of these
+tick = "60s"
+
+[agents]
+max_parallel = 2             # measure: concurrent builds and test runs on a small machine go slower, not faster
+min_free_mb = 2000           # an agent with its test runner wants ~2.5 GB; do not launch into swap
+phase_timeout = "4h"
+long_timeout = "8h"
+long_labels = ["long"]       # issues that legitimately take longer (standing up a service, a migration)
+max_attempts = 2
+provider_retries = 5         # model-endpoint failures per issue -- never counted as attempts
+provider_backoff = "2m"
+timeout_continues = 3        # a time limit continues in the same worktree this many times
+hung_after = "30m"
+ci_rounds = 3                # red / conflicting PRs handed back to an agent
+# copy_files = ["~/.local/share/opencode/auth.json"]
+
+[models]
+default = "opencode:anthropic/claude-sonnet-4-5"
+fallbacks = []               # tried in order when the default does not answer a probe
+# premium = ["claude-code:opus"]       # only on issues approved with `nohalt route <n> <model> --approve`
+# premium_fallback = "claude-code:sonnet"
+# [[models.route]]
+# labels = ["P3", "polish", "typo"]
+# model = "opencode:local/small-model"
+
+[budget]
+enabled = false              # guard paid-API spend (see docs/CONFIGURATION.md#budget)
+
+[verify]
+# Why is there a lock? Write the reason here -- a lock nobody can explain gets deleted.
+# e.g. "one test database, reset per run" or "two cores".
+slots = ["default"]
+up = ""                      # bring the test environment up (idempotent)
+reset = ""                   # put it at the schema of the commit under test
+env = ""                     # print KEY=VALUE lines to export to the agent's command
+refuse = []                  # substrings a verify command may not contain
+
+[integrate]
+mode = "none"                # none (a human merges) | direct | train
+required_checks = []         # check-run names that must pass; empty: all of them
+merge_method = "squash"
+# ci_workflow = "CI"
+# cd_workflow = "CD"
+# deploy = "./scripts/deploy.sh"
+
+[stack]
+name = "generic"
+
+[prompt]
+template = "builtin:core"
+extra = []                   # your project's own prompt files, appended in order

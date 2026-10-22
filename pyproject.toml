@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nohalt"
+version = "0.0.0"
+description = "Autonomous coding agents that keep going until the forge says done."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Jeriel Francis trading as Seityl" }]
+keywords = ["ai", "agents", "autonomous", "coding-agents", "github", "ci", "orchestration", "opencode", "claude-code"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.10", "build>=1.2", "twine>=5"]
+
+[project.scripts]
+nohalt = "nohalt.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Seityl/nohalt"
+Issues = "https://github.com/Seityl/nohalt/issues"
+Changelog = "https://github.com/Seityl/nohalt/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nohalt"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/nohalt", "tests", "docs", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "SIM105", "SIM108", "RUF001", "RUF002", "RUF003", "B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["nohalt"]
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true
+
+[tool.coverage.run]
+source = ["nohalt"]
+branch = true

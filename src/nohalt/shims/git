@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# nohalt's `git` for agents: everything passes through except
+#
+#   * `git stash` (but `stash list` / `stash show`): worktrees share ONE stash
+#     stack -- refs/stash lives in the common git dir -- so two agents
+#     stashing to prove "this test fails without my change" pop each other's
+#     work;
+#   * pushes to the base branch, tag pushes, --mirror and deleting the base:
+#     agents push their own branch and nothing else.
+set -uo pipefail
+
+REAL="${NOHALT_REAL_GIT:-}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+if [[ -z "$REAL" || "$(readlink -f "$REAL" 2>/dev/null)" == "$SELF" ]]; then
+  REAL=""
+  IFS=: read -ra dirs <<<"$PATH"
+  for d in "${dirs[@]}"; do
+    [[ -x "$d/git" && "$(readlink -f "$d/git")" != "$SELF" ]] && { REAL="$d/git"; break; }
+  done
+fi
+[[ -n "$REAL" ]] || { echo "git (nohalt guard): the real git was not found" >&2; exit 127; }
+LOG="${NOHALT_GUARD_LOG:-/dev/null}"
+BASE="${NOHALT_BASE_BRANCH:-main}"
+
+refuse() {
+  printf '%s  REFUSED  git %s  (in %s)\n' "$(date '+%F %T')" "$2" "$PWD" >>"$LOG" 2>/dev/null || true
+  printf '\ngit (nohalt guard): refused -- %s\n\n' "$1" >&2
+  exit 1
+}
+
+# Find the subcommand past git's global options (-C <dir>, -c <k=v>, ...).
+args=("$@")
+i=0
+while ((i < ${#args[@]})); do
+  case "${args[i]}" in
+    -C | -c | --git-dir | --work-tree | --namespace | --exec-path) i=$((i + 2)) ;;
+    -*) i=$((i + 1)) ;;
+    *) break ;;
+  esac
+done
+sub="${args[i]:-}"
+rest=("${args[@]:i+1}")
+
+if [[ "$sub" == stash ]]; then
+  case "${rest[0]:-}" in
+    list | show) ;;
+    *)
+      refuse "$(cat <<'WHY'
+`git stash` is refused. Worktrees share ONE stash stack, so another agent's
+pop can take your work (and yours can take theirs). To take a change out and
+put it back:
+
+    git diff -- <changed source files> > /tmp/without.patch
+    git checkout -- <changed source files>
+    <run the test; capture the failure line>
+    git apply /tmp/without.patch
+WHY
+)" "$*" ;;
+  esac
+fi
+
+if [[ "$sub" == push ]]; then
+  positional=()
+  for a in "${rest[@]}"; do
+    case "$a" in
+      --tags | --mirror | --follow-tags) refuse "pushing tags or mirrors is not yours" "$*" ;;
+      --delete | -d) del=1 ;;
+      -*) ;;
+      *) positional+=("$a") ;;
+    esac
+  done
+  # positional[0] is the remote; the rest are refspecs.
+  for spec in "${positional[@]:1}"; do
+    dst="${spec##*:}"
+    dst="${dst#+}"
+    dst="${dst#refs/heads/}"
+    if [[ "$dst" == "$BASE" ]]; then refuse "pushing to $BASE is not yours; push your own branch" "$*"; fi
+    if [[ "$spec" == refs/tags/* || "$dst" == refs/tags/* ]]; then refuse "pushing tags is not yours" "$*"; fi
+  done
+  # A bare `git push` while on the base branch.
+  if ((${#positional[@]} <= 1)) && [[ "$("$REAL" branch --show-current 2>/dev/null)" == "$BASE" ]]; then
+    refuse "you are on $BASE; create your branch and push that" "$*"
+  fi
+  : "${del:=}"
+fi
+
+exec "$REAL" "$@"

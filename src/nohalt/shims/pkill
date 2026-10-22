@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# nohalt's `pkill` / `killall` for agents.
+#
+# Agents clean up their own test workers with `pkill -f vitest` -- and CI
+# runners and every other agent run as the same user, so one such call once
+# killed the builds on four runners at once. For anything that looks like a
+# test, build or interpreter process, this signals only the matching
+# processes whose working directory is inside the caller's own worktree.
+# Anything else passes through.
+set -uo pipefail
+
+NAME="$(basename "$0")"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REAL=""
+IFS=: read -ra dirs <<<"$PATH"
+for d in "${dirs[@]}"; do
+  [[ -x "$d/$NAME" && "$(readlink -f "$d/$NAME")" != "$SELF" ]] && { REAL="$d/$NAME"; break; }
+done
+SCOPE="${NOHALT_KILL_SCOPE:-vitest|jest|node|npx|npm|yarn|pnpm|vite|esbuild|webpack|playwright|chrom|bench|frappe|gunicorn|python|pytest|celery|rq|redis|postgres|java|gradle}"
+
+if ! grep -qE "$SCOPE" <<<"$*"; then
+  [[ -n "$REAL" ]] || { echo "$NAME (nohalt guard): the real $NAME was not found" >&2; exit 127; }
+  exec "$REAL" "$@"
+fi
+
+sig=TERM
+sel=()
+while (($#)); do
+  case "$1" in
+    -[0-9]*) sig=${1#-} ;;
+    -SIG* | -KILL | -TERM | -INT | -HUP | -QUIT | -USR1 | -USR2) sig=${1#-}; sig=${sig#SIG} ;;
+    -s | --signal) sig=$2; shift ;;
+    --signal=*) sig=${1#--signal=} ;;
+    *) sel+=("$1") ;;
+  esac
+  shift
+done
+[[ "$NAME" == killall ]] && sel=(-x "${sel[@]}")
+
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+# Never the caller's own chain: `pkill -f vitest` from a shell whose command
+# line says "vitest" would otherwise kill that shell too.
+mine=" $$ "
+a=$$
+while [[ "$a" -gt 1 ]]; do
+  a=$(ps -o ppid= -p "$a" 2>/dev/null | tr -d ' ')
+  [[ -n "$a" ]] || break
+  mine+="$a "
+done
+n=0
+for p in $(pgrep "${sel[@]}" 2>/dev/null); do
+  [[ "$mine" == *" $p "* ]] && continue
+  cwd=$(readlink "/proc/$p/cwd" 2>/dev/null) || continue
+  [[ "$cwd" == "$root" || "$cwd" == "$root"/* ]] || continue
+  kill -s "$sig" "$p" 2>/dev/null && n=$((n + 1))
+done
+echo "$NAME (nohalt guard): signalled $n process(es) under $root; processes outside your worktree (CI, other agents) are never touched" >&2
+((n > 0))

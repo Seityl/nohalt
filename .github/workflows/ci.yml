@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint & types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          python-version: "3.12"
+      - run: uv venv .venv && uv pip install --python .venv -e '.[dev]'
+      - name: ruff check
+        run: ./.venv/bin/ruff check src tests
+      - name: ruff format
+        run: ./.venv/bin/ruff format --check src tests
+      - name: mypy
+        run: ./.venv/bin/mypy
+      - name: shellcheck (agent guard shims)
+        run: shellcheck -S warning src/nohalt/shims/gh src/nohalt/shims/glab src/nohalt/shims/git src/nohalt/shims/pkill
+
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv venv .venv && uv pip install --python .venv -e '.[dev]'
+      - name: git identity for test repos
+        run: |
+          git config --global user.name "nohalt-ci"
+          git config --global user.email "nohalt-ci@users.noreply.github.com"
+          git config --global init.defaultBranch main
+      - name: pytest
+        run: ./.venv/bin/pytest -q --cov --cov-report=term --cov-report=xml
+      - uses: actions/upload-artifact@v7
+        if: matrix.python == '3.12'
+        with:
+          name: coverage
+          path: coverage.xml
+
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          python-version: "3.12"
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - name: smoke-test the wheel
+        run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke dist/*.whl
+          /tmp/smoke/bin/nohalt --version
+          /tmp/smoke/bin/nohalt init --dir /tmp/proj --repo example/project
+          test -f /tmp/proj/nohalt.toml
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: gitleaks (full history)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar xz gitleaks
+          ./gitleaks git --redact --verbose --exit-code 1 .
