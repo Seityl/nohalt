@@ -34,4 +34,4 @@ Releases are automated with [release-please](https://github.com/googleapis/relea
 
 1. Conventional commits land on `main`; release-please keeps a `chore: release x.y.z` PR open with the version bump and changelog.
 2. Pull requests opened by GitHub Actions do not trigger other workflows, so run CI on the release PR's branch once: `gh workflow run CI --ref release-please--branches--main`. Its checks then satisfy branch protection.
-3. Merge the release PR. release-please tags `vX.Y.Z` and creates the GitHub release; `publish.yml` builds the distributions, attaches them to the release and publishes to PyPI via trusted publishing.
+3. Merge the release PR. release-please tags `vX.Y.Z`, creates the GitHub release and dispatches `publish.yml`, which builds the distributions, attaches them to the release and publishes to PyPI via trusted publishing (publisher: workflow `publish.yml`, environment `pypi`). To re-publish an existing tag: `gh workflow run publish.yml -f tag=vX.Y.Z`.

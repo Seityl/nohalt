@@ -2,17 +2,14 @@ name: Publish
 
 # Builds the tagged release, attaches the distributions to the GitHub release
 # and publishes to PyPI with trusted publishing (no API token is stored).
+# Dispatched by release-please.yml after a release; can also be run by hand
+# for an existing tag.
 #
 # One-time setup on PyPI: add a trusted publisher for this repository with
 # workflow "publish.yml" and environment "pypi". Until then the PyPI step
 # fails and the GitHub release still carries the built distributions.
 
 on:
-  workflow_call:
-    inputs:
-      tag:
-        type: string
-        required: true
   workflow_dispatch:
     inputs:
       tag:

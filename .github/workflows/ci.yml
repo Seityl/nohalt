@@ -29,6 +29,8 @@ jobs:
         run: ./.venv/bin/ruff format --check src tests
       - name: mypy
         run: ./.venv/bin/mypy
+      - name: actionlint (workflows)
+        run: uvx --from actionlint-py actionlint
       - name: shellcheck (agent guard shims)
         run: shellcheck -S warning src/nohalt/shims/gh src/nohalt/shims/glab src/nohalt/shims/git src/nohalt/shims/pkill
 
