@@ -325,3 +325,14 @@ def test_cli_init_and_dry_run(tmp_path, repo):
         [sys.executable, "-m", "nohalt", "--config", str(tmp_path / "nohalt.toml"), "status"], capture_output=True, text=True
     )
     assert cp.returncode == 0 and "supervisor: DOWN" in cp.stdout
+
+
+def test_init_creates_the_directory(tmp_path):
+    import subprocess
+
+    d = tmp_path / "new" / "project"
+    cp = subprocess.run(
+        [sys.executable, "-m", "nohalt", "init", "--dir", str(d), "--repo", "o/r"], capture_output=True, text=True
+    )
+    assert cp.returncode == 0, cp.stderr
+    assert (d / "nohalt.toml").exists() and (d / "queue.txt").exists()

@@ -37,6 +37,7 @@ def _sup(cfg: Config, quiet: bool = False) -> Supervisor:
 # -- commands ----------------------------------------------------------------------------
 def cmd_init(args: argparse.Namespace) -> int:
     target = Path(args.dir).resolve() / config_mod.CONFIG_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and not args.force:
         print(f"{target} already exists (use --force to overwrite)", file=sys.stderr)
         return 1
