@@ -85,12 +85,14 @@ def forge_terms(cfg: Config, issue: int) -> dict[str, str]:
             "ISSUE_VIEW": f"glab issue view {issue} --repo {repo} --comments",
             "OPEN_PR_HINT": hint,
         }
-    return {
-        "CLI": "gh",
-        "PR": "pull request",
-        "ISSUE_VIEW": f"gh issue view {issue} --repo {repo} --comments",
-        "OPEN_PR_HINT": "",
-    }
+    # REST, not `gh issue view`: GraphQL-backed subcommands break on GitHub-side
+    # deprecations (every agent's first command failed this way in a dogfood run).
+    slug = cfg.project.repo
+    view = (
+        f"gh api repos/{slug}/issues/{issue} --jq '.title, .body' && "
+        f"gh api repos/{slug}/issues/{issue}/comments --jq '.[] | \"--- \\(.user.login): \\(.body)\"'"
+    )
+    return {"CLI": "gh", "PR": "pull request", "ISSUE_VIEW": view, "OPEN_PR_HINT": ""}
 
 
 def values(
