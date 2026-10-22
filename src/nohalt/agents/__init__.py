@@ -21,6 +21,18 @@ PROVIDER_ERROR = re.compile(
 )
 
 
+# An agent that could not start at all: its CLI is not logged in, the model
+# router refuses it, or it was given an option it does not accept. Retrying
+# the issue cannot fix any of these; the agent's setup must be fixed.
+SETUP_ERROR = re.compile(
+    r"(Failed to authenticate|authentication_failed|invalid (x-)?api[ -]key|not logged in|"
+    r"please run \S+ login|API Error: 401|HTTP 401|401 Unauthorized|"
+    r"error: (unknown|unrecognized) option|error: option '[^']+' argument '[^']*' is invalid|"
+    r"credit balance is too low)",
+    re.I,
+)
+
+
 @dataclass
 class Launch:
     argv: list[str]
@@ -35,6 +47,7 @@ class Agent(Protocol):
     def provider_failed(self, log_tail: str) -> bool: ...
     def usage_limited(self, log_tail: str) -> bool: ...
     def probe_launch(self, model: str, data_dir: Path) -> Launch: ...
+    def setup_failed(self, log_tail: str) -> bool: ...
 
 
 def split_model(spec: str) -> tuple[str, str]:

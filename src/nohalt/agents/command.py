@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import PROVIDER_ERROR, Launch
+from . import PROVIDER_ERROR, SETUP_ERROR, Launch
 
 
 class Command:
@@ -35,6 +35,9 @@ class Command:
 
     def probe_launch(self, model: str, data_dir: Path) -> Launch:
         return Launch(self._fmt(self.probe_argv, model=model, prompt="", title="", data_dir=str(data_dir)))
+
+    def setup_failed(self, log_tail: str) -> bool:
+        return SETUP_ERROR.search(log_tail) is not None
 
     def provider_failed(self, log_tail: str) -> bool:
         lines = [ln for ln in log_tail.splitlines() if ln.strip()][-8:]

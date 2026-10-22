@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import PROVIDER_ERROR, Launch
+from . import PROVIDER_ERROR, SETUP_ERROR, Launch
 
 
 class OpenCode:
@@ -33,7 +33,11 @@ class OpenCode:
         return Launch(argv, self._env(data_dir))
 
     def probe_launch(self, model: str, data_dir: Path) -> Launch:
-        return Launch([self.binary, "run", "-m", model, "reply with the single word OK"], self._env(data_dir))
+        # The same flags a real launch uses, so the probe fails when a launch would.
+        return self.launch(model, "reply with the single word OK", title="nohalt probe", resume=False, data_dir=data_dir)
+
+    def setup_failed(self, log_tail: str) -> bool:
+        return SETUP_ERROR.search(log_tail) is not None
 
     def provider_failed(self, log_tail: str) -> bool:
         lines = [ln for ln in log_tail.splitlines() if ln.strip()][-8:]

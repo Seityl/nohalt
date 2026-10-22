@@ -181,8 +181,12 @@ class PipelineGate:
             # one time to appear; if none does, there is nothing to watch -- not a red.
             if now() - w["since"] < self.cfg.integrate.base_pipeline_grace:
                 return False
-            self.sup.say(f"no pipeline ran on {w['sha'][:7]} after {w['what']}; nothing to watch")
-            result = "success"
+            self.sup.say(f"no pipeline ran on {w['sha'][:7]} after {w['what']} within the grace; nothing to watch, carrying on")
+            if w.get("deploy") and not self.cfg.integrate.cd_workflow:
+                run_deploy(self.sup, f"{w['sha'][:7]} ({w['what']})")
+            st.pop("watch")
+            self._save(st)
+            return not self.sup.state.has("DEPLOY_BLOCKED")
         elif result == "pending":
             if now() - w["since"] < self.cfg.integrate.cd_timeout:
                 return False

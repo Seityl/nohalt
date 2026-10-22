@@ -35,6 +35,7 @@ class IssueRecord:
     status: str = QUEUED
     attempts: int = 0  # real attempts spent on the issue
     provider_retries: int = 0  # model-endpoint failures; never attempts
+    launch_failures: int = 0  # the agent could not start (login, config); never attempts
     timeouts: int = 0  # time limits reached and continued in the same worktree
     ci_rounds: int = 0  # times a red PR was handed back
     revivals: int = 0

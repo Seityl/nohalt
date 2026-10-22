@@ -52,7 +52,7 @@ class Direct:
             return
         if pr.head_sha != rec.pr_sha or v != GREEN:
             return  # the watcher catches up on the next tick
-        if pr.mergeable is None:
+        if pr.mergeable is None or pr.draft:
             return  # the forge is still computing it (GitLab: unchecked, checking, ...): ask again next tick
         if pr.mergeable is False:
             self.sup.hand_back(

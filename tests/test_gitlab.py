@@ -89,6 +89,10 @@ class FakeGitLab(BaseHTTPRequestHandler):
             return self._send(
                 200, {"iid": 5, "source_branch": "f", "sha": "s", "detailed_merge_status": "commits_status", "state": "opened"}
             )
+        if tail == "/merge_requests/6" and method == "GET":
+            return self._send(200, {"iid": 6, "title": "Draft: add divide", "sha": "s6", "state": "opened", "draft": True})
+        if tail == "/merge_requests/6" and method == "PUT":
+            return self._send(200, {"iid": 6, "title": body.get("title"), "draft": False})
         if tail == "" and method == "GET":
             return self._send(200, {"id": 1, "default_branch": "main"})
         if tail == "/merge_requests/3/merge":
@@ -275,3 +279,10 @@ def test_gitlab_prompt_offers_push_options_when_glab_is_broken(tmp_path):
     cfg = config_mod.from_dict({"project": {"repo": "grp/app", "forge": "gitlab", "base_branch": "develop"}}, root=tmp_path)
     body = prompt_mod.render(prompt_mod.template(cfg), prompt_mod.values(cfg, issue=5, title="T", branch="b", worktree=tmp_path))
     assert "-o merge_request.create -o merge_request.target=develop" in body and 'description="Closes #5"' in body
+
+
+def test_mark_ready_strips_the_draft_prefix(gitlab):
+    assert gitlab.pull(6).draft is True
+    gitlab.mark_ready(6)
+    put = next(c for c in FakeGitLab.calls if c[0] == "PUT" and c[1].endswith("/merge_requests/6"))
+    assert put[2] == {"title": "add divide"}

@@ -68,7 +68,7 @@ nohalt gives AI agents write access to your repository and, if you enable an int
 
 ## Status
 
-Alpha. The mechanisms come from scripts that ran production agent fleets for weeks; this package is their consolidation into one tested, configurable tool, and it is younger than they are. Expect rough edges. Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+Alpha. The mechanisms come from scripts that ran production agent fleets for weeks; this package is their consolidation into one tested, configurable tool, and it is younger than they are. Before the first release it was run end to end on both forges -- real agents (Claude Code on GitHub, opencode on a self-hosted GitLab), real CI, both `none` and `direct` integration, a supervisor `kill -9` mid-run -- and the bugs those runs found are fixed. Expect rough edges. Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

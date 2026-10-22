@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -31,6 +32,9 @@ from ..util import run
 from .base import CLOSED, MISSING, OPEN, Check, ForgeError, Issue, PullRequest, Run
 
 DEFAULT_URL = "https://gitlab.com"
+
+# GitLab marks a merge request as a draft by its title.
+_DRAFT_PREFIX = re.compile(r"^\s*(\[draft\]|\(draft\)|draft:|draft\s+-|\[wip\]|wip:)\s*", re.I)
 
 # job status -> (check status, conclusion)
 _JOB = {
@@ -206,6 +210,12 @@ class GitLab:
         except ForgeError:
             return False
         return (d or {}).get("state") == "merged"
+
+    def mark_ready(self, number: int) -> None:
+        """Clear a merge request's draft status by removing the draft prefix from its title."""
+        title = self._get(self._p(f"merge_requests/{number}")).get("title") or ""
+        clean = _DRAFT_PREFIX.sub("", title, count=1).strip() or title
+        self._request("PUT", self._p(f"merge_requests/{number}"), {"title": clean})
 
     def close_pull(self, number: int, comment: str = "") -> None:
         if comment:

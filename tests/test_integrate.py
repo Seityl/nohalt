@@ -214,6 +214,7 @@ def test_no_pipeline_on_the_base_is_not_a_red_pipeline(world):
     assert len(w.forge.data()["merged"]) == 2
     assert not w.sup.state.load("integrate.json", {}).get("fix_issue")
     assert any("no pipeline ran" in m for m in w.messages)
+    assert not any("pipeline green" in m for m in w.messages)  # one message, not a contradictory pair
 
 
 def test_inline_issue_puts_the_issue_text_in_the_prompt(world):

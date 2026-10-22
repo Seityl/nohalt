@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import Launch
+from . import SETUP_ERROR, Launch
 
 # Sub-agents, schedulers and remote triggers multiply spend on a shared plan
 # and outlive the supervisor's view of the agent; the worktree tools fight
@@ -70,9 +70,13 @@ class ClaudeCode:
         return Launch(wrapped, env, unset_env=["CLAUDECODE", "CLAUDE_AGENT_SDK_VERSION"])
 
     def probe_launch(self, model: str, data_dir: Path) -> Launch:
-        return Launch(
-            [*self._base(model), "reply with the single word OK"], {}, unset_env=["CLAUDECODE", "CLAUDE_AGENT_SDK_VERSION"]
-        )
+        # Exactly the launch mode (stream-json through the wrapper): a plain-text
+        # probe once passed on a machine whose model router rejected stream-json,
+        # and every real launch then died on its first request.
+        return self.launch(model, "reply with the single word OK", title="nohalt probe", resume=False, data_dir=data_dir)
+
+    def setup_failed(self, log_tail: str) -> bool:
+        return SETUP_ERROR.search(log_tail) is not None
 
     def provider_failed(self, log_tail: str) -> bool:
         return _PROVIDER.search(log_tail) is not None

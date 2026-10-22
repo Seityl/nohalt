@@ -355,3 +355,20 @@ def test_verify_command_runs_without_nohalt_on_path(tmp_path):
     cp = subprocess.run(f"{cmd} 'echo verified'", shell=True, capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
     assert cp.returncode == 0, cp.stderr
     assert "verified" in cp.stdout
+
+
+def test_probes_run_the_agent_exactly_as_a_launch_does(tmp_path):
+    """A plain-text probe passed where every real (stream-json) launch then failed."""
+    for name, model in (("claude-code", "sonnet"), ("opencode", "a/b")):
+        a = get_agent(name)
+        probe = a.probe_launch(model, tmp_path)
+        real = a.launch(model, "reply with the single word OK", title="nohalt probe", resume=False, data_dir=tmp_path)
+        assert probe.argv == real.argv and probe.env == real.env
+    assert "stream-json" in get_agent("claude-code").probe_launch("sonnet", tmp_path).argv
+
+
+def test_setup_failure_detection():
+    a = get_agent("claude-code")
+    assert a.setup_failed("Failed to authenticate. API Error: 401 Claude Code process exited")
+    assert a.setup_failed("error: option '--thinking-display <display>' argument 'updates' is invalid.")
+    assert not a.setup_failed("all tests passed; opened the PR")
