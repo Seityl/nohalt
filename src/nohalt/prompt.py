@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import sys
 from importlib import resources
 from pathlib import Path
 
@@ -56,8 +57,12 @@ def render(text: str, values: dict[str, str]) -> str:
 
 
 def verify_command(cfg: Config, worktree: Path) -> str:
-    """How an agent calls the verification lock from its worktree."""
-    argv = ["nohalt"]
+    """How an agent calls the verification lock from its worktree.
+
+    The interpreter nohalt runs under, not a bare `nohalt`: installed in a
+    virtualenv that is not on the agent's PATH, `nohalt` is not found.
+    """
+    argv = [sys.executable, "-m", "nohalt"]
     if cfg.source:
         argv += ["--config", str(cfg.source)]
     argv += ["verify", str(worktree), "--"]
