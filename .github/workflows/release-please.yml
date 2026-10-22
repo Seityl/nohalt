@@ -2,7 +2,7 @@ name: Release
 
 # Conventional commits on main -> a release PR that bumps the version and
 # CHANGELOG. Merging that PR tags the release and creates the GitHub release,
-# which triggers publish.yml.
+# then dispatches publish.yml to build and upload it.
 
 on:
   push:
@@ -27,11 +27,17 @@ jobs:
           manifest-file: .release-please-manifest.json
 
   publish:
+    # Dispatched, not called: PyPI trusted publishing matches the workflow that
+    # runs (publish.yml); a reusable-workflow call would present the caller.
+    # workflow_dispatch is the one event the built-in token may trigger.
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
-    uses: ./.github/workflows/publish.yml
-    with:
-      tag: ${{ needs.release-please.outputs.tag_name }}
+    runs-on: ubuntu-latest
     permissions:
-      contents: write
-      id-token: write
+      actions: write
+    steps:
+      - name: dispatch publish.yml for the new tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh workflow run publish.yml --repo "${{ github.repository }}" --ref main -f tag="$TAG"
