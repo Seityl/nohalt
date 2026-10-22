@@ -104,7 +104,15 @@ class Train:
         self.sup.say(f"release {self.sup.pr(p.number)} ({p.head_ref}) merged" + (f" as {version}" if version else ""))
         if version:
             self._tag(version)
-        close_merged(self.sup, [int(c[0]) for c in rel.get("carried", [])], f"release {self.sup.pr(p.number)}")
+        carried = rel.get("carried", [])
+        close_merged(self.sup, [int(c[0]) for c in carried], f"release {self.sup.pr(p.number)}")
+        # The release merged each PR's branch, not the PR itself: close the PRs,
+        # or every one of them stays open forever.
+        for _issue, pr_number, _sha in carried:
+            try:
+                f.close_pull(int(pr_number), f"nohalt: merged into {version or p.head_ref} by release {self.sup.pr(p.number)}.")
+            except ForgeError as e:
+                self.sup.say(f"could not close carried {self.sup.pr(int(pr_number))}: {e}")
         run_deploy(self.sup, version or p.head_ref)
         st["releases"].pop(p.head_ref, None)
         self._save(st)
