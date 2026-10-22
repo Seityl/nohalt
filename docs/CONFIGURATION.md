@@ -117,6 +117,7 @@ Spend is estimated from each opencode agent's own session database, keeping the 
 |---|---|---|
 | `mode` | `"none"` | `none` (a human merges), `direct`, `train`. Agents never merge in any mode |
 | `required_checks` | `[]` | check-run names (GitHub) or job names in the newest pipeline (GitLab) that must pass. Empty: every check must pass, and at least one must exist. On GitLab, a job with `allow_failure` never makes a commit red, and a manual job counts as skipped |
+| `ignore_checks` | `[]` | check names that never count towards green or red, e.g. a slow suite your pipeline cancels on pull requests and runs on the base after merge. Every other check present on a commit must still pass |
 | `merge_method` | `"squash"` | for `direct` (release PRs always merge with a merge commit). On GitLab, `squash` squashes; otherwise the project's merge method applies |
 | `ci_workflow` / `cd_workflow` | `""` | runs watched on the base branch after a merge: GitHub workflow names, or on GitLab a pipeline's `workflow:name` (or `"pipeline"` for any pipeline on the commit) |
 | `cd_timeout` | `"90m"` | a pipeline that does not finish in time counts as red |

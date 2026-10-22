@@ -167,7 +167,7 @@ class PipelineGate:
             if done:
                 return "success" if done[0].conclusion == "success" else "failure"
             return "pending"
-        v = verdict(f.checks(sha), ic.required_checks)
+        v = verdict(f.checks(sha), ic.required_checks, ic.ignore_checks)
         return {GREEN: "success", RED: "failure"}.get(v, "pending")
 
     def _check(self, st: dict[str, Any]) -> bool:

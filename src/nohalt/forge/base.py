@@ -95,12 +95,16 @@ _OK = {"success", "skipped", "neutral"}
 _BAD = {"failure", "timed_out", "action_required", "startup_failure", "stale"}
 
 
-def verdict(checks: list[Check], required: list[str]) -> str:
+def verdict(checks: list[Check], required: list[str], ignore: list[str] | tuple[str, ...] = ()) -> str:
     """GREEN, RED or PENDING for a commit's check runs.
 
     With ``required`` empty, every check counts and at least one must exist.
     A cancelled run is neither: superseded runs get cancelled all the time.
+    Checks named in ``ignore`` never count, either way (a suite cancelled on
+    pull requests by policy, say).
     """
+    if ignore:
+        checks = [c for c in checks if c.name not in ignore]
     if required:
         by: dict[str, Check] = {}
         for c in checks:

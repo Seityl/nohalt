@@ -47,7 +47,7 @@ class Direct:
         base = self.cfg.project.base_branch
         try:
             pr = f.pull(rec.pr)
-            v = verdict(f.checks(pr.head_sha), self.cfg.integrate.required_checks)
+            v = verdict(f.checks(pr.head_sha), self.cfg.integrate.required_checks, self.cfg.integrate.ignore_checks)
         except ForgeError:
             return
         if pr.head_sha != rec.pr_sha or v != GREEN:

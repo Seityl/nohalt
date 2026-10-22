@@ -73,7 +73,7 @@ class Train:
     def _advance(self, p: PullRequest) -> None:
         f = self.sup.forge
         try:
-            v = verdict(f.checks(p.head_sha), self.cfg.integrate.required_checks)
+            v = verdict(f.checks(p.head_sha), self.cfg.integrate.required_checks, self.cfg.integrate.ignore_checks)
         except ForgeError:
             return
         if v == RED:
@@ -182,7 +182,12 @@ class Train:
             if self.sup.issue(rec.issue).state == CLOSED:
                 continue
             try:
-                if verdict(self.sup.forge.checks(pr.head_sha), self.cfg.integrate.required_checks) != GREEN:
+                if (
+                    verdict(
+                        self.sup.forge.checks(pr.head_sha), self.cfg.integrate.required_checks, self.cfg.integrate.ignore_checks
+                    )
+                    != GREEN
+                ):
                     continue
             except ForgeError:
                 continue

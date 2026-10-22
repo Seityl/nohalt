@@ -315,3 +315,75 @@ def test_guard_log_exists_from_the_start(world):
     w.sup.run(once=True)
     w.wait_agents()
     assert (w.sup.state.logs_dir / "guard.log").exists()
+
+
+def _existing_pr(w, n: int, checks: list[tuple[str, str, str]]) -> None:
+    w.forge.add_issue(n, f"Issue {n}")
+    (w.scripts / f"{n}.txt").write_text("close\n")
+    with open(w.queue, "a") as f:
+        f.write(f"{n}:\n")
+    w.forge.add_pull(500 + n, f"feature/{n}-earlier-work", f"sha-{n}", body=f"Closes #{n}")
+    w.forge.set_checks(f"sha-{n}", checks)
+
+
+def test_an_issue_with_an_open_pr_is_adopted_not_relaunched(world):
+    """Work that already has a PR (a runner nohalt replaced, a human) is watched, not redone."""
+    w = world()
+    _existing_pr(w, 1, [("ci", "completed", "success")])
+    w.drive(2)
+    r = w.rec(1)
+    assert r.status == READY and r.pr == 501 and r.branch == "feature/1-earlier-work"
+    assert w.prompts(1) == []  # no agent was launched
+    assert any("adopted" in m for m in w.messages)
+
+
+def test_an_adopted_red_pr_gets_an_agent(world):
+    w = world()
+    _existing_pr(w, 1, [("ci", "completed", "failure")])
+    w.drive(3)
+    assert len(w.prompts(1)) == 1 and "CI is red" in w.prompts(1)[0]
+    assert w.rec(1).status == DONE
+
+
+def test_dry_run_reports_adoption_without_changing_anything(world):
+    w = world()
+    _existing_pr(w, 1, [("ci", "completed", "success")])
+    w.sup.dry_run = True
+    report = w.sup.tick()
+    assert report.adopted == ["#1<-PR #501"] and not report.launched
+    assert not w.sup.state.exists(1) or w.rec(1).status == QUEUED
+
+
+def test_ignored_checks_never_count(world):
+    """A suite cancelled on PRs by policy must not hold a green PR forever."""
+    checks = [
+        ("build the product", "completed", "success"),
+        ("Frappe tests", "completed", "cancelled"),
+        ("Upgrade rehearsal", "completed", "success"),
+    ]
+    w = world(integrate={"ignore_checks": ["Frappe tests"]})
+    _existing_pr(w, 1, checks)
+    w.drive(2)
+    assert w.rec(1).status == READY
+
+
+def test_without_ignore_a_cancelled_check_keeps_waiting(world):
+    w = world()
+    _existing_pr(w, 1, [("build the product", "completed", "success"), ("Frappe tests", "completed", "cancelled")])
+    w.drive(2)
+    assert w.rec(1).status == WAITING_CI
+
+
+def test_a_check_that_must_pass_when_present_still_gates(world):
+    w = world(integrate={"ignore_checks": ["Frappe tests"]})
+    _existing_pr(
+        w,
+        1,
+        [
+            ("build the product", "completed", "success"),
+            ("Frappe tests", "completed", "cancelled"),
+            ("Upgrade rehearsal", "completed", "failure"),
+        ],
+    )
+    w.drive(2)
+    assert len(w.prompts(1)) == 1 and "Upgrade rehearsal" in w.prompts(1)[0]
