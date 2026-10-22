@@ -62,7 +62,14 @@ class LocalForge:
             d["issues"][str(number)]["state"] = state
 
     def add_pull(
-        self, number: int, head_ref: str, head_sha: str, body: str = "", base: str = "main", mergeable: bool | None = True
+        self,
+        number: int,
+        head_ref: str,
+        head_sha: str,
+        body: str = "",
+        base: str = "main",
+        mergeable: bool | None = True,
+        draft: bool = False,
     ) -> None:
         with self._db() as d:
             d["pulls"][str(number)] = {
@@ -71,6 +78,7 @@ class LocalForge:
                 "body": body,
                 "base": base,
                 "mergeable": mergeable,
+                "draft": draft,
                 "state": "open",
                 "title": f"PR {number}",
             }
@@ -137,6 +145,7 @@ class LocalForge:
             p.get("title", ""),
             p.get("mergeable"),
             merged=p["state"] == "merged",
+            draft=bool(p.get("draft")),
         )
 
     def open_pulls(self) -> list[PullRequest]:
@@ -183,6 +192,10 @@ class LocalForge:
                 if m.group(1) in d["issues"]:
                     d["issues"][m.group(1)]["state"] = CLOSED
         return True
+
+    def mark_ready(self, number: int) -> None:
+        with self._db() as d:
+            d["pulls"][str(number)]["draft"] = False
 
     def close_pull(self, number: int, comment: str = "") -> None:
         with self._db() as d:

@@ -139,4 +139,7 @@ class Prober:
             cp = subprocess.run(launch.argv, cwd="/tmp", env=env, capture_output=True, text=True, timeout=150)
         except (subprocess.TimeoutExpired, OSError):
             return False
+        out = cp.stdout + cp.stderr
+        if agent.setup_failed(out) or agent.provider_failed(out):
+            return False
         return cp.returncode == 0 and ("OK" in cp.stdout or name == "command")

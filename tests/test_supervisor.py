@@ -271,3 +271,47 @@ def test_conflicted_pr_without_ci_is_handed_back(world):
     w.drive(4)
     assert w.rec(1).status == DONE
     assert "conflicts with" in w.prompts(1)[1]
+
+
+def test_an_agent_that_cannot_start_does_not_spend_attempts(world):
+    """A deterministic setup failure (not logged in, refused by a router) is not the issue's fault."""
+    w = world(agents={"max_attempts": 1})
+    w.issue(1, "setup-fail", "close")
+    w.drive(4)
+    r = w.rec(1)
+    assert r.status == DONE and r.attempts == 0 and r.launch_failures == 1
+
+
+def test_repeated_setup_failures_block_with_a_setup_diagnosis(world):
+    w = world()
+    w.issue(1, "setup-fail", "setup-fail", "setup-fail", "close")
+    w.drive(5)
+    r = w.rec(1)
+    assert r.status == BLOCKED and r.attempts == 0
+    assert "agent's setup" in r.blocked_reason and "Failed to authenticate" in r.blocked_reason
+
+
+def test_an_old_launchs_error_is_not_evidence(world):
+    """Only this launch's output is judged: an error printed by an earlier launch must not count again."""
+    w = world(agents={"max_attempts": 2})
+    w.issue(1, "setup-fail", "nothing", "close")
+    w.drive(3)
+    r = w.rec(1)
+    assert r.launch_failures == 1 and r.attempts == 1  # the "nothing" exit was judged on its own output
+
+
+def test_green_draft_is_marked_ready(world):
+    """Drafts cannot be merged; once green with the agent finished, nohalt marks them ready."""
+    w = world(integrate={"mode": "direct"})
+    w.issue(1, "pr-draft")
+    w.drive(4)
+    assert any("was a draft; marked ready" in m for m in w.messages)
+    assert w.forge.data()["merged"] and w.rec(1).status == DONE
+
+
+def test_guard_log_exists_from_the_start(world):
+    w = world()
+    w.issue(1, "close")
+    w.sup.run(once=True)
+    w.wait_agents()
+    assert (w.sup.state.logs_dir / "guard.log").exists()

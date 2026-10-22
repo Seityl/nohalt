@@ -186,6 +186,7 @@ class Supervisor:
         signal.signal(signal.SIGTERM, on_signal)
         signal.signal(signal.SIGINT, on_signal)
         shims.install(self.state.bin_dir)
+        (self.state.logs_dir / "guard.log").touch()  # exists, and stays empty while no agent oversteps
         self.say(
             f"=== nohalt supervising {self.cfg.project.repo} (base {self.cfg.project.base_branch}, "
             f"up to {self.cfg.agents.max_parallel} agents, integrate={self.cfg.integrate.mode})"
@@ -327,8 +328,10 @@ class Supervisor:
             self._done(rec, report, "closed" if issue.state == CLOSED else "no longer exists")
             return
         a = self.cfg.agents
-        log_tail = tail(Path(rec.log), 6000)
+        # Only this launch's output: an error from an earlier launch is not evidence.
+        log_tail = tail(Path(rec.log), 6000).rsplit("\n--- nohalt launch ", 1)[-1]
         agent = self._agent(rec.model)
+        ran_for = now() - rec.started_at if rec.started_at else 0
         rec.pid = 0
 
         if killed == "handover":
@@ -338,6 +341,24 @@ class Supervisor:
         if agent and agent.usage_limited(log_tail):
             self.router.prober.mark_limited(rec.model)
             return self._requeue(rec, "the plan's usage limit was reached", resume=True, delay=900)
+        if not killed and agent and ran_for < 300 and agent.setup_failed(log_tail):
+            # The agent never got started: not logged in, refused by a model
+            # router, given an option it rejects. Retrying the issue on the same
+            # setup cannot succeed, so it costs no attempt; the model is marked
+            # as not answering (a fallback is used, or launches wait for a probe
+            # that passes), and repeated failures go to a human.
+            self.router.prober.mark_limited(rec.model)
+            rec.launch_failures += 1
+            line = next((ln.strip() for ln in log_tail.splitlines() if agents.SETUP_ERROR.search(ln)), "?")
+            if rec.launch_failures >= 3:
+                return self._block(
+                    rec,
+                    f"the agent could not start on {rec.model} ({line[:200]}); this is the agent's setup, not the issue -- "
+                    "fix its login or configuration, check `nohalt doctor --probe`",
+                )
+            return self._requeue(
+                rec, f"the agent could not start on {rec.model}: {line[:160]} (not counted as an attempt)", resume=False
+            )
         if not killed and agent and agent.provider_failed(log_tail):
             rec.provider_retries += 1
             if rec.provider_retries > a.provider_retries:
@@ -471,6 +492,16 @@ class Supervisor:
                     f"`origin/{self.cfg.project.base_branch}` into your branch, keeping both "
                     "sides' behaviour, re-run the tests you touched, push, and stop.",
                 )
+        if v == forge_mod.base.GREEN and pr.draft:
+            # The prompt asks agents to open a draft early. The agent has finished
+            # and the checks are green: the draft has done its job, and forges
+            # refuse to merge drafts, so nohalt marks it ready.
+            try:
+                self.forge.mark_ready(pr.number)
+            except ForgeError as e:
+                self.state.log(f"#{rec.issue}: could not mark {self.pr(pr.number)} ready yet ({e})")
+                return
+            self.say(f"#{rec.issue}: {self.pr(pr.number)} was a draft; marked ready (green, agent finished)")
         if v == forge_mod.base.GREEN and rec.status != READY:
             rec.status = READY
             rec.event(f"{self.pr(pr.number)} green on {pr.head_sha[:8]}")
@@ -625,7 +656,7 @@ class Supervisor:
                     self._block(rec, rec.blocked_reason)
                     report.blocked.append(entry.issue)
                     continue
-                rec.attempts = rec.provider_retries = rec.ci_rounds = rec.timeouts = rec.revivals = 0
+                rec.attempts = rec.provider_retries = rec.ci_rounds = rec.timeouts = rec.revivals = rec.launch_failures = 0
                 rec.status, rec.resume, rec.not_before, rec.labelled = QUEUED, True, 0, False
                 rec.note = "A human removed the blocked label: try again."
                 rec.event("unblocked by a human")

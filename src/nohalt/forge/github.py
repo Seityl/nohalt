@@ -155,6 +155,24 @@ class GitHub:
             return False
         return bool(d.get("merged"))
 
+    def mark_ready(self, number: int) -> None:
+        """Mark a draft ready for review (GraphQL: REST has no endpoint for it)."""
+        node = self._api(self._r(f"pulls/{number}"))["node_id"]
+        cp = run(
+            [
+                self.gh,
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }",
+                "-f",
+                f"id={node}",
+            ],
+            timeout=self.timeout,
+        )
+        if cp.returncode != 0:
+            raise ForgeError(f"mark ready #{number}: {(cp.stderr or cp.stdout).strip()[:300]}")
+
     def close_pull(self, number: int, comment: str = "") -> None:
         if comment:
             self.comment(number, comment)

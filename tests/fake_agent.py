@@ -9,6 +9,8 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     pr-red           same, with red checks
     pr-pending       same, with checks still running
     pr-conflict      same, with no checks at all and a merge conflict
+    pr-draft         same as pr-green, opened as a draft
+    setup-fail       die the way an agent dies when its CLI is not logged in
     busy <seconds>   run a quiet shell command that long (a test run, not a hang)
     provider-error   die the way an agent dies when the model server is down
     usage-limit      stop on a subscription usage limit
@@ -36,6 +38,8 @@ def git(*args: str) -> str:
 
 
 def open_pr(forge: LocalForge, issue: int, checks: str, base: str = "main") -> None:
+    draft = checks == "draft"
+    checks = "green" if draft else checks
     Path(f"work-{issue}.txt").write_text(f"work for {issue} at {time.time()}\n")
     git("add", "-A")
     git("-c", "user.name=agent", "-c", "user.email=agent@example.com", "commit", "-q", "-m", f"work for #{issue}")
@@ -43,7 +47,7 @@ def open_pr(forge: LocalForge, issue: int, checks: str, base: str = "main") -> N
     git("push", "-q", "origin", branch)
     sha = git("rev-parse", "HEAD")
     n = forge.data()["next"]
-    forge.add_pull(n, branch, sha, body=f"Closes #{issue}", base=base, mergeable=checks != "conflict")
+    forge.add_pull(n, branch, sha, body=f"Closes #{issue}", base=base, mergeable=checks != "conflict", draft=draft)
     with forge._db() as d:
         d["branches"][branch] = sha
     if checks == "green":
@@ -77,6 +81,9 @@ def main() -> int:
         subprocess.run(["bash", "-c", f"{sys.executable} -c 'import time; time.sleep({secs})'"], check=False)
     elif action == "provider-error":
         print("Error: Bad Gateway", flush=True)
+        return 1
+    elif action == "setup-fail":
+        print("Failed to authenticate. API Error: 401 -- try 'claude login'", flush=True)
         return 1
     elif action == "usage-limit":
         print("[agent] rate_limit five_hour rejected", flush=True)
