@@ -131,6 +131,7 @@ class TrainCfg:
 class IntegrateCfg:
     mode: str = "none"  # none | direct | train
     required_checks: list[str] = field(default_factory=list)  # empty: every check run must pass
+    ignore_checks: list[str] = field(default_factory=list)  # never count, e.g. a suite cancelled on PRs by policy
     merge_method: str = "squash"
     cd_workflow: str = ""
     ci_workflow: str = ""

@@ -89,6 +89,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         report = sup.tick()
         print(f"[dry run] open: {report.open_}")
         print(f"[dry run] would launch now: {' '.join('#' + str(i) for i in report.launched) or 'none'}")
+        print(f"[dry run] would adopt (already have a PR): {' '.join(report.adopted) or 'none'}")
         print(f"[dry run] waiting: {' '.join(report.waiting) or 'none'}")
         print(f"[dry run] blocked: {' '.join('#' + str(i) for i in report.blocked) or 'none'}")
         return 0

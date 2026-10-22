@@ -83,6 +83,7 @@ class TickReport:
     running: list[int] = field(default_factory=list)
     waiting: list[str] = field(default_factory=list)
     blocked: list[int] = field(default_factory=list)
+    adopted: list[str] = field(default_factory=list)
     open_: int = 0
     complete: bool = False
 
@@ -453,6 +454,8 @@ class Supervisor:
             checks = self.forge.checks(pr.head_sha)
         except ForgeError:
             return
+        ignored = set(self.cfg.integrate.ignore_checks)
+        checks = [c for c in checks if c.name not in ignored]
         v = ci_verdict(checks, self.cfg.integrate.required_checks)
         if v == forge_mod.base.RED:
             if pr.head_sha in rec.swept:
@@ -678,6 +681,23 @@ class Supervisor:
             if pending:
                 report.waiting.append(f"#{entry.issue}<-{','.join('#' + str(d) for d in pending)}")
                 continue
+            if not rec.started_at and not rec.pr:
+                # Work that already has an open PR (started by hand, or by a runner
+                # nohalt replaced) is watched, not redone: an agent is launched only
+                # if the PR needs one (red, conflicting, closed unmerged).
+                known, existing = self.pr_for(rec)
+                if not known:
+                    continue
+                if existing and self.dry_run:
+                    report.adopted.append(f"#{entry.issue}<-{self.pr(existing.number)}")
+                    continue
+                if existing:
+                    rec.pr, rec.pr_sha, rec.branch = existing.number, existing.head_sha, existing.head_ref
+                    rec.status = WAITING_CI
+                    rec.event(f"adopted existing {self.pr(existing.number)} ({existing.head_ref})")
+                    self.state.put(rec)
+                    self.say(f"#{entry.issue}: already has {self.pr(existing.number)} -- adopted, watching it through CI")
+                    continue
             if rec.not_before > now() or stopping:
                 continue
             model, _ = self.router.wanted(issue)
