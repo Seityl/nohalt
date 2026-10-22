@@ -116,6 +116,8 @@ def test_builtin_prompts_render(tmp_path):
     vals = prompt_mod.values(cfg, issue=5, title="T", branch="feature/5-t", worktree=tmp_path / "5")
     body = prompt_mod.render(prompt_mod.template(cfg), vals)
     assert "issue #5" in body and "Closes #5" in body and "You do not merge" in body
+    # REST, never the GraphQL-backed `gh issue view`
+    assert "gh api repos/o/r/issues/5 --jq" in body and "gh issue view" not in body
     cfg2 = config_mod.from_dict(
         {"project": {"repo": "o/r"}, "stack": {"name": "frappe", "bench": "/b", "app": "a", "sites": ["s"]}}, root=tmp_path
     )
