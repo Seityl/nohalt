@@ -132,7 +132,9 @@ class TrainCfg:
 class IntegrateCfg:
     mode: str = "none"  # none | direct | train
     required_checks: list[str] = field(default_factory=list)  # empty: every check run must pass
-    ignore_checks: list[str] = field(default_factory=list)  # never count, e.g. a suite cancelled on PRs by policy
+    ignore_checks: list[str] = field(default_factory=list)  # PRs only: never count, e.g. a suite cancelled on PRs by policy
+    base_ignore_checks: list[str] = field(default_factory=list)  # base branch after a merge: checks that never count there
+    base_cancelled_limit: int = 3  # cancelled base runs in a row before merging is held for a human
     merge_method: str = "squash"
     cd_workflow: str = ""
     ci_workflow: str = ""

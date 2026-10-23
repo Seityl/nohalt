@@ -244,6 +244,9 @@ class GitLab:
             out.append(Check(j.get("name") or "", status, conclusion, j.get("web_url") or ""))
         return out
 
+    def managed_suites(self, sha: str) -> set[int]:
+        return set()  # GitLab has no forge-managed jobs posting on the base branch
+
     @staticmethod
     def _run(p: dict[str, Any]) -> Run:
         status, conclusion = _JOB.get(p.get("status", ""), ("queued", ""))

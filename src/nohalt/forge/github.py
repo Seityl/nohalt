@@ -181,7 +181,27 @@ class GitHub:
     # -- checks and runs ----------------------------------------------------------------------
     def checks(self, sha: str) -> list[Check]:
         rows = self._api(self._r(f"commits/{sha}/check-runs?per_page=100"), paginate=True, items=".check_runs[]")
-        return [Check(r["name"], r["status"], r.get("conclusion") or "", r.get("details_url") or "") for r in rows]
+        return [
+            Check(
+                r["name"],
+                r["status"],
+                r.get("conclusion") or "",
+                r.get("details_url") or "",
+                int((r.get("check_suite") or {}).get("id") or 0),
+            )
+            for r in rows
+        ]
+
+    def managed_suites(self, sha: str) -> set[int]:
+        """Check suites of GitHub-managed jobs on a commit (event "dynamic": Dependabot
+        updates, the dependency graph). They post check runs on the base branch
+        after a merge, but they are not the pipeline the merge triggered."""
+        data = self._api(self._r(f"actions/runs?head_sha={sha}&per_page=100"))
+        return {
+            int(r["check_suite_id"])
+            for r in data.get("workflow_runs", [])
+            if r.get("event") == "dynamic" and r.get("check_suite_id")
+        }
 
     def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "") -> list[Run]:
         q = ["per_page=100"]

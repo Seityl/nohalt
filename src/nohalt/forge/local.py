@@ -205,7 +205,11 @@ class LocalForge:
 
     def checks(self, sha: str) -> list[Check]:
         with self._db() as d:
-            return [Check(*c) for c in d["checks"].get(sha, [])]
+            return [Check(*c) for c in d["checks"].get(sha, [])]  # [name, status, conclusion(, url, suite)]
+
+    def managed_suites(self, sha: str) -> set[int]:
+        with self._db() as d:
+            return set(d.get("managed_suites", {}).get(sha, []))
 
     def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "") -> list[Run]:
         with self._db() as d:

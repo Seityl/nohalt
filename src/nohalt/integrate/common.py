@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import queue
 from ..forge import CLOSED, OPEN, ForgeError, verdict
-from ..forge.base import GREEN, RED
+from ..forge.base import GREEN, PENDING, RED
 from ..util import now
 
 if TYPE_CHECKING:
@@ -114,6 +114,15 @@ class PipelineGate:
 
     def open(self) -> bool:
         """May the integrator merge now?"""
+        if self.sup.state.has("BASE_NO_VERDICT"):
+            if not self.sup.state.has("base-no-verdict-said"):
+                self.sup.state.set_flag("base-no-verdict-said")
+                self.sup.say(
+                    "merging stopped: the base pipeline keeps getting cancelled, so it has no verdict "
+                    "(look at it, then delete <state>/BASE_NO_VERDICT)"
+                )
+            return False
+        self.sup.state.clear_flag("base-no-verdict-said")
         if self.sup.state.has("DEPLOY_BLOCKED"):
             if not self.sup.state.has("deploy-blocked-said"):
                 self.sup.state.set_flag("deploy-blocked-said")
@@ -146,29 +155,75 @@ class PipelineGate:
         self._save(st)
 
     def _pipeline(self, sha: str) -> str:
-        """'success', 'failure', 'ci-failure', 'pending' or 'none' (nothing runs on this commit)."""
+        """'success', 'failure', 'ci-failure', 'cancelled', 'pending' or 'none' (nothing runs on this commit).
+
+        On the base branch every check counts except ``base_ignore_checks``.
+        ``ignore_checks`` is for pull requests only: a suite skipped on PRs by
+        policy runs on the base after each merge, and this is its only gate.
+        'cancelled' means no verdict: neither green nor red.
+        """
         ic = self.cfg.integrate
         f = self.sup.forge
-        if not f.runs(head_sha=sha) and not f.checks(sha):
+        # Only the pipeline the merge triggered: forge-managed jobs (Dependabot
+        # updates and the like) post their own runs on the base head afterwards.
+        managed = f.managed_suites(sha)
+        checks = [c for c in f.checks(sha) if c.name not in ic.base_ignore_checks and not (c.suite and c.suite in managed)]
+        workflows = [w for w in (ic.cd_workflow, ic.ci_workflow) if w]
+        if not checks and not any(f.runs(head_sha=sha, workflow=w) for w in workflows):
             return "none"
         if ic.cd_workflow:
             runs = f.runs(head_sha=sha, workflow=ic.cd_workflow)
             done = [r for r in runs if r.status == "completed"]
             if done:
-                return "success" if done[0].conclusion == "success" else "failure"
+                return _run_result(done[0].conclusion)
             # CD is skipped when CI on the base fails: catch that instead of waiting it out.
             if not runs and ic.ci_workflow:
                 ci = [r for r in f.runs(head_sha=sha, workflow=ic.ci_workflow) if r.status == "completed"]
+                if ci and ci[0].conclusion == "cancelled":
+                    return "cancelled"
                 if ci and ci[0].conclusion not in ("success", "skipped", "neutral"):
                     return "ci-failure"
             return "pending"
         if ic.ci_workflow:
             done = [r for r in f.runs(head_sha=sha, workflow=ic.ci_workflow) if r.status == "completed"]
             if done:
-                return "success" if done[0].conclusion == "success" else "failure"
+                return _run_result(done[0].conclusion)
             return "pending"
-        v = verdict(f.checks(sha), ic.required_checks, ic.ignore_checks)
+        v = verdict(checks, [])
+        if v == PENDING and checks and all(c.status == "completed" for c in checks):
+            return "cancelled"  # every run finished; the only non-green ones were cancelled
         return {GREEN: "success", RED: "failure"}.get(v, "pending")
+
+    def _cancelled(self, st: dict[str, Any]) -> bool:
+        """The base run was cancelled: no verdict. Re-run it; after a few in a row, hold for a human."""
+        w = st["watch"]
+        if w.get("rerun_at") and now() - w["rerun_at"] < 600:
+            return False  # the re-run asked for has not started yet
+        w["cancelled"] = w.get("cancelled", 0) + 1
+        limit = self.cfg.integrate.base_cancelled_limit
+        if w["cancelled"] >= limit:
+            reason = f"the base pipeline on {w['sha'][:7]} after {w['what']} was cancelled {w['cancelled']} times in a row"
+            self.sup.state.set_flag("BASE_NO_VERDICT", reason + "\n")
+            self.sup.say(f"{reason}: no verdict -- merging held until a human looks")
+            st.pop("watch")
+            self._save(st)
+            return False
+        rerun = 0
+        try:
+            for r in self.sup.forge.runs(head_sha=w["sha"]):
+                if r.conclusion == "cancelled":
+                    self.sup.forge.rerun_failed(r.id)
+                    rerun += 1
+        except ForgeError as e:
+            self.sup.say(f"could not re-run the cancelled base pipeline: {e}")
+        w["rerun_at"] = now()
+        w["since"] = now()
+        self._save(st)
+        self.sup.say(
+            f"base pipeline on {w['sha'][:7]} after {w['what']} was cancelled ({w['cancelled']}/{limit}): "
+            f"no verdict, re-running {rerun} run(s)"
+        )
+        return False
 
     def _check(self, st: dict[str, Any]) -> bool:
         w = st["watch"]
@@ -187,7 +242,11 @@ class PipelineGate:
             st.pop("watch")
             self._save(st)
             return not self.sup.state.has("DEPLOY_BLOCKED")
+        elif result == "cancelled":
+            return self._cancelled(st)
         elif result == "pending":
+            if w.pop("rerun_at", None) is not None:
+                self._save(st)  # the re-run has started
             if now() - w["since"] < self.cfg.integrate.cd_timeout:
                 return False
             result = "timeout"
@@ -206,6 +265,12 @@ class PipelineGate:
                 st["fix_issue"] = n
         self._save(st)
         return False
+
+
+def _run_result(conclusion: str) -> str:
+    if conclusion == "success":
+        return "success"
+    return "cancelled" if conclusion == "cancelled" else "failure"
 
 
 def close_merged(sup: Supervisor, issues: list[int], via: str) -> None:
