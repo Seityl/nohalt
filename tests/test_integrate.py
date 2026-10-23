@@ -255,3 +255,77 @@ def test_train_closes_the_prs_it_carried_once_the_release_merges(world, repo):
     assert pulls["101"]["state"] == "closed" and pulls["102"]["state"] == "closed"
     notes = [c[1] for c in w.forge.data()["comments"] if c[0] in (101, 102)]
     assert len(notes) == 2 and all("merged into" in t for t in notes)
+
+
+def _merged_and_watching(w):
+    """Run one green PR through direct integration; return the base sha the gate now watches."""
+    w.issue(1, "pr-green")
+    w.issue(2, "pr-green")
+    w.drive(4)
+    st = w.sup.state.load("integrate.json", {})
+    assert "watch" in st, w.messages
+    return st["watch"]["sha"]
+
+
+def test_a_suite_ignored_on_prs_still_gates_the_base(world):
+    """DEP-01: a suite skipped on PRs by policy counts on the base after a merge -- red opens fix-forward."""
+    w = world(integrate={"mode": "direct", "ignore_checks": ["full suite"]})
+    sha = _merged_and_watching(w)
+    merged = list(w.forge.data()["merged"])
+    w.forge.set_checks(sha, [("ci", "completed", "success"), ("full suite", "completed", "failure")])
+    w.drive(2)
+    st = w.sup.state.load("integrate.json", {})
+    assert st.get("fix_issue"), w.messages
+    assert not any("pipeline green" in m for m in w.messages)
+    assert w.forge.data()["merged"] == merged  # merging held
+
+
+def test_base_ignore_checks_opts_a_check_out_on_the_base(world):
+    w = world(integrate={"mode": "direct", "ignore_checks": ["lint"], "base_ignore_checks": ["lint"]})
+    sha = _merged_and_watching(w)
+    w.forge.set_checks(sha, [("ci", "completed", "success"), ("lint", "completed", "failure")])
+    w.drive(2)
+    assert any("pipeline green" in m for m in w.messages)
+
+
+def test_a_suite_ignored_on_prs_is_still_ignored_on_a_pr(world):
+    w = world(integrate={"mode": "direct", "ignore_checks": ["full suite"]})
+    w.forge.add_issue(1, "Issue 1")
+    (w.scripts / "1.txt").write_text("close\n")
+    w.queue.write_text("1:\n")
+    w.forge.add_pull(501, "feature/1-x", "sha-1", body="Closes #1")
+    w.forge.set_checks("sha-1", [("ci", "completed", "success"), ("full suite", "completed", "failure")])
+    w.drive(2)
+    assert 501 in w.forge.data()["merged"]
+
+
+def test_cancelled_base_runs_are_no_verdict_rerun_then_flagged(world):
+    """A cancelled base run is neither green nor red: re-run it, and after three in a row hold for a human."""
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)
+    merged = list(w.forge.data()["merged"])
+    w.forge.add_run(Run(77, "Tests", sha, "completed", "cancelled", "main", ""))
+    for attempt in (1, 2, 3):
+        w.forge.set_checks(sha, [("ci", "completed", "success"), ("full suite", "completed", "cancelled")])
+        w.drive(1)
+        if attempt < 3:
+            assert w.forge.data()["reruns"].count(77) == attempt
+            w.forge.set_checks(sha, [("ci", "completed", "success"), ("full suite", "in_progress", "")])
+            w.drive(1)  # the re-run started
+    assert w.sup.state.has("BASE_NO_VERDICT")
+    st = w.sup.state.load("integrate.json", {})
+    assert not st.get("fix_issue")  # no verdict is not a red
+    assert not any("pipeline green" in m for m in w.messages)
+    assert w.forge.data()["merged"] == merged  # held
+    w.sup.state.clear_flag("BASE_NO_VERDICT")  # a human looked
+    w.drive(4)
+    assert len(w.forge.data()["merged"]) > len(merged)
+
+
+def test_a_cancelled_ci_workflow_run_is_not_a_failure(world):
+    w = world(integrate={"mode": "direct", "ci_workflow": "CI"})
+    sha = _merged_and_watching(w)
+    w.forge.add_run(Run(5, "CI", sha, "completed", "cancelled", "main", ""))
+    w.drive(1)
+    assert not w.sup.state.load("integrate.json", {}).get("fix_issue")
+    assert 5 in w.forge.data()["reruns"]

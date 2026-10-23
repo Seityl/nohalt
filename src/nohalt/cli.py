@@ -141,7 +141,7 @@ def render_status(cfg: Config) -> str:
     sup_lock = FileLock(state.root / "supervisor.lock")
     holder = sup_lock.held_by()
     up = holder and pid_alive(holder)
-    flags = [f for f in ("STOP", "PAUSE", "DEPLOY_BLOCKED", "BUDGET_EXHAUSTED") if state.has(f)]
+    flags = [f for f in ("STOP", "PAUSE", "DEPLOY_BLOCKED", "BASE_NO_VERDICT", "BUDGET_EXHAUSTED") if state.has(f)]
     mem = ""
     try:
         from .util import mem_available_mb
