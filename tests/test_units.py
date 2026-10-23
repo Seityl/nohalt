@@ -429,3 +429,19 @@ def test_doctor_reports_check_drift(tmp_path, repo):
     )
     assert "never seen on recent commits (misspelt? a PR would wait forever): Build" in cp.stdout, cp.stdout
     assert "count for nothing" in cp.stdout and "Migration Upgrade Test" in cp.stdout
+
+
+def test_github_marks_dynamic_runs_as_managed(monkeypatch):
+    gh = GitHub("o/r")
+
+    def api(path, **kw):
+        if "check-runs" in path:
+            return [
+                {"name": "ci", "status": "completed", "conclusion": "success", "check_suite": {"id": 10}},
+                {"name": "Dependabot", "status": "completed", "conclusion": "failure", "check_suite": {"id": 99}},
+            ]
+        return {"workflow_runs": [{"event": "push", "check_suite_id": 10}, {"event": "dynamic", "check_suite_id": 99}]}
+
+    monkeypatch.setattr(gh, "_api", api)
+    assert [c.suite for c in gh.checks("s")] == [10, 99]
+    assert gh.managed_suites("s") == {99}

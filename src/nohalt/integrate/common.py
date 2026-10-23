@@ -164,7 +164,12 @@ class PipelineGate:
         """
         ic = self.cfg.integrate
         f = self.sup.forge
-        if not f.runs(head_sha=sha) and not f.checks(sha):
+        # Only the pipeline the merge triggered: forge-managed jobs (Dependabot
+        # updates and the like) post their own runs on the base head afterwards.
+        managed = f.managed_suites(sha)
+        checks = [c for c in f.checks(sha) if c.name not in ic.base_ignore_checks and not (c.suite and c.suite in managed)]
+        workflows = [w for w in (ic.cd_workflow, ic.ci_workflow) if w]
+        if not checks and not any(f.runs(head_sha=sha, workflow=w) for w in workflows):
             return "none"
         if ic.cd_workflow:
             runs = f.runs(head_sha=sha, workflow=ic.cd_workflow)
@@ -184,7 +189,6 @@ class PipelineGate:
             if done:
                 return _run_result(done[0].conclusion)
             return "pending"
-        checks = [c for c in f.checks(sha) if c.name not in ic.base_ignore_checks]
         v = verdict(checks, [])
         if v == PENDING and checks and all(c.status == "completed" for c in checks):
             return "cancelled"  # every run finished; the only non-green ones were cancelled

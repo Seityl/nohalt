@@ -329,3 +329,27 @@ def test_a_cancelled_ci_workflow_run_is_not_a_failure(world):
     w.drive(1)
     assert not w.sup.state.load("integrate.json", {}).get("fix_issue")
     assert 5 in w.forge.data()["reruns"]
+
+
+def test_forge_managed_jobs_on_the_base_do_not_count(world):
+    """Dependabot update jobs post their own (often red) check runs on the base head: not the merge's pipeline."""
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)
+    w.forge.set_checks(sha, [("ci", "completed", "success", "", 10), ("Dependabot", "completed", "failure", "", 99)])
+    with w.forge._db() as d:
+        d["managed_suites"] = {sha: [99]}
+    w.drive(2)
+    assert any("pipeline green" in m for m in w.messages)
+    assert not w.sup.state.load("integrate.json", {}).get("fix_issue")
+
+
+def test_only_managed_jobs_on_the_base_means_no_pipeline(world):
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)
+    w.cfg.integrate.base_pipeline_grace = 0
+    w.forge.set_checks(sha, [("Dependabot", "completed", "failure", "", 99)])
+    with w.forge._db() as d:
+        d["managed_suites"] = {sha: [99]}
+    w.drive(2)
+    assert any("no pipeline ran" in m for m in w.messages)
+    assert not w.sup.state.load("integrate.json", {}).get("fix_issue")
