@@ -583,6 +583,9 @@ class Supervisor:
             self.say(f"#{rec.issue}: could not label it blocked yet ({e}); will retry")
 
     def _done(self, rec: IssueRecord, report: TickReport, how: str) -> None:
+        if self.dry_run:  # a dry run reports; it never changes anything
+            report.finished.append(rec.issue)
+            return
         if rec.status == RUNNING and self._alive(rec):
             self._kill(rec, "done", "the issue is closed")
         rec.status = DONE
@@ -591,8 +594,6 @@ class Supervisor:
         self.state.put(rec)
         report.finished.append(rec.issue)
         self.say(f"#{rec.issue}: {how} -- done")
-        if self.dry_run:
-            return
         try:
             rescued = self.trees.remove(rec.issue)
             if rescued:
@@ -636,7 +637,7 @@ class Supervisor:
                 continue
             issue = self.issue(entry.issue)
             if issue.state == MISSING:
-                if rec.status != DONE:
+                if rec.status != DONE and not self.dry_run:
                     rec.status = DONE
                     rec.event("does not exist on the forge; dropped")
                     self.state.put(rec)

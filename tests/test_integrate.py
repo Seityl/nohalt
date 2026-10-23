@@ -224,3 +224,34 @@ def test_inline_issue_puts_the_issue_text_in_the_prompt(world):
         d["issues"]["1"]["body"] = "The export button does nothing."
     w.drive(2)
     assert "The export button does nothing." in w.prompts(1)[0]
+
+
+def test_train_closes_the_prs_it_carried_once_the_release_merges(world, repo):
+    """The release merges each PR's branch, not the PR: left alone, every carried PR stays open forever."""
+    w = world(integrate={"mode": "train"})
+    for n in (1, 2):
+        w.forge.add_issue(n, f"Issue {n}")
+        b = f"feature/{n}-x"
+        git(repo, "checkout", "-q", "-b", b, "main")
+        (repo / f"f{n}.txt").write_text("x\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"#{n}")
+        git(repo, "push", "-q", "origin", b)
+        sha = git(repo, "rev-parse", "HEAD")
+        w.forge.add_pull(100 + n, b, sha, body=f"Closes #{n}")
+        w.forge.set_checks(sha, [("ci", "completed", "success")])
+        r = w.sup.state.get(n)
+        r.status, r.pr, r.pr_sha, r.branch = READY, 100 + n, sha, b
+        w.sup.state.put(r)
+    git(repo, "checkout", "-q", "main")
+    w.queue.write_text("1:\n2:\n")
+    w.sup.tick()  # builds the release
+    rel = next(p for p in w.forge.open_pulls() if p.head_ref.startswith("release/"))
+    w.forge.set_checks(rel.head_sha, [("ci", "completed", "success")])
+    w.sup._pulls, w.sup._pulls_ok = None, False
+    w.sup.integrator.tick()  # merges it
+    pulls = w.forge.data()["pulls"]
+    assert pulls[str(rel.number)]["state"] == "merged"
+    assert pulls["101"]["state"] == "closed" and pulls["102"]["state"] == "closed"
+    notes = [c[1] for c in w.forge.data()["comments"] if c[0] in (101, 102)]
+    assert len(notes) == 2 and all("merged into" in t for t in notes)

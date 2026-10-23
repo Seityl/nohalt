@@ -387,7 +387,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         name, _ = agents.split_model(m)
         try:
             a = agents.get(name, cfg.agents.options.get(name))
-            binary = a.probe_launch("x", cfg.state_dir).argv[0]
+            binary = getattr(a, "binary", "") or a.probe_launch("x", cfg.state_dir).argv[0]
             check(shutil.which(binary) is not None, f"{m}: {binary} found", f"{m}: {binary} not on PATH")
         except ValueError as e:
             check(False, "", f"{m}: {e}")
@@ -397,7 +397,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         p = Prober(cfg, StateStore(cfg.state_dir))
         for m in sorted(models):
             check(p._probe(m), f"{m} answers", f"{m} does not answer a probe", fatal=False)
-    if cfg.integrate.mode != "none" and not cfg.integrate.required_checks:
+    if cfg.integrate.mode != "none" and not cfg.integrate.required_checks and not cfg.integrate.ignore_checks:
         check(False, "", "[integrate] required_checks is empty: every check run must pass (fine if intended)", fatal=False)
     print("ready" if ok else "not ready")
     return 0 if ok else 1

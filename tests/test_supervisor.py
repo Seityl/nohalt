@@ -387,3 +387,13 @@ def test_a_check_that_must_pass_when_present_still_gates(world):
     )
     w.drive(2)
     assert len(w.prompts(1)) == 1 and "Upgrade rehearsal" in w.prompts(1)[0]
+
+
+def test_dry_run_never_writes_state(world):
+    w = world()
+    w.issue(1, "close")
+    w.forge.set_state(1, "CLOSED")
+    w.queue.write_text("1:\n999:\n")
+    w.sup.dry_run = True
+    w.sup.tick()
+    assert not w.sup.state.exists(1) and not w.sup.state.exists(999)
