@@ -106,6 +106,7 @@ class PipelineGate:
         self.sup = sup
         self.cfg = sup.cfg
         self.counted: list[Check] = []  # the checks behind the last verdict, for the log
+        self.only: int | None = None  # while a fix-forward issue is open: the one issue that may merge
 
     def _st(self) -> dict[str, Any]:
         return self.sup.state.load("integrate.json", {})
@@ -114,7 +115,8 @@ class PipelineGate:
         self.sup.state.save("integrate.json", st)
 
     def open(self) -> bool:
-        """May the integrator merge now?"""
+        """May the integrator merge now? (If ``self.only`` is set, only that issue may.)"""
+        self.only = None
         if self.sup.state.has("BASE_NO_VERDICT"):
             if not self.sup.state.has("base-no-verdict-said"):
                 self.sup.state.set_flag("base-no-verdict-said")
@@ -133,7 +135,10 @@ class PipelineGate:
         st = self._st()
         if st.get("fix_issue"):
             if self.sup.issue(st["fix_issue"], fresh=True).state != CLOSED:
-                return False
+                # Nothing merges on a red pipeline -- except the fix for it, or the
+                # fix-forward issue could never close.
+                self.only = int(st["fix_issue"])
+                return True
             self.sup.say(f"pipeline fix #{st['fix_issue']} closed; merging resumes")
             st.pop("fix_issue")
             self._save(st)
