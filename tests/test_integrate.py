@@ -353,3 +353,38 @@ def test_only_managed_jobs_on_the_base_means_no_pipeline(world):
     w.drive(2)
     assert any("no pipeline ran" in m for m in w.messages)
     assert not w.sup.state.load("integrate.json", {}).get("fix_issue")
+
+
+def test_base_is_not_green_while_a_workflow_run_is_unfinished(world):
+    """A job that waits on another (or a late workflow) has no check run yet: green over a partial set is not green."""
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)
+    w.forge.set_checks(sha, [("build", "completed", "success")])
+    w.forge.add_run(Run(41, "Tests", sha, "in_progress", "", "main", "", "push"))
+    w.drive(2)
+    assert not any("pipeline green" in m for m in w.messages)
+    with w.forge._db() as d:
+        for r in d["runs"]:
+            if r["id"] == 41:
+                r["status"], r["conclusion"] = "completed", "success"
+    w.forge.set_checks(sha, [("build", "completed", "success"), ("tests", "completed", "success")])
+    w.drive(1)
+    assert any("pipeline green" in m and "build ✓" in m and "tests ✓" in m for m in w.messages)
+
+
+def test_a_managed_run_in_progress_does_not_hold_the_verdict(world):
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)
+    w.forge.set_checks(sha, [("build", "completed", "success")])
+    w.forge.add_run(Run(42, "Dependabot", sha, "in_progress", "", "main", "", "dynamic"))
+    w.drive(1)
+    assert any("pipeline green" in m for m in w.messages)
+
+
+def test_a_started_run_without_checks_yet_is_not_no_pipeline(world):
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)
+    w.cfg.integrate.base_pipeline_grace = 0
+    w.forge.add_run(Run(43, "Tests", sha, "queued", "", "main", "", "push"))
+    w.drive(2)
+    assert not any("no pipeline ran" in m for m in w.messages)

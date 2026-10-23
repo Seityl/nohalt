@@ -6,7 +6,7 @@ import subprocess
 from typing import TYPE_CHECKING, Any
 
 from .. import queue
-from ..forge import CLOSED, OPEN, ForgeError, verdict
+from ..forge import CLOSED, OPEN, Check, ForgeError, verdict
 from ..forge.base import GREEN, PENDING, RED
 from ..util import now
 
@@ -105,6 +105,7 @@ class PipelineGate:
     def __init__(self, sup: Supervisor):
         self.sup = sup
         self.cfg = sup.cfg
+        self.counted: list[Check] = []  # the checks behind the last verdict, for the log
 
     def _st(self) -> dict[str, Any]:
         return self.sup.state.load("integrate.json", {})
@@ -162,6 +163,7 @@ class PipelineGate:
         policy runs on the base after each merge, and this is its only gate.
         'cancelled' means no verdict: neither green nor red.
         """
+        self.counted = []
         ic = self.cfg.integrate
         f = self.sup.forge
         # Only the pipeline the merge triggered: forge-managed jobs (Dependabot
@@ -169,7 +171,8 @@ class PipelineGate:
         managed = f.managed_suites(sha)
         checks = [c for c in f.checks(sha) if c.name not in ic.base_ignore_checks and not (c.suite and c.suite in managed)]
         workflows = [w for w in (ic.cd_workflow, ic.ci_workflow) if w]
-        if not checks and not any(f.runs(head_sha=sha, workflow=w) for w in workflows):
+        started = [r for r in f.runs(head_sha=sha) if r.event != "dynamic" and (not workflows or r.name in workflows)]
+        if not checks and not started:
             return "none"
         if ic.cd_workflow:
             runs = f.runs(head_sha=sha, workflow=ic.cd_workflow)
@@ -189,7 +192,12 @@ class PipelineGate:
             if done:
                 return _run_result(done[0].conclusion)
             return "pending"
+        self.counted = checks
         v = verdict(checks, [])
+        if v == GREEN and any(r.status != "completed" for r in f.runs(head_sha=sha) if r.event != "dynamic"):
+            # A job that waits on another, or a workflow that starts late, has no
+            # check run yet: green over the checks that exist so far is not green.
+            return "pending"
         if v == PENDING and checks and all(c.status == "completed" for c in checks):
             return "cancelled"  # every run finished; the only non-green ones were cancelled
         return {GREEN: "success", RED: "failure"}.get(v, "pending")
@@ -251,13 +259,17 @@ class PipelineGate:
                 return False
             result = "timeout"
         if result == "success":
-            self.sup.say(f"pipeline green on {w['sha'][:7]} after {w['what']}")
+            seen = ", ".join(f"{c.name} ✓" for c in self.counted) if self.counted else "workflow"
+            self.sup.say(f"pipeline green on {w['sha'][:7]} after {w['what']} ({seen})")
             if w.get("deploy") and not self.cfg.integrate.cd_workflow:
                 run_deploy(self.sup, f"{w['sha'][:7]} ({w['what']})")
             st.pop("watch")
             self._save(st)
             return not self.sup.state.has("DEPLOY_BLOCKED")
-        self.sup.say(f"pipeline NOT green after {w['what']}: {result}")
+        bad = ", ".join(
+            f"{c.name} {c.conclusion or c.status}" for c in self.counted if c.conclusion not in ("success", "skipped", "neutral")
+        )
+        self.sup.say(f"pipeline NOT green after {w['what']}: {result}" + (f" ({bad})" if bad else ""))
         st.pop("watch")
         if self.cfg.integrate.fix_forward:
             n = open_fix_forward(self.sup, w["what"], w["sha"], result)
