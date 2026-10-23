@@ -181,6 +181,8 @@ class Train:
 
         out = []
         recs = sorted((r for r in self.sup.state.all() if r.status == READY and r.pr), key=lambda r: rank(r.issue))
+        if self.gate.only is not None:
+            recs = [r for r in recs if r.issue == self.gate.only]
         for rec in recs:
             if rec.issue in held:
                 continue

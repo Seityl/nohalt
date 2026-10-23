@@ -388,3 +388,21 @@ def test_a_started_run_without_checks_yet_is_not_no_pipeline(world):
     w.forge.add_run(Run(43, "Tests", sha, "queued", "", "main", "", "push"))
     w.drive(2)
     assert not any("no pipeline ran" in m for m in w.messages)
+
+
+def test_the_fix_forward_pr_merges_while_everything_else_waits(world):
+    """Nothing merges on a red pipeline except its fix -- or the fix-forward issue could never close."""
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)  # #1 merged, #2 green and waiting
+    w.forge.set_checks(sha, [("ci", "completed", "failure")])
+    w.sup.tick()
+    fix = w.sup.state.load("integrate.json", {}).get("fix_issue")
+    assert fix
+    (w.scripts / f"{fix}.txt").write_text("pr-green\n")
+    merged_before = list(w.forge.data()["merged"])
+    w.drive(4)
+    merged = w.forge.data()["merged"][len(merged_before) :]
+    fix_pr = w.rec(fix).pr
+    assert merged and merged[0] == fix_pr, (merged, fix_pr, w.messages[-6:])
+    assert w.forge.issue(fix).state == "CLOSED"
+    assert w.rec(2).status != "done" or merged.index(w.rec(2).pr) > 0  # #2 only after the fix
