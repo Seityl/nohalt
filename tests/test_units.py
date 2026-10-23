@@ -372,3 +372,60 @@ def test_setup_failure_detection():
     assert a.setup_failed("Failed to authenticate. API Error: 401 Claude Code process exited")
     assert a.setup_failed("error: option '--thinking-display <display>' argument 'updates' is invalid.")
     assert not a.setup_failed("all tests passed; opened the PR")
+
+
+def test_check_drift():
+    """With required_checks set, a misspelt name waits forever and an unlisted check can go red unnoticed."""
+    from nohalt.forge.base import check_drift
+
+    seen = {"API Tests", "Build Check", "Migration Upgrade Test", "Frappe tests"}
+    missing, uncounted = check_drift(seen, ["API Tests", "Build"], ["Frappe tests"])
+    assert missing == ["Build"]
+    assert uncounted == ["Build Check", "Migration Upgrade Test"]
+    assert check_drift(seen, [], []) == ([], [])
+
+
+def test_verify_pythonpath_subdirs(tmp_path, repo):
+    import io
+
+    from nohalt.verify import run_verify
+
+    cfg = config_mod.from_dict(
+        {
+            "project": {"repo": f"local:{tmp_path}/f.json", "path": str(repo), "state_dir": str(tmp_path / "s")},
+            "verify": {"pythonpath": ["src/api"]},
+        },
+        root=tmp_path,
+    )
+    tree = cfg.worktree_root / "4"
+    tree.mkdir(parents=True)
+    out = io.StringIO()
+    assert run_verify(cfg, tree, 'echo "PP=$PYTHONPATH"', out=out, err=io.StringIO()) == 0
+    assert (
+        run_verify(
+            cfg, tree, f'case "$PYTHONPATH" in {tree}/src/api*) exit 0;; *) exit 9;; esac', out=io.StringIO(), err=io.StringIO()
+        )
+        == 0
+    )
+
+
+def test_doctor_reports_check_drift(tmp_path, repo):
+    import subprocess
+
+    from nohalt.forge.local import LocalForge
+
+    f = LocalForge(tmp_path / "f.json")
+    with f._db() as d:
+        d["branches"]["main"] = "basesha"
+    f.set_checks("basesha", [("API Tests", "completed", "success"), ("Migration Upgrade Test", "completed", "success")])
+    (tmp_path / "q.txt").write_text("1:\n")
+    (tmp_path / "nohalt.toml").write_text(
+        f'[project]\nrepo = "local:{tmp_path}/f.json"\npath = "{repo}"\nstate_dir = "{tmp_path}/s"\n'
+        f'[queue]\nfile = "{tmp_path}/q.txt"\n[models]\ndefault = "command:x"\nprobe = false\n'
+        '[agents.options.command]\nargv = ["true"]\n[integrate]\nrequired_checks = ["API Tests", "Build"]\n'
+    )
+    cp = subprocess.run(
+        [sys.executable, "-m", "nohalt", "--config", str(tmp_path / "nohalt.toml"), "doctor"], capture_output=True, text=True
+    )
+    assert "never seen on recent commits (misspelt? a PR would wait forever): Build" in cp.stdout, cp.stdout
+    assert "count for nothing" in cp.stdout and "Migration Upgrade Test" in cp.stdout

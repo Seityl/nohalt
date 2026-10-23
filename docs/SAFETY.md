@@ -17,7 +17,7 @@ Assume an agent will eventually do anything its tools allow, in good faith, when
 
 ## Guard shims (speed bumps, with a log)
 
-`gh`, `glab`, `git`, `pkill` and `killall` shims go first on every agent's `PATH`. Each refusal is written to `<state>/logs/guard.log`.
+`gh`, `glab`, `git`, `pkill`, `killall` and package-manager shims go first on every agent's `PATH`. Each refusal is written to `<state>/logs/guard.log`.
 
 | Shim | Refuses | Why |
 |---|---|---|
@@ -26,6 +26,7 @@ Assume an agent will eventually do anything its tools allow, in good faith, when
 | `glab` | `mr merge/approve/close/delete`, `issue close/delete/move`, `release *`, `repo delete/archive/transfer`, `api …/merge`, `api …/approve`, `api … state_event=close`, tag and release writes via the API; logs `config get token` and `auth status --show-token` | The GitLab twin of the `gh` shim. |
 | `git` | `stash` (except `list`/`show`) | Worktrees share one stash stack. One agent's pop takes another agent's work. |
 | `git` | pushes to the base branch, tag pushes, `--mirror`, a bare `push` while on the base | Agents push their own branch and nothing else. |
+| `npm`, `pnpm`, `yarn`, `pip`, `pip3`, `uv` | installs, removals and syncs whose target is a `shared_paths` folder | Those folders are links into the main clone: an install in one worktree changes every agent's dependencies. A package manager run by absolute path (`.venv/bin/python -m pip`) is not caught. |
 | `pkill`, `killall` | signalling test, build or interpreter processes outside the caller's worktree | CI runners and other agents run as the same user. One broad `pkill` killed builds on four runners. |
 
 **These are not a sandbox.** An agent with a write token can call the API with `curl`, or run the real binary by its absolute path. The shims block the obvious paths and log the rest. The hard controls live outside nohalt.

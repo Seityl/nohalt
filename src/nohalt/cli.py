@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -282,6 +283,34 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_check_drift(cfg: Config, check: Callable[..., None]) -> None:
+    """Compare required_checks with the checks CI really ran on recent commits."""
+    from . import forge as forge_mod
+    from .forge.base import check_drift
+
+    try:
+        f = forge_mod.make(cfg.project)
+        shas = [f.branch_sha(cfg.project.base_branch)] + [p.head_sha for p in f.open_pulls()[:5]]
+        seen = {c.name for sha in shas if sha for c in f.checks(sha)}
+    except forge_mod.ForgeError as e:
+        check(False, "", f"could not read recent check runs to compare with required_checks: {e}", fatal=False)
+        return
+    missing, uncounted = check_drift(seen, cfg.integrate.required_checks, cfg.integrate.ignore_checks)
+    check(
+        not missing,
+        "every required check has run recently",
+        f"required check(s) never seen on recent commits (misspelt? a PR would wait forever): {', '.join(missing)}",
+        fatal=False,
+    )
+    check(
+        not uncounted,
+        "every check CI runs is required or ignored",
+        f"check(s) CI runs that count for nothing -- red would go unnoticed (add to required_checks or ignore_checks): "
+        f"{', '.join(uncounted)}",
+        fatal=False,
+    )
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
 
@@ -397,6 +426,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         p = Prober(cfg, StateStore(cfg.state_dir))
         for m in sorted(models):
             check(p._probe(m), f"{m} answers", f"{m} does not answer a probe", fatal=False)
+    if cfg.integrate.required_checks:
+        _doctor_check_drift(cfg, check)
     if cfg.integrate.mode != "none" and not cfg.integrate.required_checks and not cfg.integrate.ignore_checks:
         check(False, "", "[integrate] required_checks is empty: every check run must pass (fine if intended)", fatal=False)
     print("ready" if ok else "not ready")

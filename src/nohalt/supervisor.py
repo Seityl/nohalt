@@ -787,6 +787,7 @@ class Supervisor:
                 "NOHALT_REAL_GIT": shims.real("git", env.get("PATH")),
                 "NOHALT_REAL_GLAB": shims.real("glab", env.get("PATH")),
                 "NOHALT_GUARD_LOG": str(self.state.logs_dir / "guard.log"),
+                "NOHALT_SHARED_TARGETS": shims.shared_targets(self.cfg.repo_path, self.cfg.project.shared_paths),
                 "NOHALT_BASE_BRANCH": self.cfg.project.base_branch,
                 "NOHALT_ISSUE": str(issue.number),
                 "GIT_TERMINAL_PROMPT": "0",

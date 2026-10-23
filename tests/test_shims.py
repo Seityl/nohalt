@@ -130,3 +130,73 @@ def test_pkill_only_touches_the_callers_worktree(bin_dir, tmp_path):
         for p in (a, b):
             if p.poll() is None:
                 p.kill()
+
+
+@pytest.fixture
+def shared_setup(tmp_path: Path):
+    """A main clone's node_modules and venv, linked into a worktree, plus fake real package managers."""
+    bin_dir = shims.install(tmp_path / "bin")
+    real = tmp_path / "real"
+    real.mkdir()
+    for pm in ("npm", "pnpm", "yarn", "pip", "uv"):
+        (real / pm).write_text(f'#!/bin/sh\necho REAL-{pm} "$@"\n')
+        (real / pm).chmod(0o755)
+    main = tmp_path / "main"
+    (main / "node_modules").mkdir(parents=True)
+    (main / ".venv").mkdir()
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "package.json").write_text("{}")
+    (wt / "pyproject.toml").write_text("")
+    (wt / "node_modules").symlink_to(main / "node_modules")
+    (wt / ".venv").symlink_to(main / ".venv")
+    (wt / "sub").mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{real}:{os.environ['PATH']}",
+        "NOHALT_GUARD_LOG": str(tmp_path / "guard.log"),
+        "NOHALT_SHARED_TARGETS": shims.shared_targets(main, ["node_modules", ".venv"]),
+    }
+    env.pop("VIRTUAL_ENV", None)
+    return wt, env, tmp_path
+
+
+def pm(env, cwd, *argv, venv: str = ""):
+    e = dict(env)
+    if venv:
+        e["VIRTUAL_ENV"] = venv
+    return subprocess.run(argv, env=e, cwd=cwd, capture_output=True, text=True, timeout=20)
+
+
+@pytest.mark.parametrize("argv", [["npm", "ci"], ["npm", "install", "left-pad"], ["pnpm", "add", "x"], ["yarn"], ["uv", "sync"]])
+def test_installs_through_a_shared_link_are_refused(shared_setup, argv):
+    """SAF: an install in a worktree must not write into the main clone's shared dependencies."""
+    wt, env, tmp = shared_setup
+    cp = pm(env, wt / "sub", *argv)
+    assert cp.returncode == 1 and "refused" in cp.stderr, cp.stdout
+    assert "REFUSED" in (tmp / "guard.log").read_text()
+
+
+def test_pip_into_the_shared_venv_is_refused(shared_setup):
+    wt, env, _ = shared_setup
+    assert pm(env, wt, "pip", "install", "requests", venv=str(wt / ".venv")).returncode == 1
+    assert pm(env, wt, "uv", "pip", "install", "x", venv=str(wt / ".venv")).returncode == 1
+
+
+@pytest.mark.parametrize(
+    "argv", [["npm", "test"], ["npm", "run", "build"], ["pip", "list"], ["uv", "run", "pytest"], ["yarn", "run", "x"]]
+)
+def test_read_only_commands_pass_through(shared_setup, argv):
+    wt, env, _ = shared_setup
+    cp = pm(env, wt, *argv, venv=str(wt / ".venv"))
+    assert cp.returncode == 0 and cp.stdout.startswith(f"REAL-{argv[0]}")
+
+
+def test_installs_into_unshared_folders_pass_through(shared_setup):
+    wt, env, tmp = shared_setup
+    own = tmp / "own"
+    own.mkdir()
+    (own / "package.json").write_text("{}")
+    assert pm(env, own, "npm", "install").stdout.startswith("REAL-npm")
+    env.pop("NOHALT_SHARED_TARGETS")
+    assert pm(env, wt, "npm", "ci").stdout.startswith("REAL-npm")  # no shared paths configured

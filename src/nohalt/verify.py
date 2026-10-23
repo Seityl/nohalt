@@ -72,8 +72,13 @@ def run_verify(cfg: Config, worktree: Path, command: str, *, out=sys.stdout, err
         for note in prepared.notes:
             print(f"verify: {note}", file=out)
         env = {**os.environ, **prepared.env, "NOHALT_SLOT": slot.name, "NOHALT_WORKTREE": str(worktree)}
+        # The worktree's code first, so the command imports this branch, never the main clone.
+        first = [str(worktree / sub) for sub in cfg.verify.pythonpath]
         if cfg.verify.pythonpath_worktree:
-            env["PYTHONPATH"] = str(worktree) + (f":{os.environ['PYTHONPATH']}" if os.environ.get("PYTHONPATH") else "")
+            first.append(str(worktree))
+        if first:
+            rest = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = ":".join(first + ([rest] if rest else []))
         print(f"verify: running -- {command}", file=out, flush=True)
         # close_fds (the default) keeps the lock's descriptor out of the child:
         # a server the command backgrounds must not hold the slot for hours.
