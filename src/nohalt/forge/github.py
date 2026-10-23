@@ -223,6 +223,7 @@ class GitHub:
                     r.get("conclusion") or "",
                     r.get("head_branch") or "",
                     r.get("html_url") or "",
+                    r.get("event") or "",
                 )
             )
         return out

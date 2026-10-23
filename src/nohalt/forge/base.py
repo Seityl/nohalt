@@ -61,6 +61,7 @@ class Run:
     conclusion: str = ""
     branch: str = ""
     url: str = ""
+    event: str = ""  # what started it (GitHub: push, pull_request, dynamic, ...)
 
 
 class ForgeError(RuntimeError):
