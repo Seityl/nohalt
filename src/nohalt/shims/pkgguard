@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# nohalt's package-manager guard for agents (installed as npm, pnpm, yarn,
+# pip, pip3 and uv).
+#
+# [project] shared_paths symlinks untracked dependency folders -- a venv,
+# node_modules -- from the main clone into every worktree. An install run in
+# a worktree writes THROUGH that symlink into the main clone's copy, which
+# every other agent (and whoever works in the clone) is using. So a command
+# that would change packages is refused when its target is a shared path.
+# Everything else, including every read-only command, passes through.
+#
+# Speed bump, not wall: a package manager run by absolute path
+# (`.venv/bin/python -m pip install ...`) does not come through here. The
+# prompt says the same thing in words.
+set -uo pipefail
+
+NAME="$(basename "$0")"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REAL=""
+IFS=: read -ra dirs <<<"$PATH"
+for d in "${dirs[@]}"; do
+  [[ -x "$d/$NAME" && "$(readlink -f "$d/$NAME")" != "$SELF" ]] && { REAL="$d/$NAME"; break; }
+done
+LOG="${NOHALT_GUARD_LOG:-/dev/null}"
+SHARED="${NOHALT_SHARED_TARGETS:-}"   # colon-separated real paths of the shared folders
+
+passthrough() {
+  [[ -n "$REAL" ]] || { echo "$NAME (nohalt guard): the real $NAME was not found" >&2; exit 127; }
+  exec "$REAL" "$@"
+}
+[[ -n "$SHARED" ]] || passthrough "$@"
+
+# The first argument that is not an option.
+sub=""
+for a in "$@"; do [[ "$a" == -* ]] || { sub="$a"; break; }; done
+second=""
+seen=0
+for a in "$@"; do
+  [[ "$a" == -* ]] && continue
+  if ((seen)); then second="$a"; break; fi
+  [[ "$a" == "$sub" ]] && seen=1
+done
+
+mutating=0
+kind=node
+case "$NAME" in
+  npm) case "$sub" in install | i | ci | add | uninstall | remove | rm | un | r | update | up | upgrade | prune | dedupe | ddp | link | ln | rebuild) mutating=1 ;; esac ;;
+  pnpm) case "$sub" in install | i | add | remove | rm | uninstall | un | update | up | upgrade | prune | link | rebuild) mutating=1 ;; esac ;;
+  yarn) case "$sub" in "" | install | add | remove | upgrade | up | link) mutating=1 ;; esac ;;
+  pip | pip3) kind=venv; case "$sub" in install | uninstall) mutating=1 ;; esac ;;
+  uv)
+    kind=project-venv
+    case "$sub" in
+      sync | add | remove) mutating=1 ;;
+      pip) kind=venv; case "$second" in install | uninstall | sync) mutating=1 ;; esac ;;
+    esac ;;
+esac
+((mutating)) || passthrough "$@"
+
+# What the command would change.
+target=""
+if [[ "$kind" == node || "$kind" == project-venv ]]; then
+  dir="$PWD"
+  marker=package.json
+  [[ "$kind" == project-venv ]] && marker=pyproject.toml
+  while [[ "$dir" != / && ! -f "$dir/$marker" ]]; do dir="$(dirname "$dir")"; done
+  [[ -f "$dir/$marker" ]] || dir="$PWD"
+  if [[ "$kind" == node ]]; then target="$dir/node_modules"; else target="${UV_PROJECT_ENVIRONMENT:-$dir/.venv}"; fi
+else
+  target="${VIRTUAL_ENV:-}"
+fi
+[[ -n "$target" && -e "$target" ]] || passthrough "$@"
+real_target="$(readlink -f "$target")"
+
+IFS=: read -ra shared <<<"$SHARED"
+for s in "${shared[@]}"; do
+  [[ -n "$s" ]] || continue
+  if [[ "$real_target" == "$s" || "$real_target" == "$s"/* ]]; then
+    printf '%s  REFUSED  %s %s  (target %s, in %s)\n' "$(date '+%F %T')" "$NAME" "$*" "$real_target" "$PWD" >>"$LOG" 2>/dev/null || true
+    cat >&2 <<WHY
+
+$NAME (nohalt guard): refused -- this would change $target,
+which is shared with every other agent: it is a link to the main clone's copy.
+
+Use the packages as they are. If your issue really needs a dependency added
+or changed, edit the manifest (package.json / pyproject.toml), say so in your
+pull request, and leave installing to CI and the maintainers.
+WHY
+    exit 1
+  fi
+done
+passthrough "$@"

@@ -19,7 +19,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'   # or: uv venv && uv
 .venv/bin/pytest -q            # the whole suite runs in well under a minute
 .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 .venv/bin/mypy
-shellcheck -S warning src/nohalt/shims/gh src/nohalt/shims/glab src/nohalt/shims/git src/nohalt/shims/pkill
+shellcheck -S warning src/nohalt/shims/gh src/nohalt/shims/glab src/nohalt/shims/git src/nohalt/shims/pkill src/nohalt/shims/pkgguard
 ```
 
 Optional: `pre-commit install` runs ruff, gitleaks and shellcheck before each commit.

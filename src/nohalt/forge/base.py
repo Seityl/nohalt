@@ -123,3 +123,16 @@ def verdict(checks: list[Check], required: list[str], ignore: list[str] | tuple[
     if all(c.status == "completed" and c.conclusion in _OK for c in relevant):
         return GREEN
     return PENDING
+
+
+def check_drift(seen: set[str], required: list[str], ignore: list[str]) -> tuple[list[str], list[str]]:
+    """(required names never seen, seen names that count for nothing).
+
+    With ``required`` set only the named checks count: a misspelt name waits
+    forever, and a real check left off the list can go red unnoticed.
+    """
+    if not required or not seen:
+        return [], []
+    missing = sorted(set(required) - seen)
+    uncounted = sorted(seen - set(required) - set(ignore))
+    return missing, uncounted

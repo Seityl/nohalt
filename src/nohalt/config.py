@@ -114,6 +114,7 @@ class VerifyCfg:
     reset: str = ""  # put it at the schema of the commit under test
     env: str = ""  # prints KEY=VALUE lines to export
     pythonpath_worktree: bool = False
+    pythonpath: list[str] = field(default_factory=list)  # worktree subdirectories put first on PYTHONPATH (src layouts)
     clean_pycache: bool = True
 
 

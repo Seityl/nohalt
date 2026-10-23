@@ -19,7 +19,7 @@ Durations accept `90`, `"90s"`, `"30m"`, `"4h"` or `"2d"`. Models are always wri
 | `remote` | `"origin"` | |
 | `state_dir` | `".nohalt"` | records, logs, locks, shims, agent data |
 | `worktrees` | `<state_dir>/work` | where per-issue worktrees go (keep it out of a Frappe bench's `apps/`) |
-| `shared_paths` | `[]` | untracked directories symlinked from the main clone into each worktree (e.g. `node_modules`) |
+| `shared_paths` | `[]` | untracked directories symlinked from the main clone into each worktree (e.g. `node_modules`, a venv). Installs that would write through the link are refused by the package-manager guard (SAFETY.md) |
 | `branch_prefixes` | `{ bug = "fix" }` | label → branch prefix |
 | `default_prefix` | `"feature"` | branches are `<prefix>/<issue>-<slug>`. An existing branch matching `*/<issue>-*` is reused |
 
@@ -108,6 +108,7 @@ Spend is estimated from each opencode agent's own session database, keeping the 
 | `placeholder` | `""` | a token in agents' commands replaced by the slot's `SITE` (the frappe stack sets it) |
 | `refuse` | `[]` | substrings a verify command may not contain. Refusals are logged |
 | `up` / `reset` / `env` | `""` | shell hooks (generic stack), see [STACKS.md](STACKS.md) |
+| `pythonpath` | `[]` | worktree subdirectories put first on `PYTHONPATH`, e.g. `["src/api"]` for a `src/` layout |
 | `pythonpath_worktree` | `false` | put the worktree first on `PYTHONPATH` (the frappe stack sets it) |
 | `clean_pycache` | `true` | delete stale bytecode in the worktree before running |
 
@@ -116,7 +117,7 @@ Spend is estimated from each opencode agent's own session database, keeping the 
 | Key | Default | Meaning |
 |---|---|---|
 | `mode` | `"none"` | `none` (a human merges), `direct`, `train`. Agents never merge in any mode |
-| `required_checks` | `[]` | check-run names (GitHub) or job names in the newest pipeline (GitLab) that must pass. Empty: every check must pass, and at least one must exist. On GitLab, a job with `allow_failure` never makes a commit red, and a manual job counts as skipped |
+| `required_checks` | `[]` | check-run names (GitHub) or job names in the newest pipeline (GitLab) that must pass. Empty: every check must pass, and at least one must exist. On GitLab, a job with `allow_failure` never makes a commit red, and a manual job counts as skipped. `nohalt doctor` compares this list with the checks that ran on recent commits and warns about names never seen and checks that count for nothing. |
 | `ignore_checks` | `[]` | check names that never count towards green or red, e.g. a slow suite your pipeline cancels on pull requests and runs on the base after merge. Every other check present on a commit must still pass |
 | `merge_method` | `"squash"` | for `direct` (release PRs always merge with a merge commit). On GitLab, `squash` squashes; otherwise the project's merge method applies |
 | `ci_workflow` / `cd_workflow` | `""` | runs watched on the base branch after a merge: GitHub workflow names, or on GitLab a pipeline's `workflow:name` (or `"pipeline"` for any pipeline on the commit) |

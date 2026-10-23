@@ -12,7 +12,20 @@ import stat
 from importlib import resources
 from pathlib import Path
 
-SHIMS = {"gh": "gh", "glab": "glab", "git": "git", "pkill": "pkill", "killall": "pkill"}
+SHIMS = {
+    "gh": "gh",
+    "glab": "glab",
+    "git": "git",
+    "pkill": "pkill",
+    "killall": "pkill",
+    # Package managers: refuse installs that would write through a shared_paths link.
+    **{pm: "pkgguard" for pm in ("npm", "pnpm", "yarn", "pip", "pip3", "uv")},
+}
+
+
+def shared_targets(repo: Path, shared_paths: list[str]) -> str:
+    """The real paths of the shared folders, for the package-manager guard."""
+    return ":".join(str((repo / p).resolve()) for p in shared_paths if (repo / p).exists())
 
 
 def install(bin_dir: Path) -> Path:
