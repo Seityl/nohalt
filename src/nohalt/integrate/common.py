@@ -49,6 +49,33 @@ def open_fix_forward(sup: Supervisor, after: str, sha: str, verdict: str) -> int
     return n
 
 
+def open_no_verdict(sup: Supervisor, after: str, sha: str, cancelled: int) -> int | None:
+    """A base pipeline that never reaches a verdict is work to do, not a reason to stop (INT-13).
+
+    Unlike a red, it does not hold the line: nothing says the merged code is
+    wrong, only that the pipeline never finished -- a time limit the suite has
+    outgrown, a runner that died, a canceller that reaches the base branch.
+    """
+    base = sup.cfg.project.base_branch
+    try:
+        n = sup.forge.create_issue(
+            f"Base pipeline never reached a verdict after {after} ({sha[:7]})",
+            f"nohalt merged {after} as `{sha}`; the pipeline on `{base}` was cancelled {cancelled} time(s) in a "
+            "row and never finished, so that merge has no verdict. nohalt carried on (`base_no_verdict = "
+            '"continue"`).\n\n'
+            "A job that hits its own time limit is reported as cancelled: check the runs' durations against the "
+            "workflow's timeout first, then the runners, then anything that cancels runs.\n\n"
+            f"## Done when\n- [ ] A pipeline run on `{base}` finishes with a verdict",
+            labels=["bug"],
+        )
+    except ForgeError as e:
+        sup.say(f"could not open a no-verdict issue: {e}")
+        return None
+    queue.append(sup.cfg.queue_file, n, front=True)
+    sup.say(f"opened #{n} about the base pipeline that never finishes; it goes to the front of the queue")
+    return n
+
+
 def is_network_failure(sup: Supervisor, run_ids: list[int]) -> bool:
     """A red that is only the network (DNS, resets) is not the code's fault."""
     pats = sup.cfg.integrate.network_errors
@@ -98,7 +125,9 @@ class PipelineGate:
 
     Shared by both integrators; its state (``integrate.json``) spans ticks and
     restarts. A red or timed-out pipeline opens a fix-forward issue at the
-    front of the queue, and merging resumes when that issue closes. A failed
+    front of the queue, and merging resumes when that issue closes. A pipeline
+    that keeps being cancelled has no verdict: by default it is filed and the
+    line keeps moving (``base_no_verdict``). A failed
     deploy (``DEPLOY_BLOCKED``) also stops merging until a human clears it.
     """
 
@@ -117,6 +146,10 @@ class PipelineGate:
     def open(self) -> bool:
         """May the integrator merge now? (If ``self.only`` is set, only that issue may.)"""
         self.only = None
+        if self.sup.state.has("BASE_NO_VERDICT") and self.cfg.integrate.base_no_verdict == "continue":
+            # Written by a version that held the line on no verdict (INT-13).
+            self.sup.state.clear_flag("BASE_NO_VERDICT")
+            self.sup.say("BASE_NO_VERDICT cleared: a base run with no verdict does not stop merging (base_no_verdict = continue)")
         if self.sup.state.has("BASE_NO_VERDICT"):
             if not self.sup.state.has("base-no-verdict-said"):
                 self.sup.state.set_flag("base-no-verdict-said")
@@ -216,9 +249,18 @@ class PipelineGate:
         limit = self.cfg.integrate.base_cancelled_limit
         if w["cancelled"] >= limit:
             reason = f"the base pipeline on {w['sha'][:7]} after {w['what']} was cancelled {w['cancelled']} times in a row"
+            st.pop("watch")
+            if self.cfg.integrate.base_no_verdict == "continue":
+                # No verdict is not a red: file it, deploy as a green would, keep merging (INT-13).
+                self.sup.say(f"{reason}: no verdict -- carrying on")
+                if self.cfg.integrate.fix_forward:
+                    open_no_verdict(self.sup, w["what"], w["sha"], w["cancelled"])
+                self._save(st)
+                if w.get("deploy") and not self.cfg.integrate.cd_workflow:
+                    run_deploy(self.sup, f"{w['sha'][:7]} ({w['what']}, no verdict)")
+                return not self.sup.state.has("DEPLOY_BLOCKED")
             self.sup.state.set_flag("BASE_NO_VERDICT", reason + "\n")
             self.sup.say(f"{reason}: no verdict -- merging held until a human looks")
-            st.pop("watch")
             self._save(st)
             return False
         rerun = 0

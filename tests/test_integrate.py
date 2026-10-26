@@ -299,9 +299,9 @@ def test_a_suite_ignored_on_prs_is_still_ignored_on_a_pr(world):
     assert 501 in w.forge.data()["merged"]
 
 
-def test_cancelled_base_runs_are_no_verdict_rerun_then_flagged(world):
-    """A cancelled base run is neither green nor red: re-run it, and after three in a row hold for a human."""
-    w = world(integrate={"mode": "direct"})
+def test_cancelled_base_runs_are_no_verdict_rerun_then_flagged_when_holding(world):
+    """A cancelled base run is neither green nor red: re-run it, and with base_no_verdict = hold, after three in a row hold for a human."""
+    w = world(integrate={"mode": "direct", "base_no_verdict": "hold"})
     sha = _merged_and_watching(w)
     merged = list(w.forge.data()["merged"])
     w.forge.add_run(Run(77, "Tests", sha, "completed", "cancelled", "main", ""))
@@ -319,6 +319,46 @@ def test_cancelled_base_runs_are_no_verdict_rerun_then_flagged(world):
     assert w.forge.data()["merged"] == merged  # held
     w.sup.state.clear_flag("BASE_NO_VERDICT")  # a human looked
     w.drive(4)
+    assert len(w.forge.data()["merged"]) > len(merged)
+
+
+def _cancelled_until_the_limit(w, sha, run_id=77):
+    w.forge.add_run(Run(run_id, "Tests", sha, "completed", "cancelled", "main", ""))
+    for attempt in (1, 2, 3):
+        w.forge.set_checks(sha, [("ci", "completed", "success"), ("full suite", "completed", "cancelled")])
+        w.drive(1)
+        if attempt < 3:
+            w.forge.set_checks(sha, [("ci", "completed", "success"), ("full suite", "in_progress", "")])
+            w.drive(1)  # the re-run started
+
+
+def test_a_base_pipeline_that_never_finishes_is_filed_and_merging_carries_on(world):
+    """INT-13: no verdict after the re-runs is filed as an issue at the front of the queue, never a halt and never a red."""
+    w = world(integrate={"mode": "direct"})  # base_no_verdict defaults to continue
+    sha = _merged_and_watching(w)
+    merged = list(w.forge.data()["merged"])
+    _cancelled_until_the_limit(w, sha)
+    assert not w.sup.state.has("BASE_NO_VERDICT")
+    st = w.sup.state.load("integrate.json", {})
+    assert not st.get("fix_issue")  # no verdict is not a red: nothing else is held
+    assert st.get("watch", {}).get("sha") != sha  # the no-verdict head is no longer what holds the gate
+    filed = [n for n, i in w.forge.data()["issues"].items() if "never reached a verdict" in i["title"]]
+    assert len(filed) == 1
+    assert w.queue.read_text().splitlines()[0].startswith(f"{filed[0]}:")
+    assert any("carrying on" in m for m in w.messages)
+    w.drive(4)
+    assert len(w.forge.data()["merged"]) > len(merged)  # the line kept moving
+
+
+def test_a_flag_left_by_an_older_version_no_longer_halts(world):
+    """INT-13: BASE_NO_VERDICT written under the old policy is cleared, not obeyed, when base_no_verdict = continue."""
+    w = world(integrate={"mode": "direct"})
+    sha = _merged_and_watching(w)
+    merged = list(w.forge.data()["merged"])
+    w.sup.state.set_flag("BASE_NO_VERDICT", "old\n")
+    w.forge.set_checks(sha, [("ci", "completed", "success")])
+    w.drive(4)
+    assert not w.sup.state.has("BASE_NO_VERDICT")
     assert len(w.forge.data()["merged"]) > len(merged)
 
 
