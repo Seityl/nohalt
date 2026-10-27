@@ -8,7 +8,7 @@ src/nohalt/
   queue.py         queue.txt: "<issue>: <deps>"
   state.py         issue records and control files (JSON, written atomically)
   worktree.py      one git worktree per issue; rescue before removal
-  models.py        routing, pins, premium gate, probes, fallbacks
+  models.py        routing, pins, premium gate, probes, fallbacks, overflow
   budget.py        paid-API spend estimate and caps
   prompt.py        core prompt + stack addendum + project files; strict placeholders
   verify.py        the verification lock (slot pool) and refused commands
@@ -27,8 +27,10 @@ Every `tick` (default 60 s):
 1. **Reap.** For every issue whose agent is running: past its time limit → stop it (`timeout`). No output for `hung_after` and no command of its own running → stop it (`hung`). Exited → *judge* it.
 2. **Watch.** For every issue whose agent finished with a pull request: read the PR's checks on its **current head**. Red → hand back to an agent with the failing checks. Green (or no checks yet) but conflicting with the base → if the merge drivers settle every conflicted file, nohalt merges the base into the PR branch itself and pushes (`refresh_conflicts`, INT-12). Otherwise it hands the PR back to rebase. Green and mergeable → `ready`.
 3. **Integrate.** `direct` or `train` merges `ready` PRs (see below). `none` does nothing: a human merges. Either way, an issue still open after its PR merged is closed by nohalt -- forges act on closing keywords only for the default branch.
-4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback does).
+4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback with a free slot does). An unpinned issue that has waited `overflow_after` for a slot overflows to the first `overflow_to` model with a free slot (outside `overflow_reserve`) that answers; the next launch is routed as usual.
 5. **Budget.** Every few minutes, estimate paid-API spend and move issues over their cap to a fallback model.
+
+Before each tick the supervisor checks `nohalt.toml` and the `RESTART` flag. A valid change to the file, or a restart request, makes it release its lock and `exec` itself; the new process adopts the running agents like any restarted supervisor. An invalid file keeps the running configuration and raises `CONFIG_INVALID` (see [CONFIGURATION.md](CONFIGURATION.md#changing-it-while-nohalt-runs)).
 
 The supervisor holds an exclusive lock, so only one runs per state directory. A tick never blocks on long waits: watching a pipeline after a merge, or waiting for a usage limit to reset, is a state that later ticks re-examine.
 
@@ -83,7 +85,8 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   integrate.json train.json integrator state that spans ticks
   refresh.json conflicts.json  conflicting PRs refreshed by nohalt (counted per issue); files left in conflict at hand-backs (for doctor)
   status.json              last tick's summary (for `nohalt status`)
-  STOP PAUSE WAKE BATCH_PAUSE DEPLOY_BLOCKED BUDGET_EXHAUSTED   control flags
+  supervisor.json          the running supervisor: pid, start time, hash of the config it loaded
+  STOP PAUSE WAKE RESTART BATCH_PAUSE DEPLOY_BLOCKED BUDGET_EXHAUSTED CONFIG_INVALID   control flags
   priority hold            one issue per line (train ordering / exclusion)
   bin/                     guard shims
   locks/verify-<slot>.lock verification slots

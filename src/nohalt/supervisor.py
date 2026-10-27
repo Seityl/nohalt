@@ -18,7 +18,9 @@ Rules that hold throughout:
 * A forge call that failed is "unknown", never "no PR" or "not found".
 * Work is never discarded: worktrees are rescued before removal.
 * Agents run in their own sessions. Killing or restarting the supervisor does
-  not touch them; a new supervisor adopts them from their records.
+  not touch them; a new supervisor adopts them from their records. That is also
+  how a changed ``nohalt.toml`` (or ``nohalt restart``) takes effect: the
+  supervisor re-executes itself between ticks and adopts its own agents.
 """
 
 from __future__ import annotations
@@ -30,10 +32,11 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import agents, budget, queue, shims, stacks
+from . import config as config_mod
 from . import forge as forge_mod
 from . import prompt as prompt_mod
 from .config import Config
@@ -41,7 +44,7 @@ from .forge import CLOSED, MISSING, UNKNOWN, Forge, ForgeError, Issue, PullReque
 from .forge import verdict as ci_verdict
 from .models import Router
 from .state import ACTIVE, BLOCKED, DONE, QUEUED, READY, RUNNING, WAITING_CI, FileLock, IssueRecord, StateStore
-from .util import descendants, kill_tree, mem_available_mb, now, pid_alive, tail
+from .util import descendants, kill_tree, mem_available_mb, now, pid_alive, stamp, tail
 from .worktree import GitError, Worktrees
 
 EXITED = "exited"  # agent gone; verdict pending (the forge could not be asked)
@@ -108,6 +111,7 @@ class Supervisor:
         self._issues: dict[int, tuple[float, Issue]] = {}
         self._pulls: list[PullRequest] | None = None
         self._pulls_ok = False
+        self._bad_config = ""  # hash of an invalid nohalt.toml already reported
         self.dry_run = False
         from .integrate import make as make_integrator
 
@@ -188,12 +192,18 @@ class Supervisor:
         signal.signal(signal.SIGINT, on_signal)
         shims.install(self.state.bin_dir)
         (self.state.logs_dir / "guard.log").touch()  # exists, and stays empty while no agent oversteps
+        self.state.clear_flag("CONFIG_INVALID")  # this configuration loaded and validated
+        self.state.save("supervisor.json", {"pid": os.getpid(), "started": now(), "config": self.cfg.source_hash})
         self.say(
             f"=== nohalt supervising {self.cfg.project.repo} (base {self.cfg.project.base_branch}, "
             f"up to {self.cfg.agents.max_parallel} agents, integrate={self.cfg.integrate.mode})"
         )
+        restart = ""
         try:
             while not stop["now"]:
+                restart = self._restart_reason()
+                if restart:
+                    break
                 report = self.tick()
                 if self.state.has("STOP") and not report.running:
                     self.state.clear_flag("STOP")
@@ -216,11 +226,93 @@ class Supervisor:
                     if stop["now"] or self.state.has("WAKE"):
                         self.state.clear_flag("WAKE")
                         break
+                    if self._restart_pending():
+                        break
                     time.sleep(1)
         finally:
             lock.release()
+        if restart:
+            self.say(f"=== {restart}: re-executing the supervisor; running agents continue and are adopted")
+            self._reexec(exit_when_done)
+            return 1  # not reached unless exec failed; keepalive starts a new one
         self.say("=== supervisor exiting; running agents continue and will be adopted on restart")
         return 0
+
+    # -- configuration reload and restart ---------------------------------------------------------
+    # A new configuration is applied by re-executing the supervisor, not by swapping
+    # objects: the forge, stack, router and integrator are all built from it, and a
+    # fresh process is exactly the restart path agents are already adopted through
+    # (LIV-01). Running agents keep their model; pools and models apply to new launches.
+    def check_config(self) -> bool:
+        """Has nohalt.toml changed into a valid configuration to switch to?
+
+        An invalid file is reported once, keeps the running configuration, and
+        raises ``CONFIG_INVALID`` until it is fixed.
+        """
+        src = self.cfg.source
+        if src is None:
+            return False
+        seen = config_mod.fingerprint(src)
+        if seen == self.cfg.source_hash:
+            if self.state.has("CONFIG_INVALID"):
+                self.state.clear_flag("CONFIG_INVALID")
+                self.say(f"config: {src} is back to the running configuration")
+            return False
+        if seen == self._bad_config:
+            return False
+        try:
+            new = config_mod.load(src)
+            stacks.get(new)
+            if new.state_dir != self.cfg.state_dir:
+                raise config_mod.ConfigError(
+                    f"[project] state_dir changed to {new.state_dir}: a running supervisor cannot move its state "
+                    "(its agents are recorded in the old one); revert it, or stop and start by hand"
+                )
+        except ValueError as e:  # ConfigError, and anything a stack rejects
+            self._bad_config = seen
+            self.state.set_flag("CONFIG_INVALID", f"{stamp()}  {e}\n")
+            self.say(f"config: {src} is invalid; still running on the last good configuration -- {e}")
+            return False
+        self._bad_config = ""
+        self.state.clear_flag("CONFIG_INVALID")
+        if replace(new, source_hash=self.cfg.source_hash) == self.cfg:
+            self.cfg.source_hash = new.source_hash  # comments or formatting only
+            return False
+        return True
+
+    def _restart_reason(self) -> str:
+        if self.state.has("RESTART"):
+            self.state.clear_flag("RESTART")
+            return "restart requested"
+        if self.check_config():
+            return f"{self.cfg.source} changed"
+        return ""
+
+    def _restart_pending(self) -> bool:
+        """Cheap check between ticks: end the wait early for a restart or a changed config."""
+        if self.state.has("RESTART"):
+            return True
+        src = self.cfg.source
+        return src is not None and config_mod.fingerprint(src) not in (self.cfg.source_hash, self._bad_config)
+
+    def reexec_argv(self, exit_when_done: bool = False) -> list[str]:
+        argv = [sys.executable, "-m", "nohalt"]
+        if self.cfg.source:
+            argv += ["--config", str(self.cfg.source)]
+        argv.append("run")
+        if exit_when_done:
+            argv.append("--exit-when-done")
+        return argv
+
+    def _reexec(self, exit_when_done: bool) -> None:
+        argv = self.reexec_argv(exit_when_done)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.chdir(self.cfg.root)
+            os.execv(argv[0], argv)
+        except OSError as e:
+            self.say(f"=== could not re-execute the supervisor ({e}); exiting, `nohalt keepalive` starts a new one")
 
     def _has_waiting(self) -> bool:
         return any(r.status in (WAITING_CI, READY, EXITED) for r in self.state.all())
@@ -253,6 +345,12 @@ class Supervisor:
         if proc is not None and proc.poll() is not None:
             self._procs.pop(rec.issue, None)
             return False
+        if proc is None and rec.pid:
+            # Adopted after a re-exec, the agent is still our child: reap it once it exits.
+            try:
+                os.waitpid(rec.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
         if not pid_alive(rec.pid):
             return False
         # A recycled pid is not our agent.
@@ -620,6 +718,29 @@ class Supervisor:
             return int(override[pool])
         return self.cfg.agents.pools[pool] if pool else self.cfg.agents.max_parallel
 
+    def _has_slot(self, model: str, in_use: dict[str, int], reserve: bool = False) -> bool:
+        """A free slot in the model's pool; overflow (``reserve``) may not take a pool's last reserved slots."""
+        pool = self._pool_of(model)
+        held = self.cfg.models.overflow_reserve.get(pool, 0) if reserve else 0
+        return in_use.get(pool, 0) < self._cap(pool) - held
+
+    def _stall_reason(self, model: str, in_use: dict[str, int]) -> str:
+        pool = self._pool_of(model)
+        if not self._has_slot(model, in_use):
+            return f"{pool or 'shared'} pool full ({in_use.get(pool, 0)}/{self._cap(pool)})"
+        return f"{model} not answering and no fallback has a free slot"
+
+    def _stall(self, rec: IssueRecord) -> None:
+        """Start the overflow clock: the issue could start but its model has no slot."""
+        if self.cfg.models.overflow_after and not rec.stalled_since and not self.dry_run:
+            rec.stalled_since = now()
+            self.state.put(rec)
+
+    def _overflow_due(self, rec: IssueRecord, pinned: bool) -> bool:
+        """MOD-13: waited ``overflow_after`` for a slot. Pinned issues wait for their model (MOD-05)."""
+        after = self.cfg.models.overflow_after
+        return bool(after and not pinned and rec.stalled_since and now() - rec.stalled_since >= after)
+
     def _launch(self, report: TickReport) -> None:
         try:
             entries = queue.load(self.cfg.queue_file)
@@ -704,25 +825,39 @@ class Supervisor:
                     self.say(f"#{entry.issue}: already has {self.pr(existing.number)} -- adopted, watching it through CI")
                     continue
             if rec.not_before > now() or stopping:
+                if rec.stalled_since:  # the overflow clock runs only while the issue could start
+                    rec.stalled_since = 0
+                    self.state.put(rec)
                 continue
-            model, _ = self.router.wanted(issue)
+            model, pinned = self.router.wanted(issue)
             pool = self._pool_of(model)
-            if in_use.get(pool, 0) >= self._cap(pool):
+            overflow_due = self._overflow_due(rec, pinned)
+            if not self._has_slot(model, in_use) and not overflow_due:
+                self._stall(rec)
                 continue
             if self.dry_run:
-                report.launched.append(entry.issue)
-                in_use[pool] = in_use.get(pool, 0) + 1
+                if self._has_slot(model, in_use):
+                    report.launched.append(entry.issue)
+                    in_use[pool] = in_use.get(pool, 0) + 1
                 continue
             free = mem_available_mb()
             if free is not None and free < self.cfg.agents.min_free_mb:
                 self.state.log(f"#{entry.issue} waiting: {free} MB available, need {self.cfg.agents.min_free_mb}")
                 break
-            chosen = self.router.choose(issue)
+            chosen = self.router.choose(issue, lambda m: self._has_slot(m, in_use))
+            overflow = ""
+            if not chosen and overflow_due:
+                chosen = self.router.overflow(issue, lambda m: self._has_slot(m, in_use, reserve=True))
+                if chosen:
+                    overflow = (
+                        f"overflow: {self._stall_reason(model, in_use)} for {int((now() - rec.stalled_since) // 60)}m → {chosen}"
+                    )
             if not chosen:
-                self.state.log(f"#{entry.issue} waiting: {model} is not answering and no fallback is")
+                self._stall(rec)
+                self.state.log(f"#{entry.issue} waiting: {self._stall_reason(model, in_use)}")
                 continue
             try:
-                self.launch(rec, issue, chosen)
+                self.launch(rec, issue, chosen, overflow=overflow)
             except (GitError, prompt_mod.PromptError, OSError, ValueError) as e:
                 rec.not_before = now() + 600
                 rec.event(f"launch failed: {e}")
@@ -754,7 +889,7 @@ class Supervisor:
             body += f"\n## Note from the supervisor\n\n{rec.note}\n"
         return body
 
-    def launch(self, rec: IssueRecord, issue: Issue, model: str) -> None:
+    def launch(self, rec: IssueRecord, issue: Issue, model: str, overflow: str = "") -> None:
         name, mid = agents.split_model(model)
         agent = agents.get(name, self.cfg.agents.options.get(name))
         branch = rec.branch or self.trees.branch_for(issue.number, issue.title, issue.labels)
@@ -827,9 +962,15 @@ class Supervisor:
         rec.resume = rec.fresh = False
         rec.note = ""
         rec.last_exit = ""
-        rec.event(f"launched on {model}" + (" (resumed)" if resume else ""))
+        rec.stalled_since = 0
+        rec.overflow = overflow  # not a pin: the next launch is routed as usual (fail-back)
+        rec.event(f"launched on {model}" + (" (resumed)" if resume else "") + (f" -- {overflow}" if overflow else ""))
         self.state.put(rec)
-        self.say(f"#{issue.number}: agent launched on {model} in {tree} ({branch})" + (" -- resumed" if resume else ""))
+        self.say(
+            f"#{issue.number}: agent launched on {model} in {tree} ({branch})"
+            + (" -- resumed" if resume else "")
+            + (f" -- {overflow}" if overflow else "")
+        )
 
     def _rotate(self, log: Path) -> None:
         try:

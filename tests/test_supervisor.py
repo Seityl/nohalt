@@ -397,3 +397,137 @@ def test_dry_run_never_writes_state(world):
     w.sup.dry_run = True
     w.sup.tick()
     assert not w.sup.state.exists(1) and not w.sup.state.exists(999)
+
+
+# -- overflow (MOD-13) -------------------------------------------------------------------------------
+def overflow_world(world, agents=None, **models):  # type: ignore[no-untyped-def]
+    return world(
+        agents={"pools": {"command:local": 1, "command:cloud": 2}, **(agents or {})},
+        models={"default": "command:local", "fallbacks": ["command:cloud"], "overflow_after": "10m", **models},
+    )
+
+
+def stalled_long_ago(w, n: int) -> None:  # type: ignore[no-untyped-def]
+    rec = w.rec(n)
+    assert rec.stalled_since, "the overflow clock should be running"
+    rec.stalled_since -= 12 * 60
+    w.sup.state.put(rec)
+
+
+def test_a_full_pool_overflows_to_an_idle_one_after_the_delay(world):
+    w = overflow_world(world)
+    w.issue(1, "sleep 3")
+    w.issue(2, "close")
+    w.sup.tick()
+    assert w.rec(1).model == "command:local" and not w.rec(2).started_at
+    stalled_long_ago(w, 2)
+    w.sup.tick()
+    rec = w.rec(2)
+    assert rec.status == RUNNING and rec.model == "command:cloud"
+    assert rec.overflow == "overflow: command:local pool full (1/1) for 12m → command:cloud"
+    assert not w.sup.router.pinned(2)
+    assert any("overflow: command:local pool full" in m for m in w.messages)
+    from nohalt.cli import render_status
+
+    assert "command:cloud ^" in render_status(w.cfg) and "#2: overflow: command:local" in render_status(w.cfg)
+    w.wait_agents()
+
+
+def test_before_the_delay_a_full_pool_waits(world):
+    w = overflow_world(world)
+    w.issue(1, "sleep 3")
+    w.issue(2, "close")
+    w.sup.tick()
+    w.sup.tick()
+    assert not w.rec(2).started_at and w.rec(2).stalled_since
+    w.wait_agents()
+
+
+def test_without_overflow_after_a_full_pool_waits_forever(world):
+    w = overflow_world(world, overflow_after="")
+    w.issue(1, "sleep 3")
+    w.issue(2, "close")
+    w.sup.tick()
+    w.sup.tick()
+    assert not w.rec(2).started_at and not w.rec(2).stalled_since
+    w.wait_agents()
+
+
+def test_overflow_never_takes_a_premium_model_unless_approved(world):
+    w = overflow_world(world, premium=["command:cloud"], overflow_to=["command:cloud"])
+    w.issue(1, "sleep 3")
+    w.issue(2, "close")
+    w.sup.tick()
+    stalled_long_ago(w, 2)
+    w.sup.tick()
+    assert not w.rec(2).started_at
+    w.sup.state.save("approved.json", [2])
+    w.sup.tick()
+    assert w.rec(2).model == "command:cloud" and w.rec(2).overflow
+    w.wait_agents()
+
+
+def test_a_pinned_issue_never_overflows(world):
+    """MOD-05 stands: a pinned issue waits for its own model."""
+    w = overflow_world(world)
+    w.issue(1, "sleep 3")
+    w.issue(2, "close")
+    w.sup.router.pin(2, "command:local")
+    w.sup.tick()
+    rec = w.rec(2)  # the clock may run; it must not matter
+    rec.stalled_since = time.time() - 3600
+    w.sup.state.put(rec)
+    w.sup.tick()
+    assert not w.rec(2).started_at
+    w.wait_agents()
+
+
+def test_an_overflowed_issue_is_routed_as_usual_on_relaunch(world):
+    """MOD-04: overflow is not a pin; the next launch goes back to the routed model."""
+    w = overflow_world(world, agents={"max_attempts": 1})
+    w.issue(1, "sleep 2")  # then blocked: frees the local slot
+    w.issue(2, "provider-error", "close")
+    w.sup.tick()
+    stalled_long_ago(w, 2)
+    w.sup.tick()
+    assert w.rec(2).model == "command:cloud"
+    w.wait_agents()
+    w.sup.tick()
+    rec = w.rec(2)
+    assert w.rec(1).status == BLOCKED
+    assert rec.model == "command:local" and rec.overflow == "" and rec.status == RUNNING
+    w.drive(3)
+    assert w.rec(2).status == DONE
+
+
+def test_a_dead_primary_with_full_fallbacks_overflows(world):
+    w = overflow_world(
+        world,
+        agents={"pools": {"command:local": 2, "command:cloud": 1}},
+        overflow_to=["command:cloud", "command:spare"],
+    )
+    w.sup.router.prober.answers = lambda m: m != "command:local"  # type: ignore[method-assign]
+    w.issue(1, "sleep 3")
+    w.issue(2, "close")
+    w.sup.tick()
+    assert w.rec(1).model == "command:cloud"  # failed over (MOD-03)
+    assert not w.rec(2).started_at  # the fallback's pool is full: not taken
+    stalled_long_ago(w, 2)
+    w.sup.tick()
+    rec = w.rec(2)
+    assert rec.model == "command:spare"
+    assert rec.overflow.startswith("overflow: command:local not answering and no fallback has a free slot for 12m")
+    w.wait_agents()
+
+
+def test_overflow_leaves_a_pools_reserved_slots_alone(world):
+    w = overflow_world(world, overflow_reserve={"command:cloud": 1}, route=[{"labels": ["big"], "model": "command:cloud"}])
+    w.issue(1, "sleep 3")
+    w.issue(3, "sleep 3", labels=["big"])
+    w.issue(2, "close")
+    w.sup.tick()
+    assert w.rec(3).model == "command:cloud"
+    stalled_long_ago(w, 2)
+    w.sup.tick()
+    assert not w.rec(2).started_at  # cloud has 1 of 2 free, and 1 is reserved
+    w.wait_agents()

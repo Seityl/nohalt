@@ -4,6 +4,20 @@ One `nohalt.toml` per project. `nohalt init [--stack frappe]` writes a starter f
 
 **Unknown keys are errors.** A typo that silently falls back to a default is how a guard quietly stops guarding.
 
+## Changing it while nohalt runs
+
+Edit the file; there is nothing to restart. Between ticks (and within a second while it waits) the supervisor compares the file with the one it loaded:
+
+- **Valid and different:** it re-executes itself (`python -m nohalt --config <file> run`, same process id) and adopts its running agents from their records, as after any restart (LIV-01). The `=== nohalt supervising …` line in `logs/nohalt.log` shows the new settings.
+- **Invalid** (TOML error, unknown key, failed validation): it logs the error once, keeps running on the last good configuration, and writes `<state>/CONFIG_INVALID`, which `nohalt status` shows with the error until the file is fixed or reverted.
+- **Comments or formatting only:** nothing happens.
+
+Changes apply to what the supervisor does next, never to an agent already running: a new `models.default`, route or pool cap applies to the next launch, and an agent over a lowered cap finishes its run. `[project] state_dir` cannot change under a running supervisor (its agents are recorded in the old one): that edit is reported as invalid. `queue.txt` and `<state>/caps.json` are re-read every tick anyway.
+
+`nohalt restart` does the same on demand: it validates the file first (a broken config never replaces a running supervisor), asks the supervisor to re-execute after its current tick, and starts one, detached, if none is running -- no cron needed. Agents are never signalled. If the supervisor does not respond within `--timeout` (default 120 s), it is sent SIGTERM and a new one is started. `restart` clears `STOP`.
+
+`nohalt stop` is not a restart: it is a **drain**. Nothing new launches and the supervisor exits once no agent is running, which can take hours, and `keepalive` starts nothing while `STOP` exists. `nohalt resume` clears `STOP` and `PAUSE`.
+
 Durations accept `90`, `"90s"`, `"30m"`, `"4h"` or `"2d"`. Models are always written `<agent>:<model>`: `opencode:anthropic/claude-sonnet-4-5`, `claude-code:sonnet`, `command:anything`.
 
 ## [project]
@@ -78,14 +92,17 @@ probe_argv = ["my-agent", "--model", "{model}", "--ping"]
 | Key | Default | Meaning |
 |---|---|---|
 | `default` | `opencode:anthropic/claude-sonnet-4-5` | |
-| `fallbacks` | `[]` | tried in order when an unpinned issue's model does not answer a probe |
+| `fallbacks` | `[]` | tried in order when an unpinned issue's model does not answer a probe. A fallback whose pool is full is skipped |
 | `premium` | `[]` | models that run only on issues approved with `nohalt route <n> <model> --approve` |
 | `premium_fallback` | `""` | what a non-approved request for a premium model gets (default: `default`) |
 | `probe` | `true` | ask the model for "OK" before launching. A dead endpoint otherwise kills every agent in its first second |
 | `probe_ttl` | `"5m"` | probe results are cached this long |
 | `[[models.route]]` | `[]` | `{ labels = [...], model = "..." }` or `{ title = "regex", model = "..." }`. The first match wins |
+| `overflow_after` | `""` (off) | an unpinned issue that could start but has waited this long for a slot -- its model's pool (or `max_parallel`) is full, or its model does not answer and no fallback has a free slot -- starts on the first `overflow_to` model with a free slot that answers a probe, e.g. `"10m"` |
+| `overflow_to` | `fallbacks` minus `premium` | models allowed to take overflow, in order. A premium model is used only for issues approved for it |
+| `overflow_reserve` | `{}` | `[agents] pools` prefix → slots overflow may not take, e.g. `{ "claude-code:" = 2 }` keeps the last two Claude slots for work routed there |
 
-Pins (`nohalt route <issue> <model>`) beat rules and are never failed over: a pinned issue waits for its model.
+Pins (`nohalt route <issue> <model>`) beat rules and are never failed over or overflowed: a pinned issue waits for its model. Overflow is not a pin: the issue's next launch (a resume, a retry, a hand-back) is routed as usual, and starts a fresh session if that lands on a different model. Running agents are never moved. Overflowed launches are marked `^` in `nohalt status`, with the reason (`overflow: opencode:local/ pool full (8/8) for 12m → claude-code:sonnet`), which is also in the issue's history and the log.
 
 ## [budget]
 

@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -18,7 +19,7 @@ from . import __version__
 from . import config as config_mod
 from . import queue as queue_mod
 from .config import Config, ConfigError
-from .state import RUNNING, FileLock, StateStore
+from .state import BLOCKED, QUEUED, RUNNING, FileLock, StateStore
 from .util import now, pid_alive, stamp, tail
 
 if TYPE_CHECKING:
@@ -105,10 +106,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if args.now:
         stopped = _sup(cfg, quiet=True).stop_now()
         print(f"stopped agents: {' '.join('#' + str(i) for i in stopped) or 'none'} (they resume on the next run)")
+    print("STOP set -- nohalt is DRAINING, not restarting:")
+    print("  - no new agents launch, from now on")
     print(
-        "the supervisor stops launching and exits once no agent is running"
-        + ("" if args.now else "; running agents finish their issue first (use --now to stop them)")
+        "  - the supervisor exits once no agent is running"
+        + ("" if args.now else "; running agents finish their issue first (--now stops them)")
     )
+    print("  - `nohalt keepalive` starts no supervisor while STOP is set")
+    print("undo: `nohalt resume`.  To apply a config change or restart instead: `nohalt restart` (agents keep running)")
     return 0
 
 
@@ -119,7 +124,100 @@ def cmd_pause(args: argparse.Namespace) -> int:
         print("launching resumed")
     else:
         state.set_flag("PAUSE", stamp())
-        print("no new agents will launch (running ones continue); `nohalt pause --off` to resume")
+        print("no new agents will launch (running ones continue); `nohalt resume` to undo")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    state = StateStore(cfg.state_dir)
+    cleared = [f for f in ("STOP", "PAUSE") if state.has(f)]
+    for f in cleared:
+        state.clear_flag(f)
+    state.set_flag("WAKE")
+    print(f"cleared {' '.join(cleared)}: launching resumes" if cleared else "neither STOP nor PAUSE was set")
+    if not _supervisor_up(state):
+        print("the supervisor is not running: `nohalt restart` (or `nohalt keepalive`) starts one")
+    return 0
+
+
+def _supervisor_up(state: StateStore) -> bool:
+    lock = FileLock(state.root / "supervisor.lock")
+    if lock.acquire(blocking=False):
+        lock.release()
+        return False
+    return True
+
+
+def _start_detached(cfg: Config, state: StateStore) -> int:
+    """Start ``nohalt run`` in its own session, owned by no terminal (LIV-02). Returns its pid."""
+    argv = [sys.executable, "-m", "nohalt"]
+    if cfg.source:
+        argv += ["--config", str(cfg.source)]
+    argv.append("run")
+    with open(state.logs_dir / "supervisor.out", "ab") as log:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            cwd=cfg.root,
+        )
+    return proc.pid
+
+
+def _wait(cond: Callable[[], bool], timeout: float) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.2)
+    return cond()
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    """Restart the supervisor now, with the configuration as it is on disk. Agents keep running."""
+    cfg = _cfg(args)  # an invalid config fails here, before the running supervisor is touched
+    state = StateStore(cfg.state_dir)
+    if state.has("STOP"):
+        state.clear_flag("STOP")
+        print("cleared STOP (it drains; a restart is meant to keep going)")
+    running = sum(1 for r in state.all() if r.status == RUNNING and pid_alive(r.pid))
+    agents = f"{running} running agent(s) were not touched and are adopted"
+    lock = FileLock(state.root / "supervisor.lock")
+    if not _supervisor_up(state):
+        pid = _start_detached(cfg, state)
+        state.log("restart: no supervisor was running; started one")
+        print(f"no supervisor was running; started one (pid {pid}); {agents}")
+        return 0
+    holder = lock.held_by()
+    asked = now()
+    state.set_flag("RESTART", stamp())
+    state.set_flag("WAKE")
+    print(f"asked the supervisor (pid {holder}) to restart; it does so after its current tick ...", flush=True)
+
+    def restarted() -> bool:
+        return (state.load("supervisor.json", {}) or {}).get("started", 0) >= asked and not state.has("RESTART")
+
+    if _wait(restarted, args.timeout):
+        pid = (state.load("supervisor.json", {}) or {}).get("pid", "?")
+        print(f"supervisor restarted (pid {pid}) on {cfg.source}; {agents}")
+        return 0
+    print(f"no restart after {args.timeout} s; sending SIGTERM to pid {holder} (agents are not signalled)", flush=True)
+    state.clear_flag("RESTART")
+    try:
+        os.kill(holder, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError) as e:
+        print(f"nohalt: cannot signal pid {holder}: {e}", file=sys.stderr)
+        return 1
+    if not _wait(lambda: not _supervisor_up(state), args.timeout):
+        print(f"nohalt: pid {holder} still holds the supervisor lock; look at it (`nohalt status`)", file=sys.stderr)
+        return 1
+    pid = _start_detached(cfg, state)
+    state.log("restart: the old supervisor exited on SIGTERM; started a new one")
+    print(f"old supervisor exited; started a new one (pid {pid}); {agents}")
     return 0
 
 
@@ -135,13 +233,25 @@ def cmd_status(args: argparse.Namespace) -> int:
             return 0
 
 
+# Control flags `nohalt status` shows, and what each one means.
+FLAGS = {
+    "STOP": "draining -- no new launches; the supervisor exits when no agent runs (`nohalt resume` undoes)",
+    "PAUSE": "no new launches; running agents continue (`nohalt resume` undoes)",
+    "RESTART": "a restart was asked for; the supervisor re-executes after its current tick",
+    "CONFIG_INVALID": "nohalt.toml has an error; the supervisor runs on the last good configuration",
+    "DEPLOY_BLOCKED": "a deploy failed; nothing merges until a human deletes the flag",
+    "BASE_NO_VERDICT": "the base pipeline gave no verdict; merging is held until a human deletes the flag",
+    "BUDGET_EXHAUSTED": "the paid-API budget is spent; paid issues go to the fallback model, or stop",
+}
+
+
 def render_status(cfg: Config) -> str:
     state = StateStore(cfg.state_dir)
     lines = []
     sup_lock = FileLock(state.root / "supervisor.lock")
     holder = sup_lock.held_by()
     up = holder and pid_alive(holder)
-    flags = [f for f in ("STOP", "PAUSE", "DEPLOY_BLOCKED", "BASE_NO_VERDICT", "BUDGET_EXHAUSTED") if state.has(f)]
+    flags = [f for f in FLAGS if state.has(f)]
     mem = ""
     try:
         from .util import mem_available_mb
@@ -154,6 +264,11 @@ def render_status(cfg: Config) -> str:
         f"nohalt {__version__}  {cfg.project.repo}  supervisor: {'up (pid ' + str(holder) + ')' if up else 'DOWN'}"
         f"{mem}{'   flags: ' + ' '.join(flags) if flags else ''}"
     )
+    for f in flags:
+        detail = ""
+        if f == "CONFIG_INVALID":
+            detail = " -- " + " ".join(state.read_lines(f))[:300]
+        lines.append(f"  {f}: {FLAGS[f]}{detail}")
     spend = state.load("spend.json")
     if spend:
         lines.append(f"API spend ~${spend.get('total', 0):.2f} of ${spend.get('cap', 0):.2f}")
@@ -171,7 +286,14 @@ def render_status(cfg: Config) -> str:
         else:
             last = (r.history[-1].split("  ", 1)[-1] if r.history else "")[:70]
         tries = f"{r.attempts}/{cfg.agents.max_attempts}"
-        lines.append(f"#{r.issue:<7}{r.status:<12}{r.model[:33]:<34}{idle:>7}  {tries:<6}{last}")
+        overflowed = r.overflow and r.status not in (QUEUED, BLOCKED)  # the mark is for the launch that overflowed
+        model = (r.model[:31] + " ^") if overflowed else r.model[:33]
+        lines.append(f"#{r.issue:<7}{r.status:<12}{model:<34}{idle:>7}  {tries:<6}{last}")
+    overflows = [r for r in recs if r.overflow and r.status not in (QUEUED, BLOCKED)]
+    if overflows:
+        lines.append("")
+        lines.append("^ overflowed (not pinned; the next launch is routed as usual):")
+        lines.extend(f"  #{r.issue}: {r.overflow}" for r in overflows)
     snap = state.load("status.json", {})
     if snap:
         lines.append("")
@@ -264,20 +386,7 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
     lock.release()
     if state.has("STOP"):
         return 0
-    argv = [sys.executable, "-m", "nohalt"]
-    if cfg.source:
-        argv += ["--config", str(cfg.source)]
-    argv.append("run")
-    with open(state.logs_dir / "supervisor.out", "ab") as log:
-        subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            cwd=cfg.root,
-        )
+    _start_detached(cfg, state)
     state.log("keepalive started the supervisor")
     print("supervisor started")
     return 0
@@ -465,9 +574,16 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--exit-when-done", action="store_true", help="exit when every queued issue is closed")
     s.set_defaults(fn=cmd_run)
 
-    s = sub.add_parser("stop", help="stop between issues (or now)")
+    s = sub.add_parser("stop", help="drain: launch nothing more, exit once no agent runs (`resume` undoes)")
     s.add_argument("--now", action="store_true", help="also stop running agents (they resume next run)")
     s.set_defaults(fn=cmd_stop)
+
+    s = sub.add_parser("resume", help="clear STOP and PAUSE: launching resumes")
+    s.set_defaults(fn=cmd_resume)
+
+    s = sub.add_parser("restart", help="restart the supervisor now with the config on disk; agents keep running")
+    s.add_argument("--timeout", type=float, default=120, metavar="SECONDS", help="wait this long for each step")
+    s.set_defaults(fn=cmd_restart)
 
     s = sub.add_parser("pause", help="launch no new agents until `pause --off`")
     s.add_argument("--off", action="store_true")
