@@ -78,14 +78,17 @@ probe_argv = ["my-agent", "--model", "{model}", "--ping"]
 | Key | Default | Meaning |
 |---|---|---|
 | `default` | `opencode:anthropic/claude-sonnet-4-5` | |
-| `fallbacks` | `[]` | tried in order when an unpinned issue's model does not answer a probe |
+| `fallbacks` | `[]` | tried in order when an unpinned issue's model does not answer a probe. A fallback whose pool is full is skipped |
 | `premium` | `[]` | models that run only on issues approved with `nohalt route <n> <model> --approve` |
 | `premium_fallback` | `""` | what a non-approved request for a premium model gets (default: `default`) |
 | `probe` | `true` | ask the model for "OK" before launching. A dead endpoint otherwise kills every agent in its first second |
 | `probe_ttl` | `"5m"` | probe results are cached this long |
 | `[[models.route]]` | `[]` | `{ labels = [...], model = "..." }` or `{ title = "regex", model = "..." }`. The first match wins |
+| `overflow_after` | `""` (off) | an unpinned issue that could start but has waited this long for a slot -- its model's pool (or `max_parallel`) is full, or its model does not answer and no fallback has a free slot -- starts on the first `overflow_to` model with a free slot that answers a probe, e.g. `"10m"` |
+| `overflow_to` | `fallbacks` minus `premium` | models allowed to take overflow, in order. A premium model is used only for issues approved for it |
+| `overflow_reserve` | `{}` | `[agents] pools` prefix → slots overflow may not take, e.g. `{ "claude-code:" = 2 }` keeps the last two Claude slots for work routed there |
 
-Pins (`nohalt route <issue> <model>`) beat rules and are never failed over: a pinned issue waits for its model.
+Pins (`nohalt route <issue> <model>`) beat rules and are never failed over or overflowed: a pinned issue waits for its model. Overflow is not a pin: the issue's next launch (a resume, a retry, a hand-back) is routed as usual, and starts a fresh session if that lands on a different model. Running agents are never moved. Overflowed launches are marked `^` in `nohalt status`, with the reason (`overflow: opencode:local/ pool full (8/8) for 12m → claude-code:sonnet`), which is also in the issue's history and the log.
 
 ## [budget]
 

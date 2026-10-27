@@ -11,6 +11,12 @@ answer a probe falls over to the first fallback that does, instead of waiting
 on a dead server -- and no agent is started on a model that is not answering,
 because a dead endpoint kills each agent in its first second and a loop would
 burn through the whole queue in minutes.
+
+Overflow (``[models] overflow_after``): an unpinned issue that has waited that
+long for a slot -- its model's pool is full, or its model does not answer and
+no fallback has a free slot -- may start on the first ``overflow_to`` model
+with a free slot that answers. It is not a pin: the next launch is routed as
+usual again.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from . import agents
@@ -73,15 +80,40 @@ class Router:
             return self.cfg.models.premium_fallback or self.cfg.models.default
         return model
 
-    def choose(self, issue: Issue) -> str | None:
-        """The model to launch with now, or None if nothing suitable answers."""
+    def choose(self, issue: Issue, has_slot: Callable[[str], bool] | None = None) -> str | None:
+        """The model to launch with now, or None if nothing suitable answers.
+
+        ``has_slot`` says whether a model's pool has a free slot. A full pool
+        for the wanted model means wait (overflow decides when waiting is
+        enough); a fallback is taken only if its own pool has room.
+        """
+        free = has_slot or (lambda _m: True)
         model, pinned = self.wanted(issue)
+        if not free(model):
+            return None
         if self.prober.answers(model):
             return model
         if pinned:
             return None
         for alt in self.cfg.models.fallbacks:
-            if alt != model and self.prober.answers(alt):
+            if alt != model and free(alt) and self.prober.answers(alt):
+                return alt
+        return None
+
+    def overflow_targets(self, issue: int) -> list[str]:
+        """Models an issue may overflow to, in order. Premium only if approved."""
+        m = self.cfg.models
+        targets = m.overflow_to or [f for f in m.fallbacks if f not in m.premium]
+        approved = self.approved(issue)
+        return [t for t in targets if approved or t not in m.premium]
+
+    def overflow(self, issue: Issue, has_slot: Callable[[str], bool]) -> str | None:
+        """The first overflow model with a free slot that answers. Pinned issues never overflow."""
+        model, pinned = self.wanted(issue)
+        if pinned:
+            return None
+        for alt in self.overflow_targets(issue.number):
+            if alt != model and has_slot(alt) and self.prober.answers(alt):
                 return alt
         return None
 

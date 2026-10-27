@@ -157,6 +157,34 @@ def test_fallback_when_default_does_not_answer_but_pins_wait(tmp_path):
     assert r.choose(Issue(1, "OPEN")) is None  # a pinned issue waits for its model
 
 
+def test_overflow_targets_default_to_fallbacks_minus_premium(tmp_path):
+    r = router(
+        tmp_path, default="opencode:a/b", fallbacks=["claude-code:opus", "claude-code:sonnet"], premium=["claude-code:opus"]
+    )
+    assert r.cfg.models.overflow_after == 0
+    assert r.overflow_targets(1) == ["claude-code:sonnet"]
+    r2 = router(tmp_path, overflow_to=["claude-code:opus", "claude-code:sonnet"], premium=["claude-code:opus"])
+    assert r2.overflow_targets(2) == ["claude-code:sonnet"]
+    r2.pin(2, "claude-code:opus", approve=True)
+    assert r2.overflow_targets(2) == ["claude-code:opus", "claude-code:sonnet"]
+    assert r2.overflow(Issue(2, "OPEN"), lambda m: True) is None  # pinned: never overflows
+
+
+def test_overflow_config_is_checked(tmp_path):
+    cfg = config_mod.from_dict({"models": {"overflow_after": ""}}, root=tmp_path)
+    assert cfg.models.overflow_after == 0
+    cfg = config_mod.from_dict({"models": {"overflow_after": "10m"}}, root=tmp_path)
+    assert cfg.models.overflow_after == 600
+    with pytest.raises(config_mod.ConfigError, match="overflow_reserve"):
+        config_mod.from_dict({"models": {"overflow_reserve": {"claude-code:": 2}}}, root=tmp_path)
+    with pytest.raises(config_mod.ConfigError, match="overflow_reserve"):
+        config_mod.from_dict(
+            {"agents": {"pools": {"claude-code:": 8}}, "models": {"overflow_reserve": {"claude-code:": -1}}}, root=tmp_path
+        )
+    with pytest.raises(config_mod.ConfigError, match="must name its agent"):
+        config_mod.from_dict({"models": {"overflow_to": ["sonnet"]}}, root=tmp_path)
+
+
 # -- budget ---------------------------------------------------------------------------------------------
 def test_budget_high_water_mark_and_caps(tmp_path):
     cfg = config_mod.from_dict(
