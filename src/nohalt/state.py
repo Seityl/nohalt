@@ -43,6 +43,8 @@ class IssueRecord:
     pid: int = 0
     started_at: float = 0.0
     not_before: float = 0.0  # backoff: do not relaunch before this time
+    stalled_since: float = 0.0  # launchable but no slot for its model since then (overflow clock)
+    overflow: str = ""  # why the current launch is on an overflow model; "" when routed as usual
     branch: str = ""
     worktree: str = ""
     log: str = ""

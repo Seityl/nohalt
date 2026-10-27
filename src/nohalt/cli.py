@@ -19,7 +19,7 @@ from . import __version__
 from . import config as config_mod
 from . import queue as queue_mod
 from .config import Config, ConfigError
-from .state import RUNNING, FileLock, StateStore
+from .state import BLOCKED, QUEUED, RUNNING, FileLock, StateStore
 from .util import now, pid_alive, stamp, tail
 
 if TYPE_CHECKING:
@@ -286,7 +286,14 @@ def render_status(cfg: Config) -> str:
         else:
             last = (r.history[-1].split("  ", 1)[-1] if r.history else "")[:70]
         tries = f"{r.attempts}/{cfg.agents.max_attempts}"
-        lines.append(f"#{r.issue:<7}{r.status:<12}{r.model[:33]:<34}{idle:>7}  {tries:<6}{last}")
+        overflowed = r.overflow and r.status not in (QUEUED, BLOCKED)  # the mark is for the launch that overflowed
+        model = (r.model[:31] + " ^") if overflowed else r.model[:33]
+        lines.append(f"#{r.issue:<7}{r.status:<12}{model:<34}{idle:>7}  {tries:<6}{last}")
+    overflows = [r for r in recs if r.overflow and r.status not in (QUEUED, BLOCKED)]
+    if overflows:
+        lines.append("")
+        lines.append("^ overflowed (not pinned; the next launch is routed as usual):")
+        lines.extend(f"  #{r.issue}: {r.overflow}" for r in overflows)
     snap = state.load("status.json", {})
     if snap:
         lines.append("")

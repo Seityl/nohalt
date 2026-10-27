@@ -85,6 +85,9 @@ class ModelsCfg:
     probe: bool = True
     probe_ttl: int = 300
     route: list[RouteRule] = field(default_factory=list)
+    overflow_after: int = 0  # waited this long for a slot: start on an overflow model. 0: never
+    overflow_to: list[str] = field(default_factory=list)  # default: fallbacks minus premium
+    overflow_reserve: dict[str, int] = field(default_factory=dict)  # pool prefix -> slots overflow may not take
 
 
 @dataclass
@@ -225,7 +228,9 @@ _DURATIONS = {
     "probe_ttl",
     "cd_timeout",
     "base_pipeline_grace",
+    "overflow_after",
 }
+_OFF_WHEN_EMPTY = {"overflow_after"}
 
 
 def _build(cls: type, data: dict[str, Any], where: str) -> Any:
@@ -235,7 +240,9 @@ def _build(cls: type, data: dict[str, Any], where: str) -> Any:
         if key not in known:
             raise ConfigError(f"[{where}] unknown key {key!r} (known: {', '.join(sorted(known))})")
         f = known[key]
-        if key in _DURATIONS:
+        if key in _OFF_WHEN_EMPTY and value == "":
+            value = 0
+        elif key in _DURATIONS:
             try:
                 value = parse_duration(value)
             except ValueError as e:
@@ -309,9 +316,15 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[agents] max_parallel must be at least 1")
     if cfg.agents.max_attempts < 1:
         raise ConfigError("[agents] max_attempts must be at least 1")
-    for model in [cfg.models.default, *cfg.models.fallbacks, *(r.model for r in cfg.models.route)]:
+    models = cfg.models
+    for model in [models.default, *models.fallbacks, *models.overflow_to, *(r.model for r in models.route)]:
         if ":" not in model:
             raise ConfigError(f"model {model!r} must name its agent, e.g. 'opencode:provider/model'")
+    for pool, n in models.overflow_reserve.items():
+        if pool not in cfg.agents.pools:
+            raise ConfigError(f"[models] overflow_reserve: {pool!r} is not one of [agents] pools")
+        if not isinstance(n, int) or n < 0:
+            raise ConfigError(f"[models] overflow_reserve: {pool!r} must be a whole number of slots, got {n!r}")
     from .integrate.mergers import DRIVERS
 
     for glob, driver in cfg.integrate.mergers.items():

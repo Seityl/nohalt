@@ -714,6 +714,29 @@ class Supervisor:
             return int(override[pool])
         return self.cfg.agents.pools[pool] if pool else self.cfg.agents.max_parallel
 
+    def _has_slot(self, model: str, in_use: dict[str, int], reserve: bool = False) -> bool:
+        """A free slot in the model's pool; overflow (``reserve``) may not take a pool's last reserved slots."""
+        pool = self._pool_of(model)
+        held = self.cfg.models.overflow_reserve.get(pool, 0) if reserve else 0
+        return in_use.get(pool, 0) < self._cap(pool) - held
+
+    def _stall_reason(self, model: str, in_use: dict[str, int]) -> str:
+        pool = self._pool_of(model)
+        if not self._has_slot(model, in_use):
+            return f"{pool or 'shared'} pool full ({in_use.get(pool, 0)}/{self._cap(pool)})"
+        return f"{model} not answering and no fallback has a free slot"
+
+    def _stall(self, rec: IssueRecord) -> None:
+        """Start the overflow clock: the issue could start but its model has no slot."""
+        if self.cfg.models.overflow_after and not rec.stalled_since and not self.dry_run:
+            rec.stalled_since = now()
+            self.state.put(rec)
+
+    def _overflow_due(self, rec: IssueRecord, pinned: bool) -> bool:
+        """MOD-13: waited ``overflow_after`` for a slot. Pinned issues wait for their model (MOD-05)."""
+        after = self.cfg.models.overflow_after
+        return bool(after and not pinned and rec.stalled_since and now() - rec.stalled_since >= after)
+
     def _launch(self, report: TickReport) -> None:
         try:
             entries = queue.load(self.cfg.queue_file)
@@ -798,25 +821,39 @@ class Supervisor:
                     self.say(f"#{entry.issue}: already has {self.pr(existing.number)} -- adopted, watching it through CI")
                     continue
             if rec.not_before > now() or stopping:
+                if rec.stalled_since:  # the overflow clock runs only while the issue could start
+                    rec.stalled_since = 0
+                    self.state.put(rec)
                 continue
-            model, _ = self.router.wanted(issue)
+            model, pinned = self.router.wanted(issue)
             pool = self._pool_of(model)
-            if in_use.get(pool, 0) >= self._cap(pool):
+            overflow_due = self._overflow_due(rec, pinned)
+            if not self._has_slot(model, in_use) and not overflow_due:
+                self._stall(rec)
                 continue
             if self.dry_run:
-                report.launched.append(entry.issue)
-                in_use[pool] = in_use.get(pool, 0) + 1
+                if self._has_slot(model, in_use):
+                    report.launched.append(entry.issue)
+                    in_use[pool] = in_use.get(pool, 0) + 1
                 continue
             free = mem_available_mb()
             if free is not None and free < self.cfg.agents.min_free_mb:
                 self.state.log(f"#{entry.issue} waiting: {free} MB available, need {self.cfg.agents.min_free_mb}")
                 break
-            chosen = self.router.choose(issue)
+            chosen = self.router.choose(issue, lambda m: self._has_slot(m, in_use))
+            overflow = ""
+            if not chosen and overflow_due:
+                chosen = self.router.overflow(issue, lambda m: self._has_slot(m, in_use, reserve=True))
+                if chosen:
+                    overflow = (
+                        f"overflow: {self._stall_reason(model, in_use)} for {int((now() - rec.stalled_since) // 60)}m → {chosen}"
+                    )
             if not chosen:
-                self.state.log(f"#{entry.issue} waiting: {model} is not answering and no fallback is")
+                self._stall(rec)
+                self.state.log(f"#{entry.issue} waiting: {self._stall_reason(model, in_use)}")
                 continue
             try:
-                self.launch(rec, issue, chosen)
+                self.launch(rec, issue, chosen, overflow=overflow)
             except (GitError, prompt_mod.PromptError, OSError, ValueError) as e:
                 rec.not_before = now() + 600
                 rec.event(f"launch failed: {e}")
@@ -848,7 +885,7 @@ class Supervisor:
             body += f"\n## Note from the supervisor\n\n{rec.note}\n"
         return body
 
-    def launch(self, rec: IssueRecord, issue: Issue, model: str) -> None:
+    def launch(self, rec: IssueRecord, issue: Issue, model: str, overflow: str = "") -> None:
         name, mid = agents.split_model(model)
         agent = agents.get(name, self.cfg.agents.options.get(name))
         branch = rec.branch or self.trees.branch_for(issue.number, issue.title, issue.labels)
@@ -921,9 +958,15 @@ class Supervisor:
         rec.resume = rec.fresh = False
         rec.note = ""
         rec.last_exit = ""
-        rec.event(f"launched on {model}" + (" (resumed)" if resume else ""))
+        rec.stalled_since = 0
+        rec.overflow = overflow  # not a pin: the next launch is routed as usual (fail-back)
+        rec.event(f"launched on {model}" + (" (resumed)" if resume else "") + (f" -- {overflow}" if overflow else ""))
         self.state.put(rec)
-        self.say(f"#{issue.number}: agent launched on {model} in {tree} ({branch})" + (" -- resumed" if resume else ""))
+        self.say(
+            f"#{issue.number}: agent launched on {model} in {tree} ({branch})"
+            + (" -- resumed" if resume else "")
+            + (f" -- {overflow}" if overflow else "")
+        )
 
     def _rotate(self, log: Path) -> None:
         try:
