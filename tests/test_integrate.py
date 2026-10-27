@@ -446,3 +446,44 @@ def test_the_fix_forward_pr_merges_while_everything_else_waits(world):
     assert merged and merged[0] == fix_pr, (merged, fix_pr, w.messages[-6:])
     assert w.forge.issue(fix).state == "CLOSED"
     assert w.rec(2).status != "done" or merged.index(w.rec(2).pr) > 0  # #2 only after the fix
+
+
+def _red_with_fix(w, ready):
+    """A base that went red: fix-forward issue 900 open, its record READY with a PR or not."""
+    w.forge.add_issue(900, "Pipeline red")
+    w.sup.state.save("integrate.json", {"fix_issue": 900})
+    rec = w.sup.state.get(900)
+    rec.status, rec.pr = ("ready", 901) if ready else ("running", 0)
+    w.sup.state.put(rec)
+    return w.sup.integrator.gate
+
+
+def test_on_a_red_base_the_train_carries_the_fix_and_every_green_pr(world):
+    """INT-14: with red_base = with_fix, once the fix is READY the batch is not narrowed to it."""
+    w = world(integrate={"mode": "train", "red_base": "with_fix"})
+    gate = _red_with_fix(w, ready=True)
+    assert gate.open() is True
+    assert gate.only is None
+
+
+def test_with_fix_waits_for_the_fix_before_releasing_anything(world):
+    """INT-14: a batch without the fix would only go red again, so nothing merges until it is ready."""
+    w = world(integrate={"mode": "train", "red_base": "with_fix"})
+    gate = _red_with_fix(w, ready=False)
+    assert gate.open() is False
+
+
+def test_fix_only_is_still_the_default(world):
+    """INT-14: by default a red base lets only the fix merge."""
+    w = world(integrate={"mode": "train"})
+    gate = _red_with_fix(w, ready=True)
+    assert gate.open() is True
+    assert gate.only == 900
+
+
+def test_direct_mode_keeps_fix_only_even_with_with_fix(world):
+    """INT-14: one merge at a time would put other PRs ahead of the fix, so direct mode ignores with_fix."""
+    w = world(integrate={"mode": "direct", "red_base": "with_fix"})
+    gate = _red_with_fix(w, ready=True)
+    assert gate.open() is True
+    assert gate.only == 900

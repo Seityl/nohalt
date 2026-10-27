@@ -136,6 +136,9 @@ class IntegrateCfg:
     base_ignore_checks: list[str] = field(default_factory=list)  # base branch after a merge: checks that never count there
     base_cancelled_limit: int = 3  # cancelled base runs in a row before the base is given up on as "no verdict"
     base_no_verdict: str = "continue"  # then: "continue" (file an issue, keep merging) or "hold" (stop for a human)
+    red_base: str = (
+        "fix_only"  # on a red base: "fix_only" merges only the fix; "with_fix" (train) carries the fix and every green PR
+    )
     merge_method: str = "squash"
     cd_workflow: str = ""
     ci_workflow: str = ""
@@ -294,6 +297,8 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"[project] repo must be group[/subgroup]/name, got {repo!r}")
     if cfg.integrate.mode not in ("none", "direct", "train"):
         raise ConfigError(f"[integrate] mode must be none, direct or train, got {cfg.integrate.mode!r}")
+    if cfg.integrate.red_base not in ("fix_only", "with_fix"):
+        raise ConfigError(f"[integrate] red_base must be fix_only or with_fix, got {cfg.integrate.red_base!r}")
     if cfg.integrate.base_no_verdict not in ("continue", "hold"):
         raise ConfigError(f"[integrate] base_no_verdict must be continue or hold, got {cfg.integrate.base_no_verdict!r}")
     if cfg.integrate.merge_method not in ("merge", "squash", "rebase"):
