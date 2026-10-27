@@ -44,6 +44,7 @@ mode = "train"
 required_checks = ["build", "tests"]
 # [integrate.train]
 # version_files = [{ path = "myapp/__init__.py", pattern = '__version__ = "([^"]+)"' }]
+# (version files need no merge driver: one is implied)
 # Merge drivers for patches.txt, DocType JSON, fixtures and package.json are
 # on by default for this stack; add your own:
 # [integrate.mergers]

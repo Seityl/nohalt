@@ -29,7 +29,8 @@ from ..forge.base import GREEN, RED
 from ..state import READY
 from ..worktree import GitError, git
 from .common import PipelineGate, cancel_superseded, close_merged, is_network_failure, run_deploy
-from .mergers import resolve
+from .mergers import effective, resolve
+from .refresh import REFRESHED, record_conflicts, refresh
 
 if TYPE_CHECKING:
     from ..supervisor import Supervisor
@@ -265,7 +266,8 @@ class Train:
             )
             if not ok:
                 conflicted = self._git("diff", "--name-only", "--diff-filter=U", check=False).split()
-                left = resolve(self.tree, conflicted, self.cfg.integrate.mergers) if conflicted else ["(merge failed)"]
+                mergers = effective(self.cfg.integrate.mergers, self.t.version_files)
+                left = resolve(self.tree, conflicted, mergers) if conflicted else ["(merge failed)"]
                 if not left:
                     ok = (
                         subprocess.run(
@@ -277,6 +279,17 @@ class Train:
                 if not ok:
                     self._git("merge", "--abort", check=False)
                     files = ", ".join(left)
+                    out = refresh(self.sup, self.sup.state.get(issue), pr)
+                    if out.status == REFRESHED:
+                        self.sup.say(
+                            f"  ~ #{issue} ({self.sup.pr(pr.number)}) conflicted with {base} only in "
+                            f"{', '.join(out.files)}: refreshed as {out.sha[:8]}, joins a later batch once green"
+                        )
+                        continue
+                    if out.handled:
+                        self.sup.state.log(f"  ~ #{issue} ({self.sup.pr(pr.number)}) left out, refresh deferred: {out.why}")
+                        continue
+                    record_conflicts(self.sup.state, issue, out.files or [f for f in left if not f.startswith("(")])
                     self.sup.say(f"  - #{issue} ({self.sup.pr(pr.number)}) conflicts in code: {files} -- handed back to rebase")
                     self.sup.hand_back(
                         issue,

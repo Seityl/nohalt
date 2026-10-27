@@ -162,6 +162,7 @@ class IntegrateCfg:
         ]
     )
     mergers: dict[str, str] = field(default_factory=dict)  # glob -> driver
+    refresh_conflicts: bool = True  # merge the base into a conflicting PR when drivers settle every file (INT-12)
     train: TrainCfg = field(default_factory=TrainCfg)
 
 

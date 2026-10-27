@@ -61,6 +61,7 @@ merge_method = "squash"
 # ci_workflow = "CI"
 # cd_workflow = "CD"
 # deploy = "./scripts/deploy.sh"
+# refresh_conflicts = true   # merge the base into a PR whose conflicts the merge drivers settle, instead of handing it back
 
 [stack]
 name = "generic"

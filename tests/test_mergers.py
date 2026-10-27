@@ -110,3 +110,20 @@ def test_resolve_leaves_code_conflicts(repo):
     assert conflict(repo, "src/app.py", "x = 1\n", "x = 2\n", "x = 3\n")
     left = resolve(repo, ["src/app.py"], {"**/patches.txt": "keep_both_lines"})
     assert left == ["src/app.py"]
+
+
+def test_version_lines_takes_ours_only_for_version_hunks(repo):
+    """Ours is the base side when the integrator merges; the incoming side's other edits survive."""
+    base = 'VERSION = "1.0.0"\n\n\ndef f():\n    return 1\n'
+    ours = 'VERSION = "1.1.0"\n\n\ndef f():\n    return 1\n'
+    theirs = 'VERSION = "1.0.7"\n\n\ndef f():\n    return 2\n'
+    assert conflict(repo, "pkg/version.py", base, ours, theirs)
+    assert DRIVERS["version_lines"](repo, "pkg/version.py")
+    assert (repo / "pkg/version.py").read_text() == 'VERSION = "1.1.0"\n\n\ndef f():\n    return 2\n'
+
+
+def test_version_lines_refuses_a_hunk_with_code_in_it(repo):
+    base = 'VERSION = "1.0.0"\nX = 1\n'
+    assert conflict(repo, "v.py", base, 'VERSION = "1.1.0"\nX = 1\n', 'VERSION = "1.0.7"\nX = 2\n')
+    assert not DRIVERS["version_lines"](repo, "v.py")
+    assert resolve(repo, ["v.py"], {"v.py": "version_lines"}) == ["v.py"]

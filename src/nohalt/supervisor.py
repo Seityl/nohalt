@@ -584,6 +584,10 @@ class Supervisor:
             if pr.mergeable is False:
                 if pr.head_sha in rec.swept:
                     return
+                from .integrate.refresh import before_hand_back
+
+                if before_hand_back(self, rec, pr):
+                    return  # bookkeeping only: nohalt merged the base itself (INT-12)
                 return self._hand_back(
                     rec,
                     pr,

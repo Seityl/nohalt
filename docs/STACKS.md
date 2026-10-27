@@ -85,7 +85,13 @@ Frontend work is checked with the app's JS test runner inside the worktree (syml
 "yarn.lock"                = "fail"             # never mechanically: the agent reinstalls
 ```
 
-Drivers: `package_json`, `keep_both_lines`, `keep_both_blocks`, `take_ours`, `take_theirs`, `fixture_json`, `doctype_json`, `min_counts`, `fail`. The most specific matching glob wins. A file no glob matches is a code conflict. Run one by hand inside a conflicted merge with `nohalt merge-driver <name> <path>`.
+Drivers: `package_json`, `keep_both_lines`, `keep_both_blocks`, `version_lines`, `take_ours`, `take_theirs`, `fixture_json`, `doctype_json`, `min_counts`, `fail`. The most specific matching glob wins. A file no glob matches is a code conflict. Run one by hand inside a conflicted merge with `nohalt merge-driver <name> <path>`.
+
+**Which side is "ours".** The integrator always merges with the base side checked out: "ours" is the release branch in a batch, and the base when nohalt refreshes a conflicting PR. "Theirs" is the PR. So `take_ours` and the version rules in `package_json` and `version_lines` keep the base's version in both places.
+
+**Version files need no mapping.** Each path in `[integrate.train] version_files` that no glob covers gets a driver implicitly: `package_json` for JSON, and for anything else `version_lines`. `version_lines` takes ours for every conflicting hunk made only of version-looking lines, keeps the PR's other edits to the file, and treats any other hunk as a code conflict. A glob you (or the stack) configure always wins, including `fail`.
+
+**Conflicting PRs are refreshed, not handed back, when the drivers settle everything** (`[integrate] refresh_conflicts`, on by default in `direct` and `train`). nohalt merges the base into the PR branch in `<worktrees>/_refresh`, runs `after_version`, and pushes the merge. The agent keeps its round. `nohalt doctor` names files that were left in conflict at two or more hand-backs in the last 14 days and have no driver, with a suggested driver for each.
 
 ## Writing a stack
 
