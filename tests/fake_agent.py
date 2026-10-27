@@ -59,7 +59,9 @@ def open_pr(forge: LocalForge, issue: int, checks: str, base: str = "main") -> N
     branch = git("branch", "--show-current")
     git("push", "-q", "origin", branch)
     sha = git("rev-parse", "HEAD")
-    n = forge.data()["next"]
+    with forge._db() as d:  # taken under the forge's lock: two agents finishing together must not share a number
+        n = d["next"]
+        d["next"] = n + 1
     forge.add_pull(n, branch, sha, body=f"Closes #{issue}", base=base, mergeable=checks != "conflict", draft=draft)
     with forge._db() as d:
         d["branches"][branch] = sha
