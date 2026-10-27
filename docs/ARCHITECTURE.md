@@ -30,6 +30,8 @@ Every `tick` (default 60 s):
 4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback does).
 5. **Budget.** Every few minutes, estimate paid-API spend and move issues over their cap to a fallback model.
 
+Before each tick the supervisor checks `nohalt.toml` and the `RESTART` flag. A valid change to the file, or a restart request, makes it release its lock and `exec` itself; the new process adopts the running agents like any restarted supervisor. An invalid file keeps the running configuration and raises `CONFIG_INVALID` (see [CONFIGURATION.md](CONFIGURATION.md#changing-it-while-nohalt-runs)).
+
 The supervisor holds an exclusive lock, so only one runs per state directory. A tick never blocks on long waits: watching a pipeline after a merge, or waiting for a usage limit to reset, is a state that later ticks re-examine.
 
 ## Issue lifecycle
@@ -82,7 +84,8 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   spend.json               budget high-water marks
   integrate.json train.json integrator state that spans ticks
   status.json              last tick's summary (for `nohalt status`)
-  STOP PAUSE WAKE BATCH_PAUSE DEPLOY_BLOCKED BUDGET_EXHAUSTED   control flags
+  supervisor.json          the running supervisor: pid, start time, hash of the config it loaded
+  STOP PAUSE WAKE RESTART BATCH_PAUSE DEPLOY_BLOCKED BUDGET_EXHAUSTED CONFIG_INVALID   control flags
   priority hold            one issue per line (train ordering / exclusion)
   bin/                     guard shims
   locks/verify-<slot>.lock verification slots
