@@ -16,7 +16,7 @@ src/nohalt/
   agents/          opencode, claude-code, any command
   stacks/          generic (shell hooks), frappe (site pool on a shared bench)
   review.py        the optional review gate: a reviewer agent checks green PRs against their issue
-  integrate/       none | direct | train, plus the bookkeeping merge drivers
+  integrate/       none | direct | train, the bookkeeping merge drivers, the async workflow watch
   shims/           gh, glab, git, pkill guards put first on every agent's PATH
   cli.py           the `nohalt` command
 ```
@@ -30,6 +30,7 @@ Every `tick` (default 60 s):
 
    **Review.** For each `in_review` issue: no reviewer yet → launch one (a slot in its model's pool, a model that answers) in a detached checkout of the PR head, read-only. Running → time limit and hang checks, as for agents. Exited → read its verdict: `approve` (and the PR head is still the commit reviewed) → `ready`; `changes` → handed back to the author with the review; no verdict → retried, never approved. A head that moves during a review stops the reviewer and voids its verdict.
 3. **Integrate.** `direct` or `train` merges `ready` PRs (see below). `none` does nothing: a human merges. Either way, an issue still open after its PR merged is closed by nohalt -- forges act on closing keywords only for the default branch.
+   **Async workflows** (`async_workflows`) are read here too, in any mode: the newest completed run of each on the base branch. They never hold a merge. Red opens one issue per workflow (later reds comment on it), green closes it.
 4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback with a free slot does). An unpinned issue that has waited `overflow_after` for a slot overflows to the first `overflow_to` model with a free slot (outside `overflow_reserve`) that answers; the next launch is routed as usual.
 5. **Budget.** Every few minutes, estimate paid-API spend and move issues over their cap to a fallback model.
 
@@ -51,6 +52,10 @@ The supervisor holds an exclusive lock, so only one runs per state directory. A 
    │                                                       attempts used ─► blocked  │
    │                                                                                 │
    └──── a human removes the blocked label (counters reset)        forge says CLOSED ┘ (at any point)
+
+ judged ──"NOHALT-RESULT: no-change"──► async workflow's issue: awaiting_green ──green run──► closed ──► done
+                                         │                       └─ red run, failures not seen ─► queued (fresh)
+                                         └─ any other issue: blocked ("agent says no change needed: <reason>")
 ```
 
 With `[review]`, a selected issue goes `waiting_ci ──green──► in_review ──approve──► ready`. A `changes` verdict hands it back to `queued` (resumed with the review) like a red CI, up to `max_rounds`, then `blocked`. A push after an approval sends it back to `waiting_ci`, and then to a new review.
@@ -67,6 +72,7 @@ How an exit is judged, in order:
 | Time limit, issue still open | continues in the same worktree, up to `timeout_continues` times | no |
 | Hung | restarted, up to `revive_limit` times | no |
 | A pull request exists | `waiting_ci` | no |
+| The agent ended with `NOHALT-RESULT: no-change -- <reason>` | an async workflow's issue: `awaiting_green` (relaunched only by a red run with failures it has not seen). Any other: blocked with the reason | no |
 | None of the above | requeued after `revive_grace` (it may have stopped to ask). Blocked after `max_attempts` | **yes** |
 
 A *resumed* launch continues the agent's previous session in the same worktree with a short "you were stopped, check git status and your PR first" prompt. A *fresh* launch (used after a rebase request, when the world has moved on) starts a new session from the full prompt.
@@ -74,6 +80,8 @@ A *resumed* launch continues the agent's previous session in the same worktree w
 ## Integration
 
 **direct.** Takes the first `ready` issue in queue order, checks again that its PR is green on its current head and mergeable, merges it, then watches the pipeline on the base branch's new head (`cd_workflow`, else `ci_workflow`, else the required checks). Every check of the pipeline the merge triggered counts, except `base_ignore_checks` (forge-managed jobs that post on the base head afterwards, like Dependabot updates on GitHub, are not that pipeline) -- including checks `ignore_checks` skips on PRs, whose only gate is this one. Nothing else merges until that pipeline is green. A cancelled run is no verdict: it is re-run, and after `base_cancelled_limit` in a row merging is held (`BASE_NO_VERDICT`) for a human. If it is red, or times out, nohalt opens a fix-forward issue at the front of the queue, and merging resumes when that issue closes. A `deploy` command, if set, runs after a green pipeline (unless a CD workflow already deploys).
+
+**Async workflows.** A workflow listed in `async_workflows` is never part of that gate (on GitHub its jobs are excluded from the base verdict by check suite). `integrate/async_watch.py` reads its newest completed run on the base every tick, in every mode, and keeps at most one open issue per workflow: opened on red at the front of the queue, commented on each further red (new and fixed failures, read from the failed log), closed with a comment on the first green. An agent on that issue that finds the base already fixed ends with `NOHALT-RESULT: no-change -- <reason>`; the issue waits in `awaiting_green` rather than being blocked.
 
 **train.** With no release PR open, every `ready` issue's green PR (priority list first, then queue order, minus held issues and parked SHAs) is merged into `release/auto-<time>` off the base. Conflicts go to the merge drivers by glob (`[integrate.mergers]`). If any file stays in conflict, that PR is left out. It is refreshed against the base if the drivers settle that (see `refresh_conflicts`), otherwise handed back to rebase. The batch gets the next free version (from tags, or the version files), an optional regeneration command, and a PR closing every carried issue. On a later tick: green and mergeable → merge, tag, deploy, then the same pipeline gate as `direct` watches the base branch. Red → re-run the failed jobs once (more if the failure was the network). Still red → close the release, park the carried heads until their agents push, and hand each issue back.
 
@@ -90,6 +98,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   spend.json               budget high-water marks
   integrate.json train.json integrator state that spans ticks
   refresh.json conflicts.json  conflicting PRs refreshed by nohalt (counted per issue); files left in conflict at hand-backs (for doctor)
+  async.json               per async workflow: its open issue, the last run read, its failures, what the agent saw
   status.json              last tick's summary (for `nohalt status`)
   supervisor.json          the running supervisor: pid, start time, hash of the config it loaded
   STOP PAUSE WAKE RESTART BATCH_PAUSE DEPLOY_BLOCKED BUDGET_EXHAUSTED CONFIG_INVALID   control flags

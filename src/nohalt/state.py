@@ -26,6 +26,7 @@ IN_REVIEW = "in_review"  # PR green; a reviewer agent checks it against the issu
 READY = "ready"  # PR green (and approved, when reviewed), waiting for the integrator
 DONE = "done"  # the forge says CLOSED
 BLOCKED = "blocked"  # needs a human; carries the blocked label
+AWAITING_GREEN = "awaiting_green"  # async-red issue whose agent found nothing to change: the next green run closes it
 
 ACTIVE = (RUNNING, WAITING_CI, IN_REVIEW, READY)
 

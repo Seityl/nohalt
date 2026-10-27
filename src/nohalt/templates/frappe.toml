@@ -42,6 +42,7 @@ sites = ["agents1.test", "agents2.test", "agents3.test"]
 [integrate]
 mode = "train"
 required_checks = ["build", "tests"]
+# async_workflows = ["Tests"]   # a long full suite: watched on the base without gating releases
 # [integrate.train]
 # version_files = [{ path = "myapp/__init__.py", pattern = '__version__ = "([^"]+)"' }]
 # (version files need no merge driver: one is implied)

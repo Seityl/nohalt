@@ -16,6 +16,7 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     provider-error   die the way an agent dies when the model server is down
     usage-limit      stop on a subscription usage limit
     nothing          exit 0 having done nothing
+    no-change <why>  exit 0 having changed nothing, saying why (NOHALT-RESULT: no-change -- <why>)
     sleep <seconds>  run that long (to be timed out or found hung)
     dirty            leave an uncommitted file in the worktree
 
@@ -155,6 +156,9 @@ def main() -> int:
         return 1
     elif action.startswith("sleep"):
         time.sleep(float(action.split()[1]))
+    elif action.startswith("no-change"):
+        print("I looked at the newest base.", flush=True)
+        print(f"NOHALT-RESULT: no-change -- {action.partition(' ')[2]}", flush=True)
     elif action == "dirty":
         Path("uncommitted.txt").write_text("precious\n")
     return 0

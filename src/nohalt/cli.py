@@ -19,7 +19,7 @@ from . import __version__
 from . import config as config_mod
 from . import queue as queue_mod
 from .config import Config, ConfigError
-from .state import BLOCKED, IN_REVIEW, QUEUED, RUNNING, FileLock, StateStore
+from .state import AWAITING_GREEN, BLOCKED, IN_REVIEW, QUEUED, RUNNING, FileLock, StateStore
 from .util import now, pid_alive, stamp, tail
 
 if TYPE_CHECKING:
@@ -273,7 +273,7 @@ def render_status(cfg: Config) -> str:
     if spend:
         lines.append(f"API spend ~${spend.get('total', 0):.2f} of ${spend.get('cap', 0):.2f}")
     lines.append("")
-    lines.append(f"{'ISSUE':<8}{'STATUS':<12}{'MODEL':<34}{'IDLE':>7}  {'TRIES':<6}LAST")
+    lines.append(f"{'ISSUE':<8}{'STATUS':<15}{'MODEL':<34}{'IDLE':>7}  {'TRIES':<6}LAST")
     recs = [r for r in state.all() if r.status != "done"]
     for r in recs:
         idle = ""
@@ -297,7 +297,7 @@ def render_status(cfg: Config) -> str:
             else:
                 last = "review waiting for a reviewer slot or model"
             tries = f"{r.review_rounds}/{cfg.review.max_rounds}"
-        lines.append(f"#{r.issue:<7}{r.status:<12}{model:<34}{idle:>7}  {tries:<6}{last}")
+        lines.append(f"#{r.issue:<7}{r.status:<15}{model:<34}{idle:>7}  {tries:<6}{last}")
     overflows = [r for r in recs if r.overflow and r.status not in (QUEUED, BLOCKED)]
     if overflows:
         lines.append("")
@@ -318,6 +318,12 @@ def render_status(cfg: Config) -> str:
         lines.append("")
         lines.append(f"waiting: {' '.join(snap.get('waiting', [])[:15]) or 'none'}")
         lines.append(f"blocked (need a human): {' '.join('#' + str(i) for i in snap.get('blocked', [])) or 'none'}")
+        awaiting = [r.issue for r in recs if r.status == AWAITING_GREEN]
+        if awaiting or cfg.integrate.async_workflows:
+            owner = {w.get("issue"): wf for wf, w in state.load("async.json", {}).items()}
+            lines.append(
+                "awaiting a green run: " + (" ".join(f"#{i}({owner[i]})" if i in owner else f"#{i}" for i in awaiting) or "none")
+            )
         lines.append(
             f"last tick {stamp(snap.get('at'))}; open in queue: {snap.get('open', '?')}"
             + ("  -- COMPLETE" if snap.get("complete") else "")

@@ -48,6 +48,7 @@ from .models import Router
 from .review import Reviews
 from .state import (
     ACTIVE,
+    AWAITING_GREEN,
     BLOCKED,
     DONE,
     IN_REVIEW,
@@ -132,6 +133,9 @@ class Supervisor:
 
         self.integrator = make_integrator(self)
         self.reviews = Reviews(self)
+        from .integrate.async_watch import AsyncWatch
+
+        self.async_watch = AsyncWatch(self)
 
     # -- forge vocabulary ----------------------------------------------------------------------
     def pr(self, n: int) -> str:
@@ -349,6 +353,8 @@ class Supervisor:
                 self.integrator.tick()
             except (ForgeError, GitError) as e:
                 self.say(f"integrator: {e}")
+        if self.cfg.integrate.async_workflows and not self.dry_run:
+            self.async_watch.tick()
         self._launch(report)
         if self.cfg.budget.enabled and not self.dry_run:
             self._budget()
@@ -519,6 +525,9 @@ class Supervisor:
             self.state.put(rec)
             self.say(f"#{rec.issue}: agent finished; {self.pr(pr.number)} goes through CI")
             return
+        reason = agents.no_change(log_tail)
+        if reason:
+            return self._no_change(rec, reason)
         rec.attempts += 1
         if rec.attempts >= a.max_attempts:
             return self._block(rec, f"still open after {rec.attempts} attempt(s), with no pull request")
@@ -531,6 +540,16 @@ class Supervisor:
             note="You stopped without opening a pull request. If you are blocked, say exactly why in a "
             "comment on the issue and stop; otherwise continue the work and open the PR.",
         )
+
+    def _no_change(self, rec: IssueRecord, reason: str) -> None:
+        """The agent says nothing needs changing (AGT-19). Not an attempt, and not left to look like one.
+
+        On an async workflow's red issue the next green run decides (``awaiting_green``).
+        Anywhere else a human decides, and the reason is what they read.
+        """
+        if self.async_watch.owns(rec.issue):
+            return self.async_watch.no_change(rec, reason)
+        self._block(rec, f"agent says no change needed: {reason}")
 
     # -- 2. watch PRs through CI -------------------------------------------------------------------------
     def _watch(self, rec: IssueRecord, report: TickReport) -> None:
@@ -821,7 +840,7 @@ class Supervisor:
                 self.state.put(rec)
                 report.blocked.append(entry.issue)
                 continue
-            if rec.status in ACTIVE or rec.status == EXITED:
+            if rec.status in ACTIVE or rec.status in (EXITED, AWAITING_GREEN):
                 continue
             if issue.has_label(*self.cfg.queue.held_labels):
                 report.waiting.append(f"#{entry.issue}(held)")
