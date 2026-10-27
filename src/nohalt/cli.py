@@ -430,6 +430,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         _doctor_check_drift(cfg, check)
     if cfg.integrate.mode != "none" and not cfg.integrate.required_checks and not cfg.integrate.ignore_checks:
         check(False, "", "[integrate] required_checks is empty: every check run must pass (fine if intended)", fatal=False)
+    if cfg.state_dir.is_dir():
+        from .integrate.refresh import HISTORY_DAYS, recurring_conflicts
+
+        for path, n, hint in recurring_conflicts(cfg, StateStore(cfg.state_dir)):
+            check(
+                False,
+                "",
+                f"{path} was left in conflict at {n} hand-backs in the last {HISTORY_DAYS} days and has no merge driver: "
+                f"if it is bookkeeping, map it in [integrate.mergers] -- suggested: {hint}",
+                fatal=False,
+            )
     print("ready" if ok else "not ready")
     return 0 if ok else 1
 

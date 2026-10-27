@@ -10,6 +10,9 @@ Every driver runs inside a conflicted merge in the repository root, reads the
 three sides from git (base = merge-base, ours = HEAD, theirs = MERGE_HEAD), and
 returns True if it resolved the file. ``nohalt merge-driver <name> <path>``
 runs one by hand.
+
+The integrator always merges with the base side checked out: "ours" is the
+release branch (or the base, when it refreshes a PR) and "theirs" is the PR.
 """
 
 from __future__ import annotations
@@ -119,6 +122,40 @@ def keep_both_blocks(repo: Path, path: str) -> bool:
     )
     p.write_text(s)
     return "<<<<<<<" not in s
+
+
+_VERSIONISH = re.compile(r"\d+\.\d+")
+
+
+def version_lines(repo: Path, path: str) -> bool:
+    """Version stamps: a conflicting hunk whose lines all look like a version takes ours.
+
+    The integrator always merges with the base side checked out, so "ours" is
+    the base's version (a release re-stamps it anyway). Changes git merged
+    cleanly elsewhere in the file are kept -- unlike ``take_ours``, which would
+    drop a PR's other edits to, say, a package's ``__init__.py``. A hunk with
+    any line that is not a version is a real conflict.
+    """
+    p = repo / path
+    ok = True
+
+    def pick(m: re.Match[str]) -> str:
+        nonlocal ok
+        lines = [ln for ln in (m.group(1) + m.group(2)).splitlines() if ln.strip()]
+        if not lines or not all(_VERSIONISH.search(ln) for ln in lines):
+            ok = False
+        return m.group(1)
+
+    s = re.sub(
+        r"<<<<<<< [^\n]*\n(.*?)(?:\|\|\|\|\|\|\| [^\n]*\n.*?)?=======\n(.*?)>>>>>>> [^\n]*\n",
+        pick,
+        p.read_text(),
+        flags=re.S,
+    )
+    if not ok or "<<<<<<<" in s:
+        return False
+    p.write_text(s)
+    return True
 
 
 def take_ours(repo: Path, path: str) -> bool:
@@ -232,6 +269,7 @@ DRIVERS: dict[str, Callable[[Path, str], bool]] = {
     "package_json": package_json,
     "keep_both_lines": keep_both_lines,
     "keep_both_blocks": keep_both_blocks,
+    "version_lines": version_lines,
     "take_ours": take_ours,
     "take_theirs": take_theirs,
     "fixture_json": fixture_json,
@@ -252,6 +290,23 @@ def driver_for(mergers: dict[str, str], path: str) -> str | None:
             if best is None or score > best[0]:
                 best = (score, name)
     return best[1] if best else None
+
+
+def effective(mergers: dict[str, str], version_files: list[dict[str, str]]) -> dict[str, str]:
+    """The configured drivers, plus an implicit one for each version file no glob covers.
+
+    Every branch touches the version files, so they conflict on every merge; a
+    project should not have to map them by hand. JSON (``package.json`` and the
+    like) gets ``package_json``: dependencies merged per key, the base's version
+    kept. Anything else gets ``version_lines``. A glob the user (or the stack)
+    configured always wins, even ``fail``.
+    """
+    implicit = {}
+    for vf in version_files:
+        path = vf.get("path", "")
+        if path and driver_for(mergers, path) is None:
+            implicit[path] = "package_json" if path.endswith(".json") else "version_lines"
+    return {**implicit, **mergers}
 
 
 def resolve(repo: Path, conflicted: list[str], mergers: dict[str, str]) -> list[str]:

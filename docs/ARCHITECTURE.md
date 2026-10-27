@@ -25,7 +25,7 @@ src/nohalt/
 Every `tick` (default 60 s):
 
 1. **Reap.** For every issue whose agent is running: past its time limit → stop it (`timeout`). No output for `hung_after` and no command of its own running → stop it (`hung`). Exited → *judge* it.
-2. **Watch.** For every issue whose agent finished with a pull request: read the PR's checks on its **current head**. Red → hand back to an agent with the failing checks. Green but unmergeable → hand back to rebase. Green and mergeable → `ready`.
+2. **Watch.** For every issue whose agent finished with a pull request: read the PR's checks on its **current head**. Red → hand back to an agent with the failing checks. Green (or no checks yet) but conflicting with the base → if the merge drivers settle every conflicted file, nohalt merges the base into the PR branch itself and pushes (`refresh_conflicts`, INT-12). Otherwise it hands the PR back to rebase. Green and mergeable → `ready`.
 3. **Integrate.** `direct` or `train` merges `ready` PRs (see below). `none` does nothing: a human merges. Either way, an issue still open after its PR merged is closed by nohalt -- forges act on closing keywords only for the default branch.
 4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback does).
 5. **Budget.** Every few minutes, estimate paid-API spend and move issues over their cap to a fallback model.
@@ -68,7 +68,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
 
 **direct.** Takes the first `ready` issue in queue order, checks again that its PR is green on its current head and mergeable, merges it, then watches the pipeline on the base branch's new head (`cd_workflow`, else `ci_workflow`, else the required checks). Every check of the pipeline the merge triggered counts, except `base_ignore_checks` (forge-managed jobs that post on the base head afterwards, like Dependabot updates on GitHub, are not that pipeline) -- including checks `ignore_checks` skips on PRs, whose only gate is this one. Nothing else merges until that pipeline is green. A cancelled run is no verdict: it is re-run, and after `base_cancelled_limit` in a row merging is held (`BASE_NO_VERDICT`) for a human. If it is red, or times out, nohalt opens a fix-forward issue at the front of the queue, and merging resumes when that issue closes. A `deploy` command, if set, runs after a green pipeline (unless a CD workflow already deploys).
 
-**train.** With no release PR open, every `ready` issue's green PR (priority list first, then queue order, minus held issues and parked SHAs) is merged into `release/auto-<time>` off the base. Conflicts go to the merge drivers by glob (`[integrate.mergers]`). If any file stays in conflict, that PR is left out and handed back to rebase. The batch gets the next free version (from tags, or the version files), an optional regeneration command, and a PR closing every carried issue. On a later tick: green and mergeable → merge, tag, deploy, then the same pipeline gate as `direct` watches the base branch. Red → re-run the failed jobs once (more if the failure was the network). Still red → close the release, park the carried heads until their agents push, and hand each issue back.
+**train.** With no release PR open, every `ready` issue's green PR (priority list first, then queue order, minus held issues and parked SHAs) is merged into `release/auto-<time>` off the base. Conflicts go to the merge drivers by glob (`[integrate.mergers]`). If any file stays in conflict, that PR is left out. It is refreshed against the base if the drivers settle that (see `refresh_conflicts`), otherwise handed back to rebase. The batch gets the next free version (from tags, or the version files), an optional regeneration command, and a PR closing every carried issue. On a later tick: green and mergeable → merge, tag, deploy, then the same pipeline gate as `direct` watches the base branch. Red → re-run the failed jobs once (more if the failure was the network). Still red → close the release, park the carried heads until their agents push, and hand each issue back.
 
 ## State on disk
 
@@ -81,6 +81,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   probes.json limited.json model probe cache and usage-limit marks
   spend.json               budget high-water marks
   integrate.json train.json integrator state that spans ticks
+  refresh.json conflicts.json  conflicting PRs refreshed by nohalt (counted per issue); files left in conflict at hand-backs (for doctor)
   status.json              last tick's summary (for `nohalt status`)
   STOP PAUSE WAKE BATCH_PAUSE DEPLOY_BLOCKED BUDGET_EXHAUSTED   control flags
   priority hold            one issue per line (train ordering / exclusion)
@@ -90,6 +91,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   logs/                    nohalt.log, events.jsonl, issue-<n>.log, guard.log, refused.log, deploy.log
   work/<n>/                worktrees (unless [project] worktrees is set)
   work/_release/           the train's integration tree
+  work/_refresh/           scratch tree for merging the base into conflicting PR branches
 ```
 
 ## Extending

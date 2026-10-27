@@ -131,14 +131,15 @@ Spend is estimated from each opencode agent's own session database, keeping the 
 | `fix_forward` | `true` | a red pipeline opens an issue at the front of the queue and stops merging until it closes |
 | `cancel_superseded` | `false` | cancel queued or running CI for commits no open PR or the base points at |
 | `network_errors` | DNS/reset patterns | failed-log substrings that mark a red as the network's, not the code's |
-| `mergers` | `{}` | glob → driver, see [STACKS.md](STACKS.md#merge-drivers-any-stack) |
+| `mergers` | `{}` | glob → driver, see [STACKS.md](STACKS.md#merge-drivers-any-stack). Paths in `[integrate.train] version_files` that no glob covers get one implicitly: `package_json` for JSON, `version_lines` for anything else |
+| `refresh_conflicts` | `true` | `direct` and `train`: before handing a PR back for conflicting with the base, nohalt merges the base into the PR branch itself, in a scratch tree, when the merge drivers settle every conflicted file. It then runs `after_version` (if set), commits the merge (`merge: <base> into <branch> (nohalt refresh)`) and any regenerated files, and pushes, fast-forward only. Any file left in conflict, or a failed regenerate or push, means a hand-back as before. A branch whose agent is running is never touched. Refreshes don't count as `ci_rounds` |
 
 ```toml
 [integrate.train]
 branch_prefix = "release/"
 version_files = [{ path = "pkg/__init__.py", pattern = '__version__ = "([^"]+)"' }]   # group 1 is replaced
 tag_prefix = "v"
-after_version = "python scripts/regenerate_reference.py"   # run in the release tree after stamping
+after_version = "python scripts/regenerate_reference.py"   # run in the release tree after stamping, and after a refresh
 red_retries = 1
 batch_pause_file = "BATCH_PAUSE"   # touch <state>/BATCH_PAUSE to hold new batches (expires after 1 h)
 ```

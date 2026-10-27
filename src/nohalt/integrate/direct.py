@@ -16,6 +16,7 @@ from ..forge import ForgeError, verdict
 from ..forge.base import GREEN
 from ..state import READY
 from .common import PipelineGate, cancel_superseded, close_merged
+from .refresh import before_hand_back
 
 if TYPE_CHECKING:
     from ..supervisor import Supervisor
@@ -57,6 +58,8 @@ class Direct:
         if pr.mergeable is None or pr.draft:
             return  # the forge is still computing it (GitLab: unchecked, checking, ...): ask again next tick
         if pr.mergeable is False:
+            if before_hand_back(self.sup, rec, pr):
+                return  # bookkeeping only: refreshed, it goes through CI again (INT-12)
             self.sup.hand_back(
                 rec.issue,
                 f"{self.sup.pr(pr.number)} cannot merge",
