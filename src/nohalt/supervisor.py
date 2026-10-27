@@ -5,6 +5,8 @@ Each tick:
 1. **reap**   -- agents that exited, ran out of time, or hung are judged;
 2. **watch**  -- finished agents' pull requests are followed through CI; a red
                 or conflicting PR is handed back to an agent;
+   **review**  -- with ``[review]``, a green PR whose issue needs a review goes
+                to a reviewer agent first (review.py); only its approval makes it ready;
 3. **integrate** -- green PRs are merged by the integrator (never by agents);
 4. **launch** -- queued issues whose dependencies are closed get an agent, as
                 slots, memory and a model that answers allow;
@@ -43,7 +45,20 @@ from .config import Config
 from .forge import CLOSED, MISSING, UNKNOWN, Forge, ForgeError, Issue, PullRequest
 from .forge import verdict as ci_verdict
 from .models import Router
-from .state import ACTIVE, BLOCKED, DONE, QUEUED, READY, RUNNING, WAITING_CI, FileLock, IssueRecord, StateStore
+from .review import Reviews
+from .state import (
+    ACTIVE,
+    BLOCKED,
+    DONE,
+    IN_REVIEW,
+    QUEUED,
+    READY,
+    RUNNING,
+    WAITING_CI,
+    FileLock,
+    IssueRecord,
+    StateStore,
+)
 from .util import descendants, kill_tree, mem_available_mb, now, pid_alive, stamp, tail
 from .worktree import GitError, Worktrees
 
@@ -116,6 +131,7 @@ class Supervisor:
         from .integrate import make as make_integrator
 
         self.integrator = make_integrator(self)
+        self.reviews = Reviews(self)
 
     # -- forge vocabulary ----------------------------------------------------------------------
     def pr(self, n: int) -> str:
@@ -315,7 +331,7 @@ class Supervisor:
             self.say(f"=== could not re-execute the supervisor ({e}); exiting, `nohalt keepalive` starts a new one")
 
     def _has_waiting(self) -> bool:
-        return any(r.status in (WAITING_CI, READY, EXITED) for r in self.state.all())
+        return any(r.status in (WAITING_CI, IN_REVIEW, READY, EXITED) for r in self.state.all())
 
     def tick(self) -> TickReport:
         self._pulls, self._pulls_ok = None, False
@@ -325,8 +341,9 @@ class Supervisor:
             if rec.status in (RUNNING, EXITED):
                 self._reap(rec, report)
         for rec in self.state.all():
-            if rec.status in (WAITING_CI, READY):
+            if rec.status in (WAITING_CI, IN_REVIEW, READY):
                 self._watch(rec, report)
+        self._review()
         if self.cfg.integrate.mode != "none" and not self.dry_run:
             try:
                 self.integrator.tick()
@@ -338,6 +355,11 @@ class Supervisor:
         report.running = [r.issue for r in self.state.all() if r.status == RUNNING]
         self._snapshot(report)
         return report
+
+    def _review(self) -> None:
+        """The review gate (review.py): reviewers launched, reaped and judged; verdicts applied."""
+        if not self.dry_run and (self.cfg.review.enabled or any(r.review_pid for r in self.state.all())):
+            self.reviews.tick()
 
     # -- 1. reap --------------------------------------------------------------------------------
     def _alive(self, rec: IssueRecord) -> bool:
@@ -607,11 +629,8 @@ class Supervisor:
                 self.state.log(f"#{rec.issue}: could not mark {self.pr(pr.number)} ready yet ({e})")
                 return
             self.say(f"#{rec.issue}: {self.pr(pr.number)} was a draft; marked ready (green, agent finished)")
-        if v == forge_mod.base.GREEN and rec.status != READY:
-            rec.status = READY
-            rec.event(f"{self.pr(pr.number)} green on {pr.head_sha[:8]}")
-            self.state.put(rec)
-            self.say(f"#{rec.issue}: {self.pr(pr.number)} green -- ready to integrate")
+        if v == forge_mod.base.GREEN:
+            self.reviews.gate(rec, pr)  # ready, or in review when the issue needs one
 
     def _hand_back(self, rec: IssueRecord, pr: PullRequest, why: str, note: str) -> None:
         rec.swept.append(pr.head_sha)
@@ -754,6 +773,8 @@ class Supervisor:
             if r.status == RUNNING:
                 p = self._pool_of(r.model)
                 in_use[p] = in_use.get(p, 0) + 1
+        for p, n in self.reviews.in_use().items():
+            in_use[p] = in_use.get(p, 0) + n
 
         open_count = 0
         for entry in entries:
@@ -786,6 +807,8 @@ class Supervisor:
                     report.blocked.append(entry.issue)
                     continue
                 rec.attempts = rec.provider_retries = rec.ci_rounds = rec.timeouts = rec.revivals = rec.launch_failures = 0
+                rec.review_rounds = rec.review_failures = rec.review_retries = 0
+                rec.review_verdict = ""
                 rec.status, rec.resume, rec.not_before, rec.labelled = QUEUED, True, 0, False
                 rec.note = "A human removed the blocked label: try again."
                 rec.event("unblocked by a human")
@@ -914,28 +937,7 @@ class Supervisor:
             text = self.render_prompt(rec, issue, branch, tree)
         title = f"{self.cfg.agents.title_prefix} #{issue.number}"
         spec = agent.launch(mid, text, title=title, resume=resume, data_dir=data_dir)
-
-        env = dict(os.environ)
-        for k in spec.unset_env:
-            env.pop(k, None)
-        # The real binaries are resolved BEFORE the shim directory goes first
-        # on PATH, or a shim can find itself and loop forever.
-        env.update(
-            {
-                "NOHALT_REAL_GH": shims.real("gh", env.get("PATH")),
-                "NOHALT_REAL_GIT": shims.real("git", env.get("PATH")),
-                "NOHALT_REAL_GLAB": shims.real("glab", env.get("PATH")),
-                "NOHALT_GUARD_LOG": str(self.state.logs_dir / "guard.log"),
-                "NOHALT_SHARED_TARGETS": shims.shared_targets(self.cfg.repo_path, self.cfg.project.shared_paths),
-                "NOHALT_BASE_BRANCH": self.cfg.project.base_branch,
-                "NOHALT_ISSUE": str(issue.number),
-                "GIT_TERMINAL_PROMPT": "0",
-            }
-        )
-        if self.cfg.project.forge == "gitlab" and self.cfg.project.forge_url:
-            env.setdefault("GITLAB_HOST", self.cfg.project.forge_url)
-        env.update(spec.env)
-        env["PATH"] = f"{shims.install(self.state.bin_dir)}:{env.get('PATH', '')}"
+        env = self.agent_env(issue.number, spec)
 
         log = self.state.issue_log(issue.number)
         self._rotate(log)
@@ -971,6 +973,31 @@ class Supervisor:
             + (" -- resumed" if resume else "")
             + (f" -- {overflow}" if overflow else "")
         )
+
+    def agent_env(self, issue: int, spec: agents.Launch) -> dict[str, str]:
+        """The environment of an agent (or reviewer) on an issue: guard shims first on PATH."""
+        env = dict(os.environ)
+        for k in spec.unset_env:
+            env.pop(k, None)
+        # The real binaries are resolved BEFORE the shim directory goes first
+        # on PATH, or a shim can find itself and loop forever.
+        env.update(
+            {
+                "NOHALT_REAL_GH": shims.real("gh", env.get("PATH")),
+                "NOHALT_REAL_GIT": shims.real("git", env.get("PATH")),
+                "NOHALT_REAL_GLAB": shims.real("glab", env.get("PATH")),
+                "NOHALT_GUARD_LOG": str(self.state.logs_dir / "guard.log"),
+                "NOHALT_SHARED_TARGETS": shims.shared_targets(self.cfg.repo_path, self.cfg.project.shared_paths),
+                "NOHALT_BASE_BRANCH": self.cfg.project.base_branch,
+                "NOHALT_ISSUE": str(issue),
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+        if self.cfg.project.forge == "gitlab" and self.cfg.project.forge_url:
+            env.setdefault("GITLAB_HOST", self.cfg.project.forge_url)
+        env.update(spec.env)
+        env["PATH"] = f"{shims.install(self.state.bin_dir)}:{env.get('PATH', '')}"
+        return env
 
     def _rotate(self, log: Path) -> None:
         try:
@@ -1024,4 +1051,5 @@ class Supervisor:
             if rec.status == RUNNING and self._alive(rec):
                 self._kill(rec, "stopped", "stop requested")
                 stopped.append(rec.issue)
+        self.reviews.stop_all()  # reviewers resume (from scratch) on the next run
         return stopped

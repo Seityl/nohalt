@@ -22,11 +22,12 @@ from .util import now, read_json, stamp, write_json
 QUEUED = "queued"  # known, not yet launched (or waiting for a retry time)
 RUNNING = "running"  # an agent process is alive
 WAITING_CI = "waiting_ci"  # agent finished with a PR whose checks have not settled
-READY = "ready"  # PR green, waiting for the integrator
+IN_REVIEW = "in_review"  # PR green; a reviewer agent checks it against the issue before it is ready
+READY = "ready"  # PR green (and approved, when reviewed), waiting for the integrator
 DONE = "done"  # the forge says CLOSED
 BLOCKED = "blocked"  # needs a human; carries the blocked label
 
-ACTIVE = (RUNNING, WAITING_CI, READY)
+ACTIVE = (RUNNING, WAITING_CI, IN_REVIEW, READY)
 
 
 @dataclass
@@ -57,6 +58,19 @@ class IssueRecord:
     blocked_reason: str = ""
     labelled: bool = False  # the forge carries the blocked label we put there
     swept: list[str] = field(default_factory=list)  # PR head SHAs already handed back
+    # The review gate (review.py). A reviewer runs beside the record's own agent slot.
+    review_pid: int = 0
+    review_model: str = ""
+    review_started: float = 0.0
+    review_sha: str = ""  # the PR head the last (or running) review looked at
+    review_verdict: str = ""  # approve | changes | "" (none yet)
+    review_text: str = ""  # the last verdict's review, handed to the author on "changes"
+    review_approved: str = ""  # the head SHA an approval covers; any other head needs a new review
+    review_rounds: int = 0  # "changes" verdicts handed back
+    review_failures: int = 0  # reviews that ended without a verdict
+    review_retries: int = 0  # reviewer endpoint failures; never failures
+    review_not_before: float = 0.0
+    review_exit: str = ""  # why the supervisor stopped the reviewer (timeout, hung)
     history: list[str] = field(default_factory=list)
 
     def event(self, text: str) -> None:
