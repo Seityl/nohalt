@@ -4,6 +4,20 @@ One `nohalt.toml` per project. `nohalt init [--stack frappe]` writes a starter f
 
 **Unknown keys are errors.** A typo that silently falls back to a default is how a guard quietly stops guarding.
 
+## Changing it while nohalt runs
+
+Edit the file; there is nothing to restart. Between ticks (and within a second while it waits) the supervisor compares the file with the one it loaded:
+
+- **Valid and different:** it re-executes itself (`python -m nohalt --config <file> run`, same process id) and adopts its running agents from their records, as after any restart (LIV-01). The `=== nohalt supervising …` line in `logs/nohalt.log` shows the new settings.
+- **Invalid** (TOML error, unknown key, failed validation): it logs the error once, keeps running on the last good configuration, and writes `<state>/CONFIG_INVALID`, which `nohalt status` shows with the error until the file is fixed or reverted.
+- **Comments or formatting only:** nothing happens.
+
+Changes apply to what the supervisor does next, never to an agent already running: a new `models.default`, route or pool cap applies to the next launch, and an agent over a lowered cap finishes its run. `[project] state_dir` cannot change under a running supervisor (its agents are recorded in the old one): that edit is reported as invalid. `queue.txt` and `<state>/caps.json` are re-read every tick anyway.
+
+`nohalt restart` does the same on demand: it validates the file first (a broken config never replaces a running supervisor), asks the supervisor to re-execute after its current tick, and starts one, detached, if none is running -- no cron needed. Agents are never signalled. If the supervisor does not respond within `--timeout` (default 120 s), it is sent SIGTERM and a new one is started. `restart` clears `STOP`.
+
+`nohalt stop` is not a restart: it is a **drain**. Nothing new launches and the supervisor exits once no agent is running, which can take hours, and `keepalive` starts nothing while `STOP` exists. `nohalt resume` clears `STOP` and `PAUSE`.
+
 Durations accept `90`, `"90s"`, `"30m"`, `"4h"` or `"2d"`. Models are always written `<agent>:<model>`: `opencode:anthropic/claude-sonnet-4-5`, `claude-code:sonnet`, `command:anything`.
 
 ## [project]

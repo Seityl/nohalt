@@ -29,7 +29,7 @@ queue.txt ──► scheduler ──► agent in its own worktree ──► PR �
 - **A verification lock.** Agents edit in parallel but verify one at a time per test slot (`nohalt verify <worktree> -- '<cmd>'`), with the environment reset to the commit under test.
 - **Failures classified, not counted blindly.** A model-endpoint outage is not an attempt on the issue. A time limit continues in the same worktree. A hung agent (no output, no command running) is restarted. A red PR goes back to an agent with the failing checks. Only real failures spend attempts; then the issue is labelled for a human and the rest of the queue carries on.
 - **One merger.** Agents never merge. `direct` mode merges green PRs one at a time and stops everything if the pipeline on the base branch goes red; `train` mode batches green PRs into a versioned release branch, resolving bookkeeping conflicts (package.json, migration lists, schema JSON) mechanically and handing real code conflicts back.
-- **Survives itself.** Agents run in their own sessions. Kill or restart the supervisor and it adopts the running agents from their records. `nohalt keepalive` in cron brings it back.
+- **Survives itself.** Agents run in their own sessions. Kill or restart the supervisor and it adopts the running agents from their records. `nohalt keepalive` in cron brings it back. A changed `nohalt.toml` applies without a restart by hand.
 - **Model routing and a spend guard.** Route by label or title, pin per issue, gate premium models behind approval, fall over to a model that answers, and cap paid-API spend per issue and in total.
 - **Stacks.** A `generic` stack (your own `up`/`reset`/`env` hooks for the test environment) and a `frappe` stack (a pool of agent test sites on a shared bench, worktree-first `PYTHONPATH`, migrate before test, DocType/fixture/patch merge drivers).
 
@@ -52,7 +52,9 @@ Keep it running without a terminal:
 */3 * * * * cd /path/to/your-repo && nohalt keepalive
 ```
 
-Control while it runs: `nohalt stop` (between issues), `nohalt stop --now`, `nohalt pause`, `nohalt route <issue> <model>`, `nohalt unblock <issue>`, `nohalt queue --add 42 --after 41`, `nohalt prompt <issue>` (see exactly what an agent will be told).
+Control while it runs: `nohalt restart` (now, with the config on disk; agents keep running), `nohalt stop` (a drain: launch nothing more, exit once no agent runs), `nohalt stop --now`, `nohalt pause`, `nohalt resume` (undo `stop`/`pause`), `nohalt route <issue> <model>`, `nohalt unblock <issue>`, `nohalt queue --add 42 --after 41`, `nohalt prompt <issue>` (see exactly what an agent will be told).
+
+Edits to `nohalt.toml` apply on their own: the supervisor notices the change between ticks, re-executes itself and adopts its running agents. A file that does not parse or validate is reported in `nohalt status` (`CONFIG_INVALID`) and the last good configuration keeps running.
 
 ## Before you run it
 
