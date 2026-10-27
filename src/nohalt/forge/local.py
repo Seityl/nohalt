@@ -197,6 +197,10 @@ class LocalForge:
         with self._db() as d:
             d["pulls"][str(number)]["draft"] = False
 
+    def comment_pull(self, number: int, body: str) -> None:
+        with self._db() as d:
+            d.setdefault("pull_comments", []).append([number, body])
+
     def close_pull(self, number: int, comment: str = "") -> None:
         with self._db() as d:
             d["pulls"][str(number)]["state"] = "closed"

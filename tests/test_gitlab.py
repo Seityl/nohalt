@@ -97,6 +97,8 @@ class FakeGitLab(BaseHTTPRequestHandler):
             return self._send(200, {"id": 1, "default_branch": "main"})
         if tail == "/merge_requests/3/merge":
             return self._send(200, {"iid": 3, "state": "merged"})
+        if tail == "/merge_requests/3/notes" and method == "POST":
+            return self._send(201, {"id": 1})
         if tail == "/merge_requests/9/merge":
             return self._send(405, {"message": "405 Method Not Allowed"})
         if tail == "/pipelines":
@@ -187,6 +189,12 @@ def test_merge_and_labels(gitlab):
     assert gitlab.branch_sha("main") == "headsha"
 
 
+def test_review_comments_go_on_the_merge_request(gitlab):
+    gitlab.comment_pull(3, "**nohalt review: approve**")
+    method, path, body = FakeGitLab.calls[-1][:3]
+    assert method == "POST" and path.endswith("/merge_requests/3/notes") and "approve" in body["body"]
+
+
 def test_config_accepts_subgroups_and_validates_forge(tmp_path):
     cfg = config_mod.from_dict({"project": {"repo": "grp/sub/app", "forge": "gitlab"}}, root=tmp_path)
     assert cfg.project.forge == "gitlab"
@@ -214,10 +222,12 @@ def glab_bin(tmp_path: Path) -> Path:
     return d
 
 
-def glab(bin_dir: Path, tmp: Path, *argv: str, real: str = ""):
+def glab(bin_dir: Path, tmp: Path, *argv: str, real: str = "", readonly: bool = False):
     env = {**os.environ, "PATH": f"{bin_dir}:{tmp / 'real'}:{os.environ['PATH']}", "NOHALT_GUARD_LOG": str(tmp / "guard.log")}
     if real:
         env["NOHALT_REAL_GLAB"] = real
+    if readonly:
+        env["NOHALT_READONLY"] = "1"
     return subprocess.run(["glab", *argv], env=env, capture_output=True, text=True, timeout=20)
 
 
@@ -245,6 +255,26 @@ def test_glab_refuses_accepting_or_declaring_work(glab_bin, tmp_path, argv):
 )
 def test_glab_passes_the_agents_own_work_through(glab_bin, tmp_path, argv):
     cp = glab(glab_bin, tmp_path, *argv)
+    assert cp.returncode == 0 and cp.stdout.startswith("REAL-GLAB")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["mr", "note", "3", "-m", "x"],
+        ["mr", "create", "--fill"],
+        ["issue", "note", "1", "-m", "x"],
+        ["api", "projects/1/issues/1/notes", "-f", "body=x"],
+    ],
+)
+def test_a_reviewer_glab_only_reads(glab_bin, tmp_path, argv):
+    cp = glab(glab_bin, tmp_path, *argv, readonly=True)
+    assert cp.returncode == 1 and "reviewing" in cp.stderr
+
+
+@pytest.mark.parametrize("argv", [["mr", "view", "3", "--comments"], ["mr", "diff", "3"], ["api", "projects/1/issues/1"]])
+def test_a_reviewer_glab_reads_pass_through(glab_bin, tmp_path, argv):
+    cp = glab(glab_bin, tmp_path, *argv, readonly=True)
     assert cp.returncode == 0 and cp.stdout.startswith("REAL-GLAB")
 
 

@@ -109,6 +109,52 @@ def test_bare_push_on_base_is_refused(bin_dir, tmp_path, repo):
     assert cp.returncode == 1
 
 
+RO = {"NOHALT_READONLY": "1"}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gh", "pr", "comment", "5", "--body", "x"],
+        ["gh", "pr", "review", "5", "--approve"],
+        ["gh", "pr", "edit", "5", "--body", "x"],
+        ["gh", "pr", "create", "--fill"],
+        ["gh", "issue", "comment", "7", "--body", "x"],
+        ["gh", "api", "repos/o/r/issues/7/comments", "-f", "body=x"],
+        ["gh", "api", "repos/o/r/pulls/5", "-X", "PATCH"],
+        ["gh", "api", "graphql", "-F", "query=mutation{}"],
+        ["gh", "label", "create", "x"],
+    ],
+)
+def test_a_reviewer_gh_only_reads(bin_dir, tmp_path, argv):
+    cp = run(bin_dir, tmp_path, *argv, extra=RO)
+    assert cp.returncode == 1 and "reviewing" in cp.stderr
+    assert "read-only reviewer" in (tmp_path / "guard.log").read_text()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gh", "pr", "view", "5", "--comments"],
+        ["gh", "pr", "diff", "5"],
+        ["gh", "issue", "view", "7"],
+        ["gh", "api", "repos/o/r/issues/7/comments", "--jq", ".[]"],
+        ["gh", "api", "-X", "GET", "repos/o/r/pulls/5"],
+    ],
+)
+def test_a_reviewer_gh_reads_pass_through(bin_dir, tmp_path, argv):
+    cp = run(bin_dir, tmp_path, *argv, extra=RO)
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout.startswith("REAL-GH")
+
+
+def test_a_reviewer_git_cannot_push_anything(bin_dir, tmp_path, repo):
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "feature/1-x"], check=True)
+    cp = run(bin_dir, tmp_path, "git", "push", "-q", "origin", "feature/1-x", cwd=repo, extra=RO)
+    assert cp.returncode == 1 and "reviewing" in cp.stderr
+    assert run(bin_dir, tmp_path, "git", "log", "-1", cwd=repo, extra=RO).returncode == 0
+
+
 def test_pkill_only_touches_the_callers_worktree(bin_dir, tmp_path):
     """SAF-04: a broad pkill once killed CI builds on four runners."""
     if not shutil.which("pgrep"):
