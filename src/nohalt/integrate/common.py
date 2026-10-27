@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from .. import queue
 from ..forge import CLOSED, OPEN, Check, ForgeError, verdict
 from ..forge.base import GREEN, PENDING, RED
+from ..state import READY
 from ..util import now
 
 if TYPE_CHECKING:
@@ -127,7 +128,8 @@ class PipelineGate:
     restarts. A red or timed-out pipeline opens a fix-forward issue at the
     front of the queue, and merging resumes when that issue closes. A pipeline
     that keeps being cancelled has no verdict: by default it is filed and the
-    line keeps moving (``base_no_verdict``). A failed
+    line keeps moving (``base_no_verdict``). With ``red_base = "with_fix"`` (train
+    mode) the batch after a red carries the fix and every green PR. A failed
     deploy (``DEPLOY_BLOCKED``) also stops merging until a human clears it.
     """
 
@@ -168,9 +170,15 @@ class PipelineGate:
         st = self._st()
         if st.get("fix_issue"):
             if self.sup.issue(st["fix_issue"], fresh=True).state != CLOSED:
+                fix = int(st["fix_issue"])
+                if self.cfg.integrate.red_base == "with_fix" and self.cfg.integrate.mode == "train":
+                    # The fix rides with every other green PR, once it is ready
+                    # itself (INT-14): a batch without it would only go red again.
+                    rec = self.sup.state.get(fix)
+                    return rec.status == READY and bool(rec.pr)
                 # Nothing merges on a red pipeline -- except the fix for it, or the
                 # fix-forward issue could never close.
-                self.only = int(st["fix_issue"])
+                self.only = fix
                 return True
             self.sup.say(f"pipeline fix #{st['fix_issue']} closed; merging resumes")
             st.pop("fix_issue")
