@@ -134,7 +134,8 @@ class IntegrateCfg:
     required_checks: list[str] = field(default_factory=list)  # empty: every check run must pass
     ignore_checks: list[str] = field(default_factory=list)  # PRs only: never count, e.g. a suite cancelled on PRs by policy
     base_ignore_checks: list[str] = field(default_factory=list)  # base branch after a merge: checks that never count there
-    base_cancelled_limit: int = 3  # cancelled base runs in a row before merging is held for a human
+    base_cancelled_limit: int = 3  # cancelled base runs in a row before the base is given up on as "no verdict"
+    base_no_verdict: str = "continue"  # then: "continue" (file an issue, keep merging) or "hold" (stop for a human)
     merge_method: str = "squash"
     cd_workflow: str = ""
     ci_workflow: str = ""
@@ -293,6 +294,8 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"[project] repo must be group[/subgroup]/name, got {repo!r}")
     if cfg.integrate.mode not in ("none", "direct", "train"):
         raise ConfigError(f"[integrate] mode must be none, direct or train, got {cfg.integrate.mode!r}")
+    if cfg.integrate.base_no_verdict not in ("continue", "hold"):
+        raise ConfigError(f"[integrate] base_no_verdict must be continue or hold, got {cfg.integrate.base_no_verdict!r}")
     if cfg.integrate.merge_method not in ("merge", "squash", "rebase"):
         raise ConfigError("[integrate] merge_method must be merge, squash or rebase")
     if cfg.agents.max_parallel < 1:
