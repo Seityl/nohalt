@@ -226,10 +226,12 @@ class GitLab:
         self._request("PUT", self._p(f"merge_requests/{number}"), {"state_event": "close"})
 
     # -- pipelines and jobs ----------------------------------------------------------------------
-    def _pipelines(self, sha: str = "", status: str = "") -> list[dict[str, Any]]:
+    def _pipelines(self, sha: str = "", status: str = "", ref: str = "") -> list[dict[str, Any]]:
         q = ["order_by=id", "sort=desc"]
         if sha:
             q.append(f"sha={sha}")
+        if ref:
+            q.append(f"ref={urllib.parse.quote(ref, safe='')}")
         if status:
             q.append(f"status={status}")
         return list(self._get(self._p("pipelines?" + "&".join(q) + "&per_page=100")) or [])
@@ -263,11 +265,11 @@ class GitLab:
             p.get("web_url") or "",
         )
 
-    def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "") -> list[Run]:
+    def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "", branch: str = "") -> list[Run]:
         statuses = {"queued": ["pending", "created"], "in_progress": ["running"]}.get(status, [""])
         out: list[Run] = []
         for st in statuses:
-            for p in self._pipelines(sha=head_sha, status=st):
+            for p in self._pipelines(sha=head_sha, status=st, ref=branch):
                 r = self._run(p)
                 if workflow and workflow not in ("pipeline", r.name):
                     continue

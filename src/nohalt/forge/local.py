@@ -215,7 +215,7 @@ class LocalForge:
         with self._db() as d:
             return set(d.get("managed_suites", {}).get(sha, []))
 
-    def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "") -> list[Run]:
+    def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "", branch: str = "") -> list[Run]:
         with self._db() as d:
             rows = [Run(**r) for r in d["runs"]]
         return [
@@ -224,6 +224,7 @@ class LocalForge:
             if (not head_sha or r.head_sha == head_sha)
             and (not workflow or r.name == workflow)
             and (not status or r.status == status)
+            and (not branch or r.branch == branch)
         ]
 
     def rerun_failed(self, run_id: int) -> None:
@@ -237,6 +238,10 @@ class LocalForge:
     def failed_log(self, run_id: int) -> str:
         with self._db() as d:
             return d.get("logs", {}).get(str(run_id), "")
+
+    def set_log(self, run_id: int, text: str) -> None:
+        with self._db() as d:
+            d.setdefault("logs", {})[str(run_id)] = text
 
     def commit_time(self, sha: str) -> float | None:
         with self._db() as d:

@@ -102,7 +102,7 @@ class FakeGitLab(BaseHTTPRequestHandler):
         if tail == "/merge_requests/9/merge":
             return self._send(405, {"message": "405 Method Not Allowed"})
         if tail == "/pipelines":
-            if q.get("sha") == ["none"]:
+            if q.get("sha") == ["none"] or q.get("ref", ["main"]) != ["main"]:
                 return self._send(200, [])
             return self._send(200, [{"id": 7, "sha": "abc", "status": "failed", "ref": "main", "name": "CI"}])
         if tail == "/pipelines/7/jobs":
@@ -175,6 +175,11 @@ def test_pipelines_are_runs(gitlab):
     runs = gitlab.runs(head_sha="abc", workflow="pipeline")
     assert runs and runs[0].conclusion == "failure" and runs[0].name == "CI"
     assert gitlab.runs(head_sha="abc", workflow="CD") == []
+
+
+def test_runs_on_a_branch_ask_for_its_ref(gitlab):
+    assert [r.id for r in gitlab.runs(branch="main", workflow="CI")] == [7]
+    assert gitlab.runs(branch="release/v16", workflow="CI") == []
 
 
 def test_merge_and_labels(gitlab):
