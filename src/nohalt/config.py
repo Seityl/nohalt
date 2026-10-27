@@ -7,6 +7,7 @@ that silently falls back to a default is how a guard quietly stops guarding.
 
 from __future__ import annotations
 
+import hashlib
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -188,6 +189,7 @@ class Config:
     stack: StackCfg = field(default_factory=StackCfg)
     prompt: PromptCfg = field(default_factory=PromptCfg)
     source: Path | None = None
+    source_hash: str = ""  # of the file as loaded: the supervisor reloads when it changes
 
     # -- resolved paths --------------------------------------------------------
     @property
@@ -329,9 +331,24 @@ def load(path: Path | str | None = None) -> Config:
             raise ConfigError(f"no {CONFIG_NAME} here or in any parent directory (run `nohalt init`)")
     path = Path(path).expanduser().resolve()
     try:
-        data = tomllib.loads(path.read_text())
+        raw = path.read_bytes()
+        data = tomllib.loads(raw.decode())
     except OSError as e:
         raise ConfigError(f"cannot read {path}: {e}") from None
-    except tomllib.TOMLDecodeError as e:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
         raise ConfigError(f"{path}: {e}") from None
-    return from_dict(data, root=path.parent, source=path)
+    cfg = from_dict(data, root=path.parent, source=path)
+    cfg.source_hash = digest(raw)
+    return cfg
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def fingerprint(path: Path) -> str:
+    """The hash of the file as it is now ("" if it cannot be read)."""
+    try:
+        return digest(path.read_bytes())
+    except OSError:
+        return ""
