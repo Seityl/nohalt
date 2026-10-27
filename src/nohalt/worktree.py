@@ -9,6 +9,7 @@ behind is preserved, not cleaned: uncommitted changes are committed to a
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from .config import Config
@@ -79,12 +80,45 @@ class Worktrees:
             # `git push` would aim at the base branch and be refused (or worse).
             git(tree, "branch", "--unset-upstream", check=False)
         git(tree, "config", "push.default", "current", check=False)
+        self._link_shared(tree)
+        return tree
+
+    def _link_shared(self, tree: Path) -> None:
         for rel in self.cfg.project.shared_paths:
             src, dst = self.repo / rel, tree / rel
             if src.exists() and not dst.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.symlink_to(src)
+
+    # -- review trees: a detached checkout of a PR head, for a reviewer that must not push ---------
+    def review_path(self, issue: int) -> Path:
+        return self.root / "_review" / str(issue)
+
+    def prepare_review(self, issue: int, sha: str, branch: str = "") -> Path:
+        """A fresh, detached tree at ``sha``. Nothing in it is ever kept: it is cut again for every review."""
+        tree = self.review_path(issue)
+        git(self.repo, "fetch", "-q", self.remote, check=False)
+        if not self._has_commit(sha):
+            if branch:
+                git(self.repo, "fetch", "-q", self.remote, branch, check=False)
+            if not self._has_commit(sha):
+                raise GitError(f"the PR head {sha[:12]} is not in the clone after fetching")
+        self.remove_review(issue)
+        tree.parent.mkdir(parents=True, exist_ok=True)
+        git(self.repo, "worktree", "add", "-q", "--detach", str(tree), sha)
+        self._link_shared(tree)
         return tree
+
+    def remove_review(self, issue: int) -> None:
+        tree = self.review_path(issue)
+        if tree.exists():
+            git(self.repo, "worktree", "remove", "--force", str(tree), check=False)
+            if tree.exists():
+                shutil.rmtree(tree, ignore_errors=True)
+            git(self.repo, "worktree", "prune", check=False)
+
+    def _has_commit(self, sha: str) -> bool:
+        return run(["git", "-C", str(self.repo), "cat-file", "-e", f"{sha}^{{commit}}"]).returncode == 0
 
     def _has_ref(self, ref: str) -> bool:
         return run(["git", "-C", str(self.repo), "show-ref", "--verify", "--quiet", ref]).returncode == 0

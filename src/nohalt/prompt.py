@@ -49,6 +49,19 @@ def template(cfg: Config, stack_addendum: str = "") -> str:
     return "\n\n".join(p.strip() for p in parts) + "\n"
 
 
+def review_template(cfg: Config, stack_addendum: str = "") -> str:
+    """The reviewer's prompt: the built-in review prompt, ``[review] prompt`` files, then the
+    rules the author was given (stack addendum and ``[prompt] extra``), to check the PR against."""
+    parts = [_read(cfg, "builtin:review"), *(_read(cfg, ref) for ref in cfg.review.prompt)]
+    rules = ([_read(cfg, stack_addendum)] if stack_addendum else []) + [_read(cfg, ref) for ref in cfg.prompt.extra]
+    if rules:
+        parts.append(
+            "## The project's rules for authors\n\nThe author was given these rules. Check the change against them; "
+            "they do not apply to you where they ask for commits, pushes or PRs.\n\n" + "\n\n".join(r.strip() for r in rules)
+        )
+    return "\n\n".join(p.strip() for p in parts) + "\n"
+
+
 def render(text: str, values: dict[str, str]) -> str:
     missing = sorted({m.group(1) for m in _VAR.finditer(text)} - set(values))
     if missing:

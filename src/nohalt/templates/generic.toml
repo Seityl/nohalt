@@ -69,3 +69,9 @@ name = "generic"
 [prompt]
 template = "builtin:core"
 extra = []                   # your project's own prompt files, appended in order
+
+[review]
+enabled = false              # green is not enough: a second agent checks selected PRs against their issue
+labels = []                  # issues with any of these labels need review (or `all = true`, or `title = "regex"`)
+# model = "opencode:local/coder"   # the reviewer; may differ from the author's model
+max_rounds = 2               # "changes" verdicts handed back before the issue goes to a human

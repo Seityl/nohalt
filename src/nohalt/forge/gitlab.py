@@ -217,6 +217,9 @@ class GitLab:
         clean = _DRAFT_PREFIX.sub("", title, count=1).strip() or title
         self._request("PUT", self._p(f"merge_requests/{number}"), {"title": clean})
 
+    def comment_pull(self, number: int, body: str) -> None:
+        self._request("POST", self._p(f"merge_requests/{number}/notes"), {"body": body})
+
     def close_pull(self, number: int, comment: str = "") -> None:
         if comment:
             self._request("POST", self._p(f"merge_requests/{number}/notes"), {"body": comment})

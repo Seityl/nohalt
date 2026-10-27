@@ -173,6 +173,14 @@ class GitHub:
         if cp.returncode != 0:
             raise ForgeError(f"mark ready #{number}: {(cp.stderr or cp.stdout).strip()[:300]}")
 
+    def comment_pull(self, number: int, body: str) -> None:
+        self.comment(number, body)  # a pull request is an issue to the comments API
+
+    def review_pull(self, number: int, body: str, approve: bool) -> None:
+        """A formal review. GitHub refuses one on a PR the token's own account opened: callers fall back to a comment."""
+        event = "APPROVE" if approve else "REQUEST_CHANGES"
+        self._api(self._r(f"pulls/{number}/reviews"), method="POST", fields={"body": body, "event": event})
+
     def close_pull(self, number: int, comment: str = "") -> None:
         if comment:
             self.comment(number, comment)

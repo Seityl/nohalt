@@ -8,6 +8,7 @@ that silently falls back to a default is how a guard quietly stops guarding.
 from __future__ import annotations
 
 import hashlib
+import re
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -181,6 +182,20 @@ class PromptCfg:
 
 
 @dataclass
+class ReviewCfg:
+    enabled: bool = False
+    all: bool = False  # every issue needs review
+    labels: list[str] = field(default_factory=list)  # issues carrying any of these need review
+    title: str = ""  # regex on the title: matching issues need review
+    model: str = ""  # the reviewer, <agent>:<model>; default: [models] default
+    fallbacks: list[str] = field(default_factory=list)  # tried in order when the reviewer model does not answer
+    max_rounds: int = 2  # "changes" verdicts handed back before the issue goes to a human
+    attempts: int = 3  # reviews that ended without a verdict (timeout, hang, no verdict) before a human is asked
+    timeout: int = 3600
+    prompt: list[str] = field(default_factory=list)  # extra prompt files for the reviewer
+
+
+@dataclass
 class Config:
     root: Path
     project: ProjectCfg = field(default_factory=ProjectCfg)
@@ -192,6 +207,7 @@ class Config:
     integrate: IntegrateCfg = field(default_factory=IntegrateCfg)
     stack: StackCfg = field(default_factory=StackCfg)
     prompt: PromptCfg = field(default_factory=PromptCfg)
+    review: ReviewCfg = field(default_factory=ReviewCfg)
     source: Path | None = None
     source_hash: str = ""  # of the file as loaded: the supervisor reloads when it changes
 
@@ -230,6 +246,7 @@ _DURATIONS = {
     "cd_timeout",
     "base_pipeline_grace",
     "overflow_after",
+    "timeout",
 }
 _OFF_WHEN_EMPTY = {"overflow_after"}
 
@@ -262,6 +279,7 @@ def from_dict(data: dict[str, Any], root: Path, source: Path | None = None) -> C
         "agents": AgentsCfg,
         "budget": BudgetCfg,
         "prompt": PromptCfg,
+        "review": ReviewCfg,
     }
     cfg = Config(root=root, source=source)
     for name, cls in sections.items():
@@ -317,8 +335,18 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[agents] max_parallel must be at least 1")
     if cfg.agents.max_attempts < 1:
         raise ConfigError("[agents] max_attempts must be at least 1")
+    if cfg.review.max_rounds < 0 or cfg.review.attempts < 1:
+        raise ConfigError("[review] max_rounds must be at least 0 and attempts at least 1")
+    if isinstance(cfg.review.prompt, str):
+        cfg.review.prompt = [cfg.review.prompt]
+    if cfg.review.title:
+        try:
+            re.compile(cfg.review.title)
+        except re.error as e:
+            raise ConfigError(f"[review] title: not a regular expression: {e}") from None
+    reviewers = [cfg.review.model, *cfg.review.fallbacks] if cfg.review.model else cfg.review.fallbacks
     models = cfg.models
-    for model in [models.default, *models.fallbacks, *models.overflow_to, *(r.model for r in models.route)]:
+    for model in [models.default, *models.fallbacks, *models.overflow_to, *(r.model for r in models.route), *reviewers]:
         if ":" not in model:
             raise ConfigError(f"model {model!r} must name its agent, e.g. 'opencode:provider/model'")
     for pool, n in models.overflow_reserve.items():

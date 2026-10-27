@@ -90,6 +90,7 @@ class World:
         end = time.time() + timeout
         while time.time() < end:
             running = [r for r in self.sup.state.all() if r.status == RUNNING and self.sup._alive(r)]
+            running += [r for r in self.sup.state.all() if r.review_pid and self.sup.reviews._alive(r)]
             if not running:
                 return
             time.sleep(0.1)
@@ -101,12 +102,19 @@ class World:
             self.sup.tick()
             self.wait_agents()
             for r in self.sup.state.all():  # skip backoffs in tests
-                if r.not_before:
-                    r.not_before = 0
+                if r.not_before or r.review_not_before:
+                    r.not_before = r.review_not_before = 0
                     self.sup.state.put(r)
 
     def rec(self, n: int):  # type: ignore[no-untyped-def]
         return self.sup.state.get(n)
+
+    def review(self, n: int, *script: str) -> None:
+        (self.scripts / f"{n}.review.txt").write_text("\n".join(script) + "\n")
+
+    def review_prompts(self, n: int) -> list[str]:
+        p = self.scripts / f"{n}.review-prompts"
+        return [x for x in p.read_text().split("\n=====\n") if x.strip()] if p.exists() else []
 
     def prompts(self, n: int) -> list[str]:
         p = self.scripts / f"{n}.prompts"

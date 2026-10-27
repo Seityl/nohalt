@@ -19,7 +19,7 @@ from . import __version__
 from . import config as config_mod
 from . import queue as queue_mod
 from .config import Config, ConfigError
-from .state import BLOCKED, QUEUED, RUNNING, FileLock, StateStore
+from .state import BLOCKED, IN_REVIEW, QUEUED, RUNNING, FileLock, StateStore
 from .util import now, pid_alive, stamp, tail
 
 if TYPE_CHECKING:
@@ -288,12 +288,31 @@ def render_status(cfg: Config) -> str:
         tries = f"{r.attempts}/{cfg.agents.max_attempts}"
         overflowed = r.overflow and r.status not in (QUEUED, BLOCKED)  # the mark is for the launch that overflowed
         model = (r.model[:31] + " ^") if overflowed else r.model[:33]
+        if r.status == IN_REVIEW:
+            model = (r.review_model or "(reviewer)")[:33]
+            rlog = state.logs_dir / f"review-{r.issue}.log"
+            if r.review_pid and rlog.exists():
+                idle = f"{int(now() - rlog.stat().st_mtime)}s"
+                last = f"reviewing {r.review_sha[:8]}"
+            else:
+                last = "review waiting for a reviewer slot or model"
+            tries = f"{r.review_rounds}/{cfg.review.max_rounds}"
         lines.append(f"#{r.issue:<7}{r.status:<12}{model:<34}{idle:>7}  {tries:<6}{last}")
     overflows = [r for r in recs if r.overflow and r.status not in (QUEUED, BLOCKED)]
     if overflows:
         lines.append("")
         lines.append("^ overflowed (not pinned; the next launch is routed as usual):")
         lines.extend(f"  #{r.issue}: {r.overflow}" for r in overflows)
+    reviewed = [r for r in recs if r.review_verdict]
+    if reviewed:
+        lines.append("")
+        lines.append(
+            "reviews: "
+            + "  ".join(
+                f"#{r.issue} {r.review_verdict} on {r.review_sha[:8]} (round {r.review_rounds}/{cfg.review.max_rounds})"
+                for r in reviewed[:15]
+            )
+        )
     snap = state.load("status.json", {})
     if snap:
         lines.append("")

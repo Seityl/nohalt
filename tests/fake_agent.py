@@ -10,6 +10,7 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     pr-pending       same, with checks still running
     pr-conflict      same, with no checks at all and a merge conflict
     pr-draft         same as pr-green, opened as a draft
+    push-green       commit and push to the branch; its open PR moves to the new head, green
     setup-fail       die the way an agent dies when its CLI is not logged in
     busy <seconds>   run a quiet shell command that long (a test run, not a hang)
     provider-error   die the way an agent dies when the model server is down
@@ -19,6 +20,17 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     dirty            leave an uncommitted file in the worktree
 
 The prompt it was given is appended to ``<script-dir>/<issue>.prompts``.
+
+Launched as a reviewer (``NOHALT_ROLE=review``) it reads ``<issue>.review.txt``
+and appends its prompts to ``<issue>.review-prompts``:
+
+    approve            write an approving review to $NOHALT_REVIEW_FILE
+    changes <text>     write a review asking for <text>
+    stdout-approve     print an approving review, write no file
+    noverdict          end without a verdict
+    push               try to push a commit (exit code to <issue>.review-push-rc), then approve
+    sleep-approve <s>  run that long, then approve
+    provider-error     die the way an agent dies when the model server is down
 """
 
 from __future__ import annotations
@@ -60,11 +72,62 @@ def open_pr(forge: LocalForge, issue: int, checks: str, base: str = "main") -> N
         forge.set_checks(sha, [("ci", "in_progress", "")])
 
 
+def push_green(forge: LocalForge, issue: int) -> None:
+    Path(f"work-{issue}.txt").write_text(f"more work for {issue} at {time.time()}\n")
+    git("add", "-A")
+    git("-c", "user.name=agent", "-c", "user.email=agent@example.com", "commit", "-q", "-m", f"more work for #{issue}")
+    branch = git("branch", "--show-current")
+    git("push", "-q", "origin", branch)
+    sha = git("rev-parse", "HEAD")
+    with forge._db() as d:
+        d["branches"][branch] = sha
+        for p in d["pulls"].values():
+            if p["head_ref"] == branch and p["state"] == "open":
+                p["head_sha"] = sha
+    forge.set_checks(sha, [("ci", "completed", "success")])
+
+
+def review(script_dir: Path, prompt: str, issue: int) -> int:
+    with open(script_dir / f"{issue}.review-prompts", "a") as f:
+        f.write(prompt + "\n=====\n")
+    script = script_dir / f"{issue}.review.txt"
+    lines = script.read_text().splitlines() if script.exists() else []
+    action = lines[0].strip() if lines else "noverdict"
+    script.write_text("\n".join(lines[1:]) + ("\n" if lines[1:] else ""))
+    print(f"fake reviewer on #{issue}: {action}", flush=True)
+    out = Path(os.environ["NOHALT_REVIEW_FILE"])
+    approve = f"1. Criterion met: work file added (work-{issue}.txt).\n\nNOHALT-REVIEW: approve\n"
+    if action == "push":
+        Path("reviewer.txt").write_text("not mine to push\n")
+        subprocess.run(["git", "add", "-A"], check=False)
+        subprocess.run(["git", "-c", "user.name=r", "-c", "user.email=r@example.com", "commit", "-q", "-m", "x"], check=False)
+        rc = subprocess.run(["git", "push", "-q", "origin", "HEAD:refs/heads/reviewer-was-here"], check=False).returncode
+        (script_dir / f"{issue}.review-push-rc").write_text(str(rc))
+        action = "approve"
+    if action.startswith("sleep-approve"):
+        time.sleep(float(action.split()[1]))
+        action = "approve"
+    if action == "approve":
+        out.write_text(approve)
+    elif action.startswith("changes"):
+        out.write_text(f"Missing an acceptance item.\n\nNOHALT-REVIEW: changes\n1. {action[8:]}\n")
+    elif action == "stdout-approve":
+        print(approve, flush=True)
+    elif action == "provider-error":
+        print("Error: Bad Gateway", flush=True)
+        return 1
+    else:
+        print("I looked around and have no opinion.", flush=True)
+    return 0
+
+
 def main() -> int:
     forge = LocalForge(sys.argv[1])
     script_dir = Path(sys.argv[2])
     prompt = sys.argv[3] if len(sys.argv) > 3 else ""
     issue = int(os.environ["NOHALT_ISSUE"])
+    if os.environ.get("NOHALT_ROLE") == "review":
+        return review(script_dir, prompt, issue)
     with open(script_dir / f"{issue}.prompts", "a") as f:
         f.write(prompt + "\n=====\n")
     script = script_dir / f"{issue}.txt"
@@ -76,6 +139,8 @@ def main() -> int:
         forge.set_state(issue, "CLOSED")
     elif action.startswith("pr-"):
         open_pr(forge, issue, action[3:], base=os.environ.get("NOHALT_BASE_BRANCH", "main"))
+    elif action == "push-green":
+        push_green(forge, issue)
     elif action.startswith("busy"):
         secs = action.split()[1]
         subprocess.run(["bash", "-c", f"{sys.executable} -c 'import time; time.sleep({secs})'"], check=False)

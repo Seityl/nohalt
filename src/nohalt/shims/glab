@@ -46,6 +46,36 @@ WHY
   exit 1
 }
 
+# A reviewer (NOHALT_READONLY) reads and nothing else: nohalt posts its review.
+readonly_refuse() {
+  note "REFUSED" "glab $* (read-only reviewer)"
+  printf '\nglab (nohalt guard): refused -- you are reviewing, so you only read. nohalt posts your review;\nput everything you would have written in it.\n\n' >&2
+  exit 1
+}
+if [[ -n "${NOHALT_READONLY:-}" ]]; then
+  case "${1:-}" in
+    mr) case "${2:-}" in view | diff | list) ;; *) readonly_refuse "$@" ;; esac ;;
+    issue) case "${2:-}" in view | list) ;; *) readonly_refuse "$@" ;; esac ;;
+    ci | pipeline) case "${2:-}" in view | list | status | get | trace) ;; *) readonly_refuse "$@" ;; esac ;;
+    repo) case "${2:-}" in view) ;; *) readonly_refuse "$@" ;; esac ;;
+    help | version | --version | --help | "") ;;
+    auth) case "${2:-}" in status) ;; *) readonly_refuse "$@" ;; esac ;;
+    api)
+      for ((i = 2; i <= $#; i++)); do
+        a="${!i}"
+        case "$a" in
+          -f | -F | --field | --raw-field | --input | -f* | -F* | --field=* | --raw-field=* | --input=*) readonly_refuse "$@" ;;
+          -X | --method) j=$((i + 1)); [[ "${!j:-}" =~ ^(GET|get)$ ]] || readonly_refuse "$@" ;;
+          -X*) [[ "${a#-X}" =~ ^(GET|get)$ ]] || readonly_refuse "$@" ;;
+          --method=*) [[ "${a#--method=}" =~ ^(GET|get)$ ]] || readonly_refuse "$@" ;;
+          graphql) [[ "$i" == 2 ]] && readonly_refuse "$@" ;;
+        esac
+      done
+      ;;
+    *) readonly_refuse "$@" ;;
+  esac
+fi
+
 case "${1:-}" in
   mr)
     case "${2:-}" in merge | close | approve | delete) refuse "$@" ;; esac ;;

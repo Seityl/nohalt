@@ -178,6 +178,46 @@ batch_pause_file = "BATCH_PAUSE"   # touch <state>/BATCH_PAUSE to hold new batch
 
 Placeholders available: `{{ISSUE}} {{TITLE}} {{REPO}} {{BRANCH}} {{WORKTREE}} {{BASE}} {{VERIFY}}`, `{{SITE}}` when `verify.placeholder` is set, plus `vars`. An undefined placeholder is an error, not an empty string. Run `nohalt prompt <issue>` to see exactly what an agent will be told.
 
+## [review]
+
+Green CI says the tests pass, not that the issue is done. With `[review]` enabled, a selected issue whose PR is green goes to **`in_review`** instead of `ready`: a reviewer agent checks the PR against the issue in a detached checkout of the PR head, and only its approval makes the issue `ready` for the integrator.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | |
+| `all` | `false` | every issue needs review |
+| `labels` | `[]` | issues carrying any of these labels need review |
+| `title` | `""` | a regex on the title (case-insensitive): matching issues need review |
+| `model` | `[models] default` | the reviewer, `<agent>:<model>`. It may differ from the author's: a local model reviewing Claude's work, or Claude reviewing a local model's. A reviewer takes a slot in its model's pool (`[agents] pools`, else `max_parallel`) like any agent |
+| `fallbacks` | `[]` | reviewer models tried in order when `model` has no free slot or does not answer a probe |
+| `max_rounds` | `2` | "changes" verdicts handed back to the author. One more, and the issue is blocked: "review: changes still requested after N round(s)" |
+| `attempts` | `3` | reviews that ended without a verdict (time limit, hang, no verdict line) before the issue goes to a human. Never an approval |
+| `timeout` | `"1h"` | a reviewer running longer is stopped (and that review counts against `attempts`) |
+| `prompt` | `[]` | your own reviewer prompt files, appended to the built-in one (`src/nohalt/prompts/review.md`) |
+
+```toml
+[review]
+enabled = true
+labels = ["feature", "security"]
+title = "^(feat|epic)"
+model = "opencode:local/coder"      # reviews work authored on claude-code:sonnet
+fallbacks = ["claude-code:sonnet"]
+max_rounds = 2
+prompt = ["prompts/review-rules.md"]
+```
+
+The reviewer's prompt is the built-in review prompt, your `prompt` files, then the rules your authors were given (the stack's addendum and `[prompt] extra`), so "every new string is translated" or "every endpoint checks roles" are checked as well as stated. The issue's text and comments are inlined, and on a re-review so is the previous review.
+
+How it works:
+
+- **Verdict.** The reviewer writes its review to a file nohalt names (or prints it); its last lines are `NOHALT-REVIEW: approve`, or `NOHALT-REVIEW: changes` and a numbered list. nohalt posts the review on the PR -- as a formal GitHub review when the token may (GitHub refuses one on a PR the same account opened), else as a comment.
+- **approve** → `ready`. The approval covers that head SHA only: a later push (by anyone) sends the PR back through CI and then through a new review of the **whole** PR.
+- **changes** → handed back to the author agent, resuming its session with the review as its note (as a red CI is). If the author stops without pushing, the same review stands and another round is counted without running a reviewer.
+- **Read-only.** The reviewer runs with `NOHALT_READONLY=1`: the `git` shim refuses every push and the `gh`/`glab` shims allow reads only. As with the merge refusal, that is a speed bump; the binding rule is that a verdict counts only if the PR head is still the commit reviewed.
+- **Failures.** A reviewer that hits an endpoint error is retried with backoff (`[agents] provider_retries`, not counted); a usage limit waits; a time limit, a hang or a missing verdict is retried up to `attempts`. Never an approval.
+- **Restarts.** A reviewer runs in its own session; a restarted supervisor adopts it from the issue record. `nohalt stop --now` stops reviewers too; their reviews start again from scratch.
+- `nohalt status` shows `in_review` with the reviewer's model and round, and each issue's last verdict.
+
 ## Example: self-hosted GitLab
 
 Work lands on an integration branch, and humans promote it to the default branch, which deploys. CI on merge requests is a short validation job, and the instance itself doesn't require pipelines to pass.

@@ -7,7 +7,9 @@
 #     stashing to prove "this test fails without my change" pop each other's
 #     work;
 #   * pushes to the base branch, tag pushes, --mirror and deleting the base:
-#     agents push their own branch and nothing else.
+#     agents push their own branch and nothing else;
+#   * with NOHALT_READONLY set (a reviewer), any push at all: a reviewer reads
+#     the PR, it never changes it.
 set -uo pipefail
 
 REAL="${NOHALT_REAL_GIT:-}"
@@ -58,6 +60,10 @@ put it back:
 WHY
 )" "$*" ;;
   esac
+fi
+
+if [[ "$sub" == push && -n "${NOHALT_READONLY:-}" ]]; then
+  refuse "you are reviewing this change, not making it: pushing is not yours. Put what must change in your review" "$*"
 fi
 
 if [[ "$sub" == push ]]; then
