@@ -14,6 +14,10 @@ batching them by hand cost a night. So, on every tick:
    left out and its issue handed back to rebase. The branch gets the next
    free version, and a PR that closes the issues it carries. CI's full suite
    on the batch is the gate.
+3. With ``windows`` set, a normal batch opens only inside a release window, and
+   ``per_window`` of them merge per window. Outside, a batch carries hotfixes
+   only (a hotfix label, ``<state>/priority``, the fix for a red base), or
+   nothing; ``nohalt release-now`` opens one normal batch regardless (DEP-13).
 """
 
 from __future__ import annotations
@@ -27,15 +31,19 @@ from .. import queue
 from ..forge import CLOSED, ForgeError, PullRequest, verdict
 from ..forge.base import GREEN, RED
 from ..state import READY
+from ..util import now
 from ..worktree import GitError, git
 from .common import PipelineGate, cancel_superseded, close_merged, is_network_failure, run_deploy
 from .mergers import effective, resolve
 from .refresh import REFRESHED, record_conflicts, refresh
+from .windows import Schedule, duration
 
 if TYPE_CHECKING:
     from ..supervisor import Supervisor
 
 NETWORK_RERUNS = 3
+RELEASE_NOW = "RELEASE_NOW"  # `nohalt release-now`: one normal batch, whatever the windows say
+RELEASE_NOW_TTL = 12 * 3600  # a request nobody's batch used by then is dropped
 
 
 def _vkey(v: str) -> tuple[int, ...]:
@@ -49,6 +57,8 @@ class Train:
         self.t = sup.cfg.integrate.train
         self.tree = sup.cfg.worktree_root / "_release"
         self.gate = PipelineGate(sup)
+        self.schedule = Schedule(self.t.windows, self.t.timezone, self.t.days)
+        self.clock = now  # tests move time by replacing it
 
     def _st(self) -> dict[str, Any]:
         return self.sup.state.load("train.json", {"releases": {}, "parked": [], "reruns": {}})
@@ -115,6 +125,12 @@ class Train:
             except ForgeError as e:
                 self.sup.say(f"could not close carried {self.sup.pr(int(pr_number))}: {e}")
         run_deploy(self.sup, version or p.head_ref)
+        if rel.get("kind") == "normal" and rel.get("window"):
+            # A window's quota is spent by a merge: a batch that went red or was closed retries.
+            used = st.setdefault("windows_used", {})
+            used[rel["window"]] = used.get(rel["window"], 0) + 1
+            for old in sorted(used)[:-30]:
+                used.pop(old)
         st["releases"].pop(p.head_ref, None)
         self._save(st)
         self.gate.merged(version or p.head_ref, deploy_after=False)
@@ -164,6 +180,75 @@ class Train:
         # A short hold so a critical PR can catch up; a forgotten pause expires after an hour.
         age = self.sup.state.flag_age(self.t.batch_pause_file)
         return age is not None and age < 3600
+
+    def _release_now(self) -> bool:
+        age = self.sup.state.flag_age(RELEASE_NOW)
+        if age is None:
+            return False
+        if age > RELEASE_NOW_TTL:
+            self.sup.state.clear_flag(RELEASE_NOW)
+            self.sup.say("release-now: the request is over 12 h old and no batch used it; dropped")
+            return False
+        return True
+
+    def _is_hotfix(self, issue: int, priority: set[int], fix: int | None) -> bool:
+        if issue == fix:
+            return True  # a red base is fixed at once, window or not
+        if self.t.hotfix_priority and issue in priority:
+            return True
+        return bool(self.t.hotfix_labels) and self.sup.issue(issue).has_label(*self.t.hotfix_labels)
+
+    def _schedule(self, cands: list[tuple[int, PullRequest]]) -> tuple[list[tuple[int, PullRequest]], str, str, set[int]]:
+        """(what may go now, the kind of release, the window instance it belongs to, the hotfixes).
+
+        Kinds: ``normal`` (counts against the window's quota once merged), ``hotfix``
+        (only hotfixes; any time) and ``manual`` (``release-now``).
+        """
+        if not self.schedule.enabled:
+            return cands, "normal", "", set()
+        st = self._st()
+        ts = self.clock()
+        inst = self.schedule.current(ts)
+        priority = {int(x) for x in self.sup.state.read_lines("priority") if x.isdigit()}
+        fix = self.gate.fix_issue()
+        hot = [c for c in cands if self._is_hotfix(c[0], priority, fix)]
+        used = st.get("windows_used", {}).get(inst.key, 0) if inst else 0
+        if inst and (self.t.per_window == 0 or used < self.t.per_window):
+            why = f"in release window {inst.window.label}"
+            kind = "hotfix" if len(hot) == len(cands) else "normal"
+            self._waiting(st, why, cands, hot, ts, say=False)
+            return cands, kind, inst.key, {i for i, _ in hot}
+        if inst:
+            why = f"release window {inst.window.label} has had its release ({used}/{self.t.per_window})"
+        else:
+            why = "outside release window"
+        self._waiting(st, why, cands, hot, ts, say=True)
+        return hot, "hotfix", "", {i for i, _ in hot}
+
+    def _waiting(
+        self,
+        st: dict[str, Any],
+        why: str,
+        cands: list[tuple[int, PullRequest]],
+        hot: list[tuple[int, PullRequest]],
+        ts: float,
+        say: bool,
+    ) -> None:
+        """Record what waits on the schedule (for `nohalt status`); log it when it changes."""
+        ready, hotfixes = [i for i, _ in cands], [i for i, _ in hot]
+        st["waiting"] = {"at": ts, "why": why, "ready": ready, "hotfixes": hotfixes}
+        said = [why, len(ready), hotfixes]
+        if say and ready and st.get("window_said") != said:
+            st["window_said"] = said
+            nxt = self.schedule.next(ts)
+            when = (
+                f" (next {nxt.window.label} {self.schedule.label(ts)}, in {duration(nxt.start.timestamp() - ts)})" if nxt else ""
+            )
+            hf = f"{len(hotfixes)} hotfix(es)" + (": " + " ".join(f"#{i}" for i in hotfixes) + " go alone" if hotfixes else "")
+            self.sup.say(f"no normal batch: {why}{when}; {len(ready) - len(hotfixes)} ready issue(s) wait; {hf}")
+        elif not say:
+            st.pop("window_said", None)
+        self._save(st)
 
     def _candidates(self) -> list[tuple[int, PullRequest]]:
         st = self._st()
@@ -226,9 +311,23 @@ class Train:
     def _build(self) -> None:
         if self._paused():
             return
+        manual = self._release_now()
         cands = self._candidates()
         if not cands:
+            if manual:
+                self.sup.state.clear_flag(RELEASE_NOW)
+                self.sup.say("release-now: nothing is ready to release; the request is dropped")
+            elif self.schedule.enabled:
+                self._schedule(cands)
             return
+        hot: set[int] = set()
+        if manual:
+            kind, window = "manual", ""
+            self.sup.say(f"release-now: opening a batch outside the schedule ({len(cands)} ready)")
+        else:
+            cands, kind, window, hot = self._schedule(cands)
+            if not cands:
+                return
         remote, base = self.cfg.project.remote, self.cfg.project.base_branch
         try:
             self._ensure_tree()
@@ -305,6 +404,8 @@ class Train:
         if not merged:
             self.sup.say("integrator: nothing merged cleanly")
             return
+        if kind == "normal" and all(i in hot for i, _, _ in merged):
+            kind = "hotfix"  # only the hotfixes merged cleanly: the window's release is still to come
         version = self._stamp_version()
         issues = " ".join(f"#{i}" for i, _, _ in merged)
         try:
@@ -346,9 +447,18 @@ class Train:
             self.sup.say(f"integrator: could not open the release PR: {e}")
             return
         st = self._st()
-        st["releases"][branch] = {"version": version, "carried": [list(m) for m in merged], "pr": n}
+        st["releases"][branch] = {
+            "version": version,
+            "carried": [list(m) for m in merged],
+            "pr": n,
+            "kind": kind,
+            "window": window,
+        }
         self._save(st)
-        self.sup.say(f"opened release {self.sup.pr(n)} ({version or branch}) carrying {issues}")
+        if manual:
+            self.sup.state.clear_flag(RELEASE_NOW)
+        what = {"hotfix": " (hotfix)", "manual": " (release-now)"}.get(kind, "") if self.schedule.enabled or manual else ""
+        self.sup.say(f"opened release {self.sup.pr(n)} ({version or branch}){what} carrying {issues}")
 
     # -- versions ------------------------------------------------------------------------------------
     def next_version(self) -> str:
