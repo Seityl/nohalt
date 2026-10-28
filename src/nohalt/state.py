@@ -86,6 +86,7 @@ class IssueRecord:
     review_retries: int = 0  # reviewer endpoint failures; never failures
     review_not_before: float = 0.0
     review_exit: str = ""  # why the supervisor stopped the reviewer (timeout, hung)
+    review_cooling: str = ""  # the warning cool-down the last reviewer was let through ([review] during_cooldown)
     history: list[str] = field(default_factory=list)
 
     def event(self, text: str) -> None:

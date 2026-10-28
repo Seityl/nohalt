@@ -156,8 +156,8 @@ class Prober:
         self.state = state
         self.capacity = Capacity(cfg, state)
 
-    def answers(self, model: str) -> bool:
-        if self.capacity.unavailable(model):
+    def answers(self, model: str, warned_ok: bool = False) -> bool:
+        if self.capacity.unavailable(model, warned_ok):
             # Down (probed again on its own schedule) or cooling down: probing a plan at its
             # limit can itself be billed (MOD-08).
             return False

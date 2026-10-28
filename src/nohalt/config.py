@@ -232,6 +232,7 @@ class ReviewCfg:
     attempts: int = 3  # reviews that ended without a verdict (timeout, hang, no verdict) before a human is asked
     timeout: int = 3600
     prompt: list[str] = field(default_factory=list)  # extra prompt files for the reviewer
+    during_cooldown: str = "none"  # "warning": a reviewer may start on a pool cooling down for a usage warning (#76)
 
 
 @dataclass
@@ -402,6 +403,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[agents] max_attempts must be at least 1")
     if cfg.review.max_rounds < 0 or cfg.review.attempts < 1:
         raise ConfigError("[review] max_rounds must be at least 0 and attempts at least 1")
+    if cfg.review.during_cooldown not in ("none", "warning"):
+        raise ConfigError(f"[review] during_cooldown must be none or warning, got {cfg.review.during_cooldown!r}")
     if isinstance(cfg.review.prompt, str):
         cfg.review.prompt = [cfg.review.prompt]
     if cfg.review.title:

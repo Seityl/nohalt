@@ -14,7 +14,9 @@ Two kinds of trouble are about a model, not about any one issue:
   ``rate_limit five_hour rejected`` and the like) cools down the model's pool --
   the ``[agents] pools`` prefix it belongs to, or the model itself -- until the
   reset time the line reports, else for ``usage_cooldown``. New launches avoid a
-  cooling pool. Running agents are not touched.
+  cooling pool. Running agents are not touched. A limit is remembered apart
+  (``hard_until``): with ``[review] during_cooldown = "warning"`` a reviewer may
+  still start on a pool that only a warning cools down, never on one at its limit.
 
 State is ``<state>/capacity.json``, read by ``nohalt status``.
 """
@@ -69,15 +71,18 @@ class Capacity:
         c = self._load()["cooling"].get(self.pool_key(model))
         return float(c["until"]) if c and c["until"] > now() else 0.0
 
-    def unavailable(self, model: str) -> str:
-        """Why no new agent should start on ``model`` now, or "" if nothing here says so."""
+    def unavailable(self, model: str, warned_ok: bool = False) -> str:
+        """Why no new agent should start on ``model`` now, or "" if nothing here says so.
+
+        ``warned_ok``: a pool cooling down only for a warning is no reason (a reviewer, ``[review] during_cooldown``).
+        """
         d = self._load()
         down = d["down"].get(model)
         if down:
             return f"{model} down since {stamp(down['since'])}"
         key = self.pool_key(model)
         c = d["cooling"].get(key)
-        if c and c["until"] > now():
+        if c and c["until"] > now() and not (warned_ok and hard_until(c) <= now()):
             window = f" ({c['window']})" if c.get("window") else ""
             return f"{key} cooling down{window} until {stamp(c['until'])}"
         return ""
@@ -165,7 +170,7 @@ class Capacity:
 
     # -- usage ---------------------------------------------------------------------------------------------
     def usage(self, model: str, sig: UsageSignal, source: str, launch: float = 0) -> bool:
-        """An agent on ``model`` reported a usage limit or warning. True if this started or moved a cool-down.
+        """An agent on ``model`` reported a usage limit or warning. True if this started, moved or hardened a cool-down.
 
         The same line from the same source is read only once (a running agent's
         log is read every tick).
@@ -181,6 +186,13 @@ class Capacity:
         active = c.get("until", 0) > t
         c["seen"] = [*c.get("seen", []), seen][-20:]
         moved = not active or until > c["until"]
+        # A limit is hard while its own reset is ahead, whatever a warning later says (#76).
+        hard = hard_until(c) if active else 0.0
+        hardened = sig.kind == "limit" and until > hard
+        if hardened:
+            c["hard_until"] = until
+        elif not active:
+            c.pop("hard_until", None)
         if moved:
             c.update(
                 until=until,
@@ -192,6 +204,8 @@ class Capacity:
             )
         d["cooling"][key] = c
         self._save(d)
+        if hardened and not moved:
+            self.say(f"pool {key}: usage limit reached ({source}); hard until {stamp(until)}, reviews divert too")
         if moved:
             what = "usage limit reached" if sig.kind == "limit" else "close to its usage limit"
             reset = "reported reset" if sig.resets_at > t else f"no reset reported, {ago(until - t)} by default"
@@ -200,7 +214,7 @@ class Capacity:
                 f"pool {key} cooling down until {stamp(until)}{window}: {what} ({source}; {reset}); "
                 "new work goes to fallbacks, pinned issues wait"
             )
-        return moved
+        return moved or hardened
 
     # -- each tick ---------------------------------------------------------------------------------------------
     def tick(self, probe: Callable[[str], bool] | None) -> None:
@@ -224,3 +238,8 @@ class Capacity:
 
     def snapshot(self) -> dict[str, Any]:
         return self._load()
+
+
+def hard_until(c: dict[str, Any]) -> float:
+    """Until when a cool-down is for a hard limit, not only a warning (a record from before #76: its kind says)."""
+    return float(c.get("hard_until", c.get("until", 0) if c.get("kind") == "limit" else 0))
