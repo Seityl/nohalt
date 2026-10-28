@@ -131,6 +131,12 @@ class TrainCfg:
     after_version: str = ""  # a command run in the release tree after stamping (regenerate docs, ...)
     red_retries: int = 1
     batch_pause_file: str = "BATCH_PAUSE"
+    windows: list[str] = field(default_factory=list)  # daily "HH:MM-HH:MM" ranges a normal batch may open in; empty: always
+    timezone: str = ""  # IANA name for windows; default: the system's local time
+    days: list[str] = field(default_factory=list)  # weekdays windows apply on ("mon".."sun"); empty: every day
+    per_window: int = 1  # normal releases merged per window instance; 0: unlimited
+    hotfix_labels: list[str] = field(default_factory=lambda: ["hotfix"])  # these may release outside a window
+    hotfix_priority: bool = True  # issues in <state>/priority count as hotfixes too
 
 
 @dataclass
@@ -365,6 +371,18 @@ def validate(cfg: Config) -> None:
         if not isinstance(n, int) or n < 0:
             raise ConfigError(f"[models] overflow_reserve: {pool!r} must be a whole number of slots, got {n!r}")
     from .integrate.mergers import DRIVERS
+    from .integrate.windows import Schedule, WindowError
+
+    t = cfg.integrate.train
+    for key in ("windows", "days", "hotfix_labels"):
+        if isinstance(getattr(t, key), str):
+            setattr(t, key, [getattr(t, key)])
+    try:
+        Schedule(t.windows, t.timezone, t.days)
+    except WindowError as e:
+        raise ConfigError(f"[integrate.train] {e}") from None
+    if not isinstance(t.per_window, int) or isinstance(t.per_window, bool) or t.per_window < 0:
+        raise ConfigError(f"[integrate.train] per_window must be a whole number, 0 for unlimited, got {t.per_window!r}")
 
     for glob, driver in cfg.integrate.mergers.items():
         if driver not in DRIVERS:

@@ -172,9 +172,36 @@ tag_prefix = "v"
 after_version = "python scripts/regenerate_reference.py"   # run in the release tree after stamping, and after a refresh
 red_retries = 1
 batch_pause_file = "BATCH_PAUSE"   # touch <state>/BATCH_PAUSE to hold new batches (expires after 1 h)
+
+# Release windows: one release a day before staff start; hotfixes any time.
+windows = ["05:00-06:00"]
+timezone = "America/Curacao"
+days = ["mon", "tue", "wed", "thu", "fri"]
+per_window = 1
+hotfix_labels = ["hotfix"]
+hotfix_priority = true
 ```
 
 `<state>/priority` and `<state>/hold` (one issue per line) put issues first in, or keep them out of, the next batch.
+
+### Release windows
+
+By default the train opens a batch whenever no release is open, so with a `deploy` command every batch deploys, all day. Release windows restrict when a **normal** batch may open (DEP-13):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `windows` | `[]` | daily `"HH:MM-HH:MM"` ranges (24-hour clock, end exclusive) in which a normal batch may **open**. A range whose end is at or before its start crosses midnight (`"23:00-01:00"`). Empty: no schedule, a batch opens whenever one can (the old behaviour) |
+| `timezone` | `""` | IANA name the windows are read in, e.g. `"America/Curacao"`. Empty: the system's local time |
+| `days` | `[]` | weekdays the windows apply on: `mon` `tue` `wed` `thu` `fri` `sat` `sun`. A window crossing midnight belongs to the day it starts. Empty: every day |
+| `per_window` | `1` | normal releases **merged** per window instance. After that, no further normal batch opens in the same window. A batch that fails (red, closed for conflicts, its PRs parked) does not count, so it is retried in the same window. `0`: unlimited inside the window |
+| `hotfix_labels` | `["hotfix"]` | issues carrying any of these labels (case-insensitive) are hotfixes |
+| `hotfix_priority` | `true` | issues listed in `<state>/priority` are hotfixes too |
+
+- **Outside a window**, or once the window's quota is used, no normal batch opens. If any ready issue is a hotfix, a release opens carrying **only the hotfixes**; the other green PRs wait for the next window. The log says why nothing opened (`no normal batch: outside release window (next 05:00-06:00 America/Curacao, in 8h 12m); 9 ready issue(s) wait; 0 hotfix(es)`), once per change, and `nohalt status` shows the next window and the hotfixes waiting.
+- **The fix-forward issue for a red base is always a hotfix**: a red production base is fixable at once. With `red_base = "with_fix"`, outside a window the fix goes with the other hotfixes only, not with every green PR; inside one it carries them as usual.
+- **A release already open always proceeds**, window or not: CI, re-runs, merge, tag, `deploy` and the base watch. Windows only decide when a batch is *opened*, so a batch opened at 05:55 may deploy at 06:20.
+- A batch of hotfixes only (inside a window too) does not use the window's quota.
+- **`nohalt release-now`** asks for one unscheduled release: once no release is open and the base gate is open, the next tick opens a normal batch of everything ready, ignoring windows and quota. The request (`<state>/RELEASE_NOW`) is used once and does not count against a window. With nothing ready it is dropped; unused after 12 h it expires; `nohalt release-now --off` withdraws it. `BATCH_PAUSE`, `hold`, a red base and `DEPLOY_BLOCKED` still apply.
 
 ## [stack]
 

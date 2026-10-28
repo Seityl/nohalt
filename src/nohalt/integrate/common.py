@@ -187,6 +187,11 @@ class PipelineGate:
             return self._check(st)
         return True
 
+    def fix_issue(self) -> int | None:
+        """The open fix-forward issue for a red base, if any: it may release outside any window."""
+        n = self._st().get("fix_issue")
+        return int(n) if n else None
+
     def merged(self, what: str, deploy_after: bool) -> None:
         """Record a merge: watch the base branch's new head."""
         try:

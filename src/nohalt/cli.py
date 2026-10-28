@@ -141,6 +141,60 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_now(args: argparse.Namespace) -> int:
+    from .integrate.train import RELEASE_NOW
+
+    cfg = _cfg(args)
+    state = StateStore(cfg.state_dir)
+    if args.off:
+        print("release-now request withdrawn" if state.has(RELEASE_NOW) else "no release-now request was pending")
+        state.clear_flag(RELEASE_NOW)
+        return 0
+    if cfg.integrate.mode != "train":
+        print(f"nohalt: release-now is for the release train; [integrate] mode is {cfg.integrate.mode!r}", file=sys.stderr)
+        return 2
+    state.set_flag(RELEASE_NOW, stamp())
+    state.set_flag("WAKE")
+    print("RELEASE_NOW set: once no release is open and the base is green, the next tick opens one normal batch")
+    print("  - release windows and their quota are ignored for that one batch; BATCH_PAUSE and a red base are not")
+    print("  - the request is used once; with nothing ready it is dropped (`release-now --off` withdraws it)")
+    if not cfg.integrate.train.windows:
+        print("  - no [integrate.train] windows are set, so the train releases on its own anyway")
+    if not _supervisor_up(state):
+        print("the supervisor is not running: `nohalt restart` (or `nohalt keepalive`) starts one")
+    return 0
+
+
+def _windows_status(cfg: Config, state: StateStore) -> list[str]:
+    """The release schedule (DEP-13): the window now or next, and what waits on it."""
+    from .integrate.windows import Schedule, duration
+
+    t = cfg.integrate.train
+    if cfg.integrate.mode != "train" or not t.windows:
+        return []
+    sched = Schedule(t.windows, t.timezone, t.days)
+    ts = now()
+    zone = sched.label(ts)
+    lines = []
+    cur = sched.current(ts)
+    st = state.load("train.json", {}) or {}
+    if cur:
+        used = (st.get("windows_used") or {}).get(cur.key, 0)
+        quota = "unlimited" if t.per_window == 0 else f"{used}/{t.per_window} released"
+        lines.append(f"release window open: {cur.window.label} {zone}, closes in {duration(cur.end.timestamp() - ts)} ({quota})")
+    nxt = sched.next(ts)
+    if nxt:
+        lines.append(f"next release window: {nxt.window.label} {zone}, in {duration(nxt.start.timestamp() - ts)}")
+    w = st.get("waiting")
+    if w:
+        hot = " ".join(f"#{i}" for i in w.get("hotfixes", []))
+        lines.append(
+            f"  as of {stamp(w.get('at'))}: {w.get('why', '')}; {len(w.get('ready', []))} ready, "
+            f"hotfixes waiting: {hot or 'none'}"
+        )
+    return lines
+
+
 def _supervisor_up(state: StateStore) -> bool:
     lock = FileLock(state.root / "supervisor.lock")
     if lock.acquire(blocking=False):
@@ -242,6 +296,7 @@ FLAGS = {
     "DEPLOY_BLOCKED": "a deploy failed; nothing merges until a human deletes the flag",
     "BASE_NO_VERDICT": "the base pipeline gave no verdict; merging is held until a human deletes the flag",
     "BUDGET_EXHAUSTED": "the paid-API budget is spent; paid issues go to the fallback model, or stop",
+    "RELEASE_NOW": "a release-now request: the train's next batch ignores the release windows (`release-now --off` withdraws)",
 }
 
 
@@ -269,6 +324,7 @@ def render_status(cfg: Config) -> str:
         if f == "CONFIG_INVALID":
             detail = " -- " + " ".join(state.read_lines(f))[:300]
         lines.append(f"  {f}: {FLAGS[f]}{detail}")
+    lines.extend(_windows_status(cfg, state))
     spend = state.load("spend.json")
     if spend:
         lines.append(f"API spend ~${spend.get('total', 0):.2f} of ${spend.get('cap', 0):.2f}")
@@ -613,6 +669,10 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("pause", help="launch no new agents until `pause --off`")
     s.add_argument("--off", action="store_true")
     s.set_defaults(fn=cmd_pause)
+
+    s = sub.add_parser("release-now", help="train: open one normal batch now, ignoring the release windows")
+    s.add_argument("--off", action="store_true", help="withdraw a pending request")
+    s.set_defaults(fn=cmd_release_now)
 
     s = sub.add_parser("status", help="one screen of what is happening (local, no forge calls)")
     s.add_argument("--watch", "-w", type=int, nargs="?", const=10, default=0, metavar="SECONDS")
