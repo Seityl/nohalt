@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.2.1](https://github.com/Seityl/nohalt/compare/v0.2.0...v0.2.1) (2026-10-28)
+
+
+### Features
+
+* **integrate:** a base pipeline with no verdict files an issue and keeps merging ([#35](https://github.com/Seityl/nohalt/issues/35)) ([00383e3](https://github.com/Seityl/nohalt/commit/00383e3371cd03ad10040d1ba66dc6bf38ce4815))
+* **integrate:** a post-deploy check, and "shipped" means live ([#68](https://github.com/Seityl/nohalt/issues/68)) ([a48f2f3](https://github.com/Seityl/nohalt/commit/a48f2f312b80f7773e993c96b2b1b221aada5826))
+* **integrate:** on a red base the train can carry the fix and every green PR ([#38](https://github.com/Seityl/nohalt/issues/38)) ([fa20405](https://github.com/Seityl/nohalt/commit/fa20405b5c50eae1f34c797a1ad016b16de7ac5c))
+* **integrate:** refresh PRs whose conflicts with the base are all bookkeeping ([#41](https://github.com/Seityl/nohalt/issues/41)) ([5c97afa](https://github.com/Seityl/nohalt/commit/5c97afaa4136fa355db397de6a6c47986b186393))
+* **integrate:** watch slow workflows without gating; one self-closing issue each; no-change is a result ([#47](https://github.com/Seityl/nohalt/issues/47)) ([39a9544](https://github.com/Seityl/nohalt/commit/39a95441d19a4ba2830a696b9883e6305c97ede5))
+* **models:** endpoint-down state, usage-aware routing and pause expiry ([#63](https://github.com/Seityl/nohalt/issues/63)) ([d953a18](https://github.com/Seityl/nohalt/commit/d953a1803030a609b223237a8a652e932e96de84))
+* **models:** overflow to an idle pool when the routed pool is full ([#39](https://github.com/Seityl/nohalt/issues/39)) ([#44](https://github.com/Seityl/nohalt/issues/44)) ([666b087](https://github.com/Seityl/nohalt/commit/666b087c814c35ac1e79c2c9d5e09fc69152484a))
+* **prompt,review:** per-issue prompt lanes; reviewers chosen from the author's model ([#61](https://github.com/Seityl/nohalt/issues/61)) ([7cf79e5](https://github.com/Seityl/nohalt/commit/7cf79e516bb6e37fc29eb28f366ffcffd77e2a57))
+* **review:** a review gate -- a second agent checks green PRs against their issue ([#48](https://github.com/Seityl/nohalt/issues/48)) ([e79b4c6](https://github.com/Seityl/nohalt/commit/e79b4c62c32fbf97b97cc7771c6fca01d525abaf))
+* **supervisor:** start dependants early on a synthetic base of their dependencies' green PRs ([#66](https://github.com/Seityl/nohalt/issues/66)) ([d4fe72a](https://github.com/Seityl/nohalt/commit/d4fe72a2d3a81e9a419d38dfc6e0ecc81bdd8958))
+* **train:** release windows -- ship on a schedule, with a hotfix lane ([#55](https://github.com/Seityl/nohalt/issues/55)) ([17f05c0](https://github.com/Seityl/nohalt/commit/17f05c0089904982e67c4cbb6d20c04deac8f3c3))
+
+
+### Bug Fixes
+
+* **review:** stop the conflict refresh and the review gate from livelocking ([#70](https://github.com/Seityl/nohalt/issues/70)) ([1b06247](https://github.com/Seityl/nohalt/commit/1b06247286bb809026b1c58048d39cf8bdfde28a))
+* **supervisor:** queue a reopened issue again instead of leaving it done ([#59](https://github.com/Seityl/nohalt/issues/59)) ([0bcece2](https://github.com/Seityl/nohalt/commit/0bcece26aedf2dcb840f1a927d5cbbf8b8b0e4fc))
+* **supervisor:** switch to a newly installed nohalt by re-executing; preload every module ([#67](https://github.com/Seityl/nohalt/issues/67)) ([bfddffe](https://github.com/Seityl/nohalt/commit/bfddffe7e2a73a88aae314d3f7f0d5e63d3b23a1))
+
 ## [0.2.0](https://github.com/Seityl/nohalt/compare/v0.1.0...v0.2.0) (2026-10-23)
 
 
