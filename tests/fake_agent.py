@@ -21,6 +21,10 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     no-change <why>  exit 0 having changed nothing, saying why (NOHALT-RESULT: no-change -- <why>)
     sleep <seconds>  run that long (to be timed out or found hung)
     dirty            leave an uncommitted file in the worktree
+    describe <text>  append <text> to its open PR's description, push nothing, and say so
+                     (NOHALT-RESULT: updated-description -- <text>)
+    describe-quiet <text>  the same edit, without saying so
+    claim-describe <text>  say it updated the description, without editing it
 
 The prompt it was given is appended to ``<script-dir>/<issue>.prompts``.
 
@@ -90,6 +94,14 @@ def push_green(forge: LocalForge, issue: int) -> None:
             if p["head_ref"] == branch and p["state"] == "open":
                 p["head_sha"] = sha
     forge.set_checks(sha, [("ci", "completed", "success")])
+
+
+def describe(forge: LocalForge, text: str) -> None:
+    branch = git("branch", "--show-current")
+    with forge._db() as d:
+        for p in d["pulls"].values():
+            if p["head_ref"] == branch and p["state"] == "open":
+                p["body"] = f"{p.get('body', '')}\n\n{text}"
 
 
 def review(script_dir: Path, prompt: str, issue: int) -> int:
@@ -174,6 +186,12 @@ def main() -> int:
         print(f"NOHALT-RESULT: no-change -- {action.partition(' ')[2]}", flush=True)
     elif action == "dirty":
         Path("uncommitted.txt").write_text("precious\n")
+    elif action.startswith(("describe", "claim-describe")):
+        verb, _, text = action.partition(" ")
+        if verb != "claim-describe":
+            describe(forge, text)
+        if verb != "describe-quiet":
+            print(f"NOHALT-RESULT: updated-description -- {text}", flush=True)
     return 0
 
 

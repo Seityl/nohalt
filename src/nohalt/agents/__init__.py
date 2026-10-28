@@ -48,6 +48,20 @@ def no_change(log_tail: str) -> str | None:
     return found[-1].strip().strip("`*").strip()[:500] or None
 
 
+# After a review asked for changes to the PR description, an author that edited it (no push) may say
+#     NOHALT-RESULT: updated-description -- <what>
+# A hint only: the review gate compares the description itself with the one the reviewer read (AGT-22).
+UPDATED_DESCRIPTION = re.compile(r"NOHALT-RESULT:\s*updated-description\b[ \t]*(?:--|—|–|-|:)?[ \t]*([^<\s\-—–:][^\n]*)", re.I)
+
+
+def updated_description(log_tail: str) -> str | None:
+    """What an agent said it changed in the PR description, or None if it said nothing."""
+    found = UPDATED_DESCRIPTION.findall(log_tail)
+    if not found:
+        return None
+    return found[-1].strip().strip("`*").strip()[:500] or None
+
+
 @dataclass
 class UsageSignal:
     """A usage line an agent printed: ``limit`` (it stopped on it) or ``warning`` (it is close to it)."""

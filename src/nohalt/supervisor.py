@@ -555,6 +555,7 @@ class Supervisor:
             rec.status = WAITING_CI
             rec.last_exit = "pr"
             rec.event(f"agent finished with {self.pr(pr.number)}")
+            self.reviews.author_finished(rec, log_tail)  # its "updated-description" line, a hint for the gate
             self.state.put(rec)
             self.say(f"#{rec.issue}: agent finished; {self.pr(pr.number)} goes through CI")
             return
@@ -1051,6 +1052,7 @@ class Supervisor:
         rec.attempts = rec.provider_retries = rec.launch_failures = rec.timeouts = rec.ci_rounds = rec.revivals = 0
         rec.review_rounds = rec.review_failures = rec.review_retries = 0
         rec.review_verdict = rec.review_text = rec.review_approved = rec.review_sha = rec.review_exit = ""
+        rec.review_body = rec.review_body_hint = ""
         rec.review_not_before = 0
         # Not the old PR: the agent is launched, and finds (and continues) a PR still open on its branch.
         rec.pr, rec.pr_sha, rec.pid = 0, "", 0

@@ -74,6 +74,8 @@ class IssueRecord:
     review_model: str = ""
     review_started: float = 0.0
     review_sha: str = ""  # the PR head the last (or running) review looked at
+    review_body: str = ""  # a hash of the PR description that review read: an edit to it alone is a change (#74)
+    review_body_hint: str = ""  # the author's "NOHALT-RESULT: updated-description" from its last run; a hint only
     review_verdict: str = ""  # approve | changes | "" (none yet)
     review_text: str = ""  # the last verdict's review, handed to the author on "changes"
     review_approved: str = ""  # the head SHA an approval covers; any other head needs a new review

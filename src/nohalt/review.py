@@ -8,6 +8,9 @@ head. Its verdict is the last line of its review:
 * ``NOHALT-REVIEW: approve``  -> ``ready``; the approval covers that head SHA only;
 * ``NOHALT-REVIEW: changes``  -> handed back to the author with the review
   (like a red CI), up to ``max_rounds`` times, then blocked for a human.
+  A new head, or a PR description that differs from the one the reviewer read,
+  is reviewed again and costs no round. An author that changed neither has
+  used one.
 
 Rules that hold throughout:
 
@@ -22,6 +25,7 @@ Rules that hold throughout:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import signal
@@ -55,6 +59,12 @@ def parse_verdict(text: str) -> tuple[str, str]:
     if not found:
         return "", ""
     return found[-1].group(1).lower(), text.strip()
+
+
+def body_hash(body: str) -> str:
+    """A PR description's fingerprint. Line endings and trailing blanks are the forge's, not the author's edit."""
+    text = "\n".join(ln.rstrip() for ln in (body or "").replace("\r\n", "\n").splitlines()).strip()
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def reviewer_models(cfg: Config, author: str = "") -> list[str]:
@@ -99,17 +109,23 @@ class Reviews:
     def gate(self, rec: IssueRecord, pr: PullRequest) -> None:
         """A green PR becomes ``ready`` -- or ``in_review`` when its issue needs a review this head has not passed."""
         sup = self.sup
+        hint, rec.review_body_hint = rec.review_body_hint, ""  # about this hand-back only
         if self.needed(sup.issue(rec.issue)) and rec.review_approved != pr.head_sha:
             if rec.status == IN_REVIEW:
                 return
-            if rec.review_verdict == CHANGES and rec.review_sha == pr.head_sha:
-                # Handed back, and nothing was pushed: the review still stands.
-                return self._changes(rec, pr.number, rec.review_text, repeat=True)
+            handed_back = rec.review_verdict == CHANGES and rec.review_sha == pr.head_sha
+            if handed_back and not self._description_changed(rec, pr, hint):
+                # Handed back, and nothing was pushed or edited: the review still stands.
+                return self._changes(rec, pr.number, rec.review_text, repeat=True, hint=hint)
             rec.status = IN_REVIEW
             rec.review_not_before = 0
-            rec.event(f"{sup.pr(pr.number)} green on {pr.head_sha[:8]}; review needed")
+            what = "its description changed" if handed_back else "it changed"
+            said = f" (the author: {hint})" if hint else ""
+            rec.event(
+                f"{sup.pr(pr.number)} green on {pr.head_sha[:8]}; review needed" + (f", {what}{said}" if rec.review_sha else "")
+            )
             sup.state.put(rec)
-            again = " again (it changed since the last review)" if rec.review_sha else ""
+            again = f" again ({what} since the last review)" if rec.review_sha else ""
             sup.say(f"#{rec.issue}: {sup.pr(pr.number)} green -- in review{again}")
             return
         if rec.status == READY:
@@ -122,6 +138,23 @@ class Reviews:
         rec.event(f"{sup.pr(pr.number)} green on {pr.head_sha[:8]}{how}")
         sup.state.put(rec)
         sup.say(f"#{rec.issue}: {sup.pr(pr.number)} green{how} -- ready to integrate")
+
+    @staticmethod
+    def _description_changed(rec: IssueRecord, pr: PullRequest, hint: str) -> bool:
+        """Whether the PR description differs from the one the last review read (#74).
+
+        The hash decides. A review from before descriptions were recorded has none: then, once, the author's
+        ``updated-description`` hint does."""
+        if rec.review_body:
+            return body_hash(pr.body) != rec.review_body
+        return bool(hint)
+
+    def author_finished(self, rec: IssueRecord, log_tail: str) -> None:
+        """The author ended with a PR: keep its ``updated-description`` line, if any, for the gate to report."""
+        hint = agents.updated_description(log_tail)
+        if hint:
+            rec.review_body_hint = hint
+            rec.event(f"the author says it updated the PR description: {hint}")
 
     # -- each tick ---------------------------------------------------------------------------------------
     def tick(self) -> None:
@@ -197,6 +230,8 @@ class Reviews:
             return
         try:
             self.launch(rec, model)
+        except ForgeError as e:
+            sup.state.log(f"#{rec.issue} review waiting: could not read {sup.pr(rec.pr)} ({e})")
         except (GitError, prompt_mod.PromptError, OSError, ValueError) as e:
             rec.review_not_before = now() + 600
             rec.event(f"review launch failed: {e}")
@@ -206,7 +241,7 @@ class Reviews:
     def review_file(self, issue: int) -> Path:
         return self.sup.state.root / "reviews" / f"{issue}.md"
 
-    def render_prompt(self, rec: IssueRecord, issue: Issue, tree: Path) -> str:
+    def render_prompt(self, rec: IssueRecord, issue: Issue, tree: Path, description: str = "") -> str:
         sup = self.sup
         lane = prompt_mod.find_lane(self.cfg, rec.lane)
         text = prompt_mod.review_template(self.cfg, sup.stack.prompt_addendum, lane)
@@ -230,11 +265,24 @@ class Reviews:
             body += f"\n## The issue, as it read when you were launched\n\n{sup.forge.issue_text(issue.number)}\n"
         except ForgeError as e:
             sup.state.log(f"#{issue.number}: could not inline the issue text for the reviewer ({e})")
+        body += (
+            f"\n## The {sup.pr(rec.pr)} description, as it read when you were launched\n\n"
+            "The author's claims in it -- acceptance evidence, test output, screenshot paths -- are part of what you "
+            "judge: check them against the code and the issue.\n\n"
+            f"{description.strip() or '(empty)'}\n"
+        )
         if rec.review_verdict and rec.review_sha and rec.review_text:
             what = "approved" if rec.review_verdict == APPROVE else "asked for changes on"
+            if rec.review_sha == rec.pr_sha:
+                since = (
+                    "the head you are reviewing. Nothing was pushed since; the author edited the description instead. "
+                    "Review the **whole** PR again, description included"
+                )
+            else:
+                since = "the PR has changed since. Review the **whole** PR again, not only the new commits"
             body += (
-                f"\n## The previous review\n\nA previous review {what} `{rec.review_sha[:12]}`; the PR has changed since. "
-                "Review the **whole** PR again, not only the new commits, and check that every item below was addressed.\n\n"
+                f"\n## The previous review\n\nA previous review {what} `{rec.review_sha[:12]}`; {since}, "
+                "and check that every item below was addressed.\n\n"
                 f"{rec.review_text}\n"
             )
         return body
@@ -242,6 +290,7 @@ class Reviews:
     def launch(self, rec: IssueRecord, model: str) -> None:
         sup = self.sup
         issue = sup.issue(rec.issue)
+        description = sup.forge.pull(rec.pr).body  # what this review reads: an edit to it alone is a change (#74)
         name, mid = agents.split_model(model)
         agent = agents.get(name, self.cfg.agents.options.get(name))
         sup.settle_lane(rec, issue)  # an adopted PR's issue never launched: choose its lane now
@@ -258,7 +307,7 @@ class Reviews:
             if src.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
-        text = self.render_prompt(rec, issue, tree)
+        text = self.render_prompt(rec, issue, tree, description)
         spec = agent.launch(
             mid, text, title=f"{self.cfg.agents.title_prefix} review #{rec.issue}", resume=False, data_dir=data_dir
         )
@@ -286,7 +335,7 @@ class Reviews:
         pids[f"review-{rec.issue}"] = _pid_start(proc.pid)
         sup.state.save("pids.json", pids)
         rec.review_pid, rec.review_model, rec.review_started = proc.pid, model, now()
-        rec.review_sha, rec.review_exit = rec.pr_sha, ""
+        rec.review_sha, rec.review_body, rec.review_exit = rec.pr_sha, body_hash(description), ""
         rec.event(f"reviewer launched on {model} for {rec.pr_sha[:8]}" + (f" (author {rec.model})" if rec.model else ""))
         sup.state.put(rec)
         sup.say(f"#{rec.issue}: reviewer launched on {model} for {sup.pr(rec.pr)} at {rec.pr_sha[:8]}")
@@ -441,7 +490,7 @@ class Reviews:
         self._post(rec, APPROVE, text)
         self._cleanup(rec.issue)
 
-    def _changes(self, rec: IssueRecord, pr: int, text: str, *, post: bool = False, repeat: bool = False) -> None:
+    def _changes(self, rec: IssueRecord, pr: int, text: str, *, post: bool = False, repeat: bool = False, hint: str = "") -> None:
         sup = self.sup
         rec.review_verdict, rec.review_text = CHANGES, text
         rec.review_rounds += 1
@@ -451,15 +500,21 @@ class Reviews:
         r = self.cfg.review
         if rec.review_rounds > r.max_rounds:
             return sup._block(rec, f"review: changes still requested after {r.max_rounds} round(s)")
-        lead = (
-            "You stopped without pushing anything since the review below; it still stands."
-            if repeat
-            else f"A reviewer checked your {sup.pr_long(pr)} against the issue and asked for changes."
-        )
+        if repeat and hint:
+            lead = (
+                f"You said you updated the PR description ({hint}), but it reads exactly as it did when the review "
+                "below was written, and nothing was pushed: the edit did not reach the PR. The review still stands."
+            )
+        elif repeat:
+            lead = "You stopped without pushing anything or editing the PR description since the review below; it still stands."
+        else:
+            lead = f"A reviewer checked your {sup.pr_long(pr)} against the issue and asked for changes."
         note = (
             f"{lead} Address every numbered item, run the tests you touched, push, and stop. If you are sure an item "
             "is wrong, say why with evidence in the PR body instead of changing it -- the next review reads it. "
-            f"The whole PR is reviewed again after your push.\n\n{text}"
+            "The whole PR is reviewed again after your push, or after an edit to its description. If the items ask "
+            "only for changes to the description, edit it, check that the edit was saved, and end your session with "
+            f"this line on its own:\n\n    NOHALT-RESULT: updated-description -- <what you changed>\n\n{text}"
         )
         sup._requeue(
             rec,
