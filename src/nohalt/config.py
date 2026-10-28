@@ -166,6 +166,11 @@ class IntegrateCfg:
     cd_timeout: int = 90 * 60
     base_pipeline_grace: int = 10 * 60  # no pipeline at all on the base after a merge for this long: nothing to watch
     deploy: str = ""  # run after a merge (direct) or a tagged release (train)
+    post_deploy_check: str = ""  # run after a deploy (or a green CD workflow); non-zero: DEPLOY_BLOCKED and an issue
+    post_deploy_retries: int = 2  # further tries of a failing post_deploy_check (warm-up), post_deploy_delay apart
+    post_deploy_delay: int = 30
+    live_version: str = ""  # prints the live version or SHA; merged issues close only once it contains them
+    live_timeout: int = 0  # released and still not live after this long: a warning; 0: cd_timeout
     fix_forward: bool = True
     cancel_superseded: bool = False
     network_errors: list[str] = field(
@@ -278,6 +283,8 @@ _DURATIONS = {
     "probe_ttl",
     "cd_timeout",
     "base_pipeline_grace",
+    "post_deploy_delay",
+    "live_timeout",
     "overflow_after",
     "timeout",
     "down_window",
@@ -286,7 +293,7 @@ _DURATIONS = {
     "down_block_after",
     "usage_cooldown",
 }
-_OFF_WHEN_EMPTY = {"overflow_after"}
+_OFF_WHEN_EMPTY = {"overflow_after", "live_timeout"}
 
 
 def _build(cls: type, data: dict[str, Any], where: str) -> Any:
@@ -381,6 +388,9 @@ def validate(cfg: Config) -> None:
         )
     if cfg.integrate.async_workflows and not cfg.integrate.async_label:
         raise ConfigError("[integrate] async_label must not be empty while async_workflows is set")
+    n = cfg.integrate.post_deploy_retries
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ConfigError(f"[integrate] post_deploy_retries must be a whole number, 0 for none, got {n!r}")
     if cfg.integrate.merge_method not in ("merge", "squash", "rebase"):
         raise ConfigError("[integrate] merge_method must be merge, squash or rebase")
     if cfg.agents.max_parallel < 1:

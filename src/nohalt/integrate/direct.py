@@ -16,6 +16,7 @@ from ..forge import ForgeError, verdict
 from ..forge.base import GREEN
 from ..state import READY
 from .common import PipelineGate, cancel_superseded, close_merged
+from .live import LiveWatch
 from .refresh import before_hand_back
 
 if TYPE_CHECKING:
@@ -27,8 +28,11 @@ class Direct:
         self.sup = sup
         self.cfg = sup.cfg
         self.gate = PipelineGate(sup)
+        self.live = LiveWatch(sup)
 
     def tick(self) -> None:
+        if self.live.enabled:
+            self.live.tick()
         if self.cfg.integrate.cancel_superseded:
             cancel_superseded(self.sup)
         if self.gate.open():
@@ -75,5 +79,8 @@ class Direct:
         self.sup.say(f"merged {self.sup.pr(pr.number)} (#{rec.issue})")
         rec.event(f"merged {self.sup.pr(pr.number)}")
         self.sup.state.put(rec)
-        close_merged(self.sup, [rec.issue], f"{self.sup.pr(pr.number)}")
-        self.gate.merged(f"#{rec.issue}", deploy_after=True)
+        sha = self.gate.merged(f"#{rec.issue}", deploy_after=True, ctx={"issues": [rec.issue]})
+        if self.live.enabled and sha:
+            self.live.released([rec.issue], sha, "", self.sup.pr(pr.number))  # closed once live (DEP-15)
+        else:
+            close_merged(self.sup, [rec.issue], f"{self.sup.pr(pr.number)}")

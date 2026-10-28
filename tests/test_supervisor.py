@@ -305,7 +305,7 @@ def test_an_old_launchs_error_is_not_evidence(world):
 
 
 def test_green_draft_is_marked_ready(world):
-    """Drafts cannot be merged; once green with the agent finished, nohalt marks them ready."""
+    """INT-15: drafts cannot be merged; once green with the agent finished, nohalt marks them ready."""
     w = world(integrate={"mode": "direct"})
     w.issue(1, "pr-draft")
     w.drive(4)

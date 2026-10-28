@@ -19,7 +19,7 @@ src/nohalt/
   stacks/          generic (shell hooks), frappe (site pool on a shared bench)
   early.py         early start: a dependant on a synthetic base of its dependencies' unmerged PRs
   review.py        the optional review gate: a reviewer agent, chosen by the author's model, checks green PRs against their issue
-  integrate/       none | direct | train, the bookkeeping merge drivers, the async workflow watch
+  integrate/       none | direct | train, the bookkeeping merge drivers, the async workflow watch, release windows, the post-deploy check and the live-version watch
   shims/           gh, glab, git, pkill guards put first on every agent's PATH
   cli.py           the `nohalt` command
 ```
@@ -64,6 +64,8 @@ The supervisor holds an exclusive lock, so only one runs per state directory. A 
                                          └─ any other issue: blocked ("agent says no change needed: <reason>")
 ```
 
+With `[integrate] live_version`, `ready ──merged──► released ──live version contains the merge──► closed ──► done` (DEP-15): a released issue is not closed by nohalt, never relaunched, and not watched for its PR; `integrate/live.py` closes it, or comments on it if the forge already closed it, once production runs it.
+
 `done` is not the end if a human reopens the issue (AGT-20). Each tick, one listing of the forge's open issues updated since the last one finds done records whose issue is open again. Such a record goes back to `queued` with fresh counters and its history kept, and a fresh launch is told the issue was reopened, with the comments made since nohalt saw it closed. The branch is kept unless it was merged (its PR merged, or the branch is in the base); then a new `<branch>-reopened` is cut from the base.
 
 With `[review]`, a selected issue goes `waiting_ci ──green──► in_review ──approve──► ready`. A `changes` verdict hands it back to `queued` (resumed with the review) like a red CI, up to `max_rounds`, then `blocked`. A push after an approval sends it back to `waiting_ci`, and then to a new review.
@@ -92,6 +94,8 @@ A *resumed* launch continues the agent's previous session in the same worktree w
 
 **direct.** Takes the first `ready` issue in queue order, checks again that its PR is green on its current head and mergeable, merges it, then watches the pipeline on the base branch's new head (`cd_workflow`, else `ci_workflow`, else the required checks). Every check of the pipeline the merge triggered counts, except `base_ignore_checks` (forge-managed jobs that post on the base head afterwards, like Dependabot updates on GitHub, are not that pipeline) -- including checks `ignore_checks` skips on PRs, whose only gate is this one. Nothing else merges until that pipeline is green. A cancelled run is no verdict: it is re-run, and after `base_cancelled_limit` in a row merging is held (`BASE_NO_VERDICT`) for a human. If it is red, or times out, nohalt opens a fix-forward issue at the front of the queue, and merging resumes when that issue closes. A `deploy` command, if set, runs after a green pipeline (unless a CD workflow already deploys).
 
+**After the deploy** (DEP-14, DEP-15). `post_deploy_check` runs once the `deploy` command succeeds, or once `cd_workflow` is green. The gate keeps its retries in `integrate.json` (`post_check`) and holds merging while they are due. A final failure writes `DEPLOY_BLOCKED` and opens one issue (`check_block`), which is treated like a fix-forward issue. A later passing check clears the flag. With `live_version`, the integrator merges and then hands the carried issues to `LiveWatch` instead of closing them. `LiveWatch` runs `live_version` every tick, checks each released merge commit with `git merge-base --is-ancestor`, and closes or comments on the issues when it is live, or warns after `live_timeout`.
+
 **Async workflows.** A workflow listed in `async_workflows` is never part of that gate (on GitHub its jobs are excluded from the base verdict by check suite). `integrate/async_watch.py` reads its newest completed run on the base every tick, in every mode, and keeps at most one open issue per workflow: opened on red at the front of the queue, commented on each further red (new and fixed failures, read from the failed log), closed with a comment on the first green. An agent on that issue that finds the base already fixed ends with `NOHALT-RESULT: no-change -- <reason>`; the issue waits in `awaiting_green` rather than being blocked.
 
 **train.** With no release PR open, every `ready` issue's green PR (priority list first, then queue order, minus held issues and parked SHAs) is merged into `release/auto-<time>` off the base. Conflicts go to the merge drivers by glob (`[integrate.mergers]`). If any file stays in conflict, that PR is left out. It is refreshed against the base if the drivers settle that (see `refresh_conflicts`), otherwise handed back to rebase. The batch gets the next free version (from tags, or the version files), an optional regeneration command, and a PR closing every carried issue. On a later tick: green and mergeable → merge, tag, deploy, then the same pipeline gate as `direct` watches the base branch. Red → re-run the failed jobs once (more if the failure was the network). Still red → close the release, park the carried heads until their agents push, and hand each issue back.
@@ -110,9 +114,10 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   probes.json limited.json model probe cache and usage-limit marks
   capacity.json            down models (since, next probe), recent endpoint errors, pools cooling down (until, window, source)
   spend.json               budget high-water marks
-  integrate.json train.json integrator state that spans ticks
+  integrate.json train.json integrator state that spans ticks (the base watch, fix-forward issue, post-deploy check and its block)
   refresh.json conflicts.json  conflicting PRs refreshed by nohalt (counted per issue); files left in conflict at hand-backs (for doctor)
   async.json               per async workflow: its open issue, the last run read, its failures, what the agent saw
+  live.json                released merges not yet live (issues, merge commit, tag, since) and what live_version last printed
   status.json              last tick's summary (for `nohalt status`)
   supervisor.json          the running supervisor: pid, start time, hash of the config it loaded
   STOP PAUSE WAKE RESTART BATCH_PAUSE RELEASE_NOW DEPLOY_BLOCKED BUDGET_EXHAUSTED CONFIG_INVALID   control flags

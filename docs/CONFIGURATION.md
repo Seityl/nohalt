@@ -186,11 +186,62 @@ Spend is estimated from each opencode agent's own session database, keeping the 
 | `cd_timeout` | `"90m"` | a pipeline that does not finish in time counts as red |
 | `base_pipeline_grace` | `"10m"` | if **no** pipeline appears on the base branch's new head within this time, there is nothing to watch, and merging continues. Many integration branches run no CI after a merge |
 | `deploy` | `""` | shell command after a green pipeline (`direct`, when no CD workflow deploys) or a merged release (`train`). A failure writes `DEPLOY_BLOCKED` |
+| `post_deploy_check` | `""` | shell command run after a successful `deploy`, or when `cd_workflow` goes green (the CD job is the deploy then). It checks the live app, e.g. that the main pages answer. See [Post-deploy check](#post-deploy-check) |
+| `post_deploy_retries` | `2` | further tries of a failing `post_deploy_check` before it counts as failed (warm-up: workers take a while to come back) |
+| `post_deploy_delay` | `"30s"` | time between those tries. A retry waits between ticks; nothing merges meanwhile |
+| `live_version` | `""` | shell command that prints what production runs: a version, a tag or a commit SHA (its last non-empty line is read). When set, issues are closed only once that is live. See [Shipped means live](#shipped-means-live) |
+| `live_timeout` | `""` | how long a merged issue may wait to be live before nohalt warns. Empty: `cd_timeout` |
 | `fix_forward` | `true` | a red pipeline opens an issue at the front of the queue and stops merging until it closes |
 | `cancel_superseded` | `false` | cancel queued or running CI for commits no open PR or the base points at |
 | `network_errors` | DNS/reset patterns | failed-log substrings that mark a red as the network's, not the code's |
 | `mergers` | `{}` | glob → driver, see [STACKS.md](STACKS.md#merge-drivers-any-stack). Paths in `[integrate.train] version_files` that no glob covers get one implicitly: `package_json` for JSON, `version_lines` for anything else |
 | `refresh_conflicts` | `true` | `direct` and `train`: before handing a PR back for conflicting with the base, nohalt merges the base into the PR branch itself, in a scratch tree, when the merge drivers settle every conflicted file. It then runs `after_version` (if set), commits the merge (`merge: <base> into <branch> (nohalt refresh)`) and any regenerated files, and pushes, fast-forward only. Any file left in conflict, or a failed regenerate or push, means a hand-back as before. A branch whose agent is running is never touched. Refreshes don't count as `ci_rounds` |
+
+### Post-deploy check
+
+A deploy that exits 0 has finished, but the app may not work. `post_deploy_check` runs after every successful deploy (DEP-14), in the clone, with:
+
+| Variable | Value |
+|---|---|
+| `NOHALT_VERSION` | the release's version without `tag_prefix` (`1.4.2`); in `direct` mode, the first 12 characters of the merge commit |
+| `NOHALT_SHA` | the base branch's head after the merge |
+| `NOHALT_TAG` | the release tag (`v1.4.2`); empty in `direct` mode |
+| `NOHALT_ISSUES` | the issues the merge carried, space-separated |
+
+Exit 0 is a pass. Anything else is tried again `post_deploy_retries` times, `post_deploy_delay` apart. If it still fails:
+
+- `DEPLOY_BLOCKED` is written, with the check's exit code and last output (`nohalt status` shows it). Merging and deploys stop, as for a failed `deploy`.
+- One issue opens at the front of the queue, "Post-deploy check failed on v1.4.2: <the output's last line>", with the output in its body. A further failure while that issue is still worked on is a comment on it, not a second issue. `fix_forward = false` opens nothing.
+- That issue is a fix-forward. Its own PR may merge (with `red_base = "with_fix"` in train mode, it carries every green PR), and outside the release windows it releases as a hotfix.
+- Once a later deploy passes the check, `DEPLOY_BLOCKED` is cleared by itself. A human may also delete it. A `deploy` command that fails outright still needs a human, as before.
+
+```toml
+[integrate]
+deploy = "./scripts/deploy.sh"
+post_deploy_check = "./scripts/smoke.sh"   # curl the login page, the dashboard, an API call; exit non-zero on failure
+post_deploy_retries = 3
+post_deploy_delay = "20s"
+```
+
+`nohalt doctor` warns when `deploy` (or `cd_workflow`) is set without a `post_deploy_check`.
+
+### Shipped means live
+
+By default, an issue is done when its PR (or its release) merges. With `live_version` set, merged is not done (DEP-15):
+
+- After the merge, nohalt does **not** close the issue. Its record becomes `released`, and the issue gets a comment: "released in v1.4.2, not yet live". A released issue is never relaunched. Dependants wait for it, since they wait for closed issues.
+- Every tick (`direct` and `train` modes), nohalt runs `live_version` and resolves what it prints in the clone: a commit, a tag, or a version that is a tag with `tag_prefix` (`1.4.2` → `v1.4.2`). Tags are fetched when the value is new to the clone.
+- When the merge commit is an ancestor of the live commit (`git merge-base --is-ancestor`), each issue is closed with a comment "live in 1.4.2 (verified)". If the forge already closed it (a closing keyword on the default branch), it gets the comment only.
+- After `live_timeout` (default `cd_timeout`) without that, nohalt logs a warning once and keeps waiting. The issues stay open; close them by hand if the release went live some other way.
+- `nohalt status` lists them: `released, awaiting live: #12 #14 in v1.4.2 (for 25m)`, with `OVERDUE` past the timeout, and the value `live_version` last printed.
+
+```toml
+[integrate]
+live_version = "curl -fsS https://app.example.com/api/version | jq -r .version"
+live_timeout = "2h"
+```
+
+Not covered: restoring a neutralised copy of production after a release and sweeping it with real-backend checks (see LESSONS, Open problems).
 
 An agent may finish with **nothing to change**: the line `NOHALT-RESULT: no-change -- <reason>` in its output (the built-in prompt tells it how). On an async workflow's issue that moves the issue to `awaiting_green`: no attempt is spent and no agent is launched, the next green run closes it, and a red run with failures the agent has not seen sends an agent back with that run. On any other issue it is blocked for a human with the reason "agent says no change needed: <reason>".
 

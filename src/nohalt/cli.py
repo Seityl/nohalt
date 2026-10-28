@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import re
 import shutil
@@ -246,6 +247,20 @@ def _capacity_status(state: StateStore) -> list[str]:
     return lines
 
 
+def _live_status(cfg: Config, state: StateStore) -> list[str]:
+    """A post-deploy check still retrying, and released issues not yet live (DEP-14, DEP-15)."""
+    from .integrate.live import awaiting, label
+
+    lines = []
+    pc = (state.load("integrate.json", {}) or {}).get("post_check")
+    if pc:
+        lines.append(f"post-deploy check on {label(pc.get('ctx') or {})}: retrying (failed {pc.get('tries', 0)} time(s))")
+    if cfg.integrate.live_version:
+        timeout = cfg.integrate.live_timeout or cfg.integrate.cd_timeout
+        lines.extend(awaiting(state.load("live.json", {}) or {}, now(), timeout))
+    return lines
+
+
 def _supervisor_up(state: StateStore) -> bool:
     lock = FileLock(state.root / "supervisor.lock")
     if lock.acquire(blocking=False):
@@ -344,7 +359,8 @@ FLAGS = {
     "PAUSE": "no new launches; running agents continue (`nohalt resume` undoes; `pause --for` expires)",
     "RESTART": "a restart was asked for; the supervisor re-executes after its current tick",
     "CONFIG_INVALID": "nohalt.toml has an error; the supervisor runs on the last good configuration",
-    "DEPLOY_BLOCKED": "a deploy failed; nothing merges until a human deletes the flag",
+    "DEPLOY_BLOCKED": "a deploy or its post-deploy check failed; nothing merges (but the fix for a failed check) until "
+    "a human deletes the flag or a deploy passes the check",
     "BASE_NO_VERDICT": "the base pipeline gave no verdict; merging is held until a human deletes the flag",
     "BUDGET_EXHAUSTED": "the paid-API budget is spent; paid issues go to the fallback model, or stop",
     "RELEASE_NOW": "a release-now request: the train's next batch ignores the release windows (`release-now --off` withdraws)",
@@ -372,13 +388,14 @@ def render_status(cfg: Config) -> str:
     )
     for f in flags:
         detail = ""
-        if f == "CONFIG_INVALID":
+        if f in ("CONFIG_INVALID", "DEPLOY_BLOCKED"):
             detail = " -- " + " ".join(state.read_lines(f))[:300]
         if f == "PAUSE":
             detail = _pause_detail(state)
         lines.append(f"  {f}: {FLAGS[f]}{detail}")
     lines.extend(_windows_status(cfg, state))
     lines.extend(_capacity_status(state))
+    lines.extend(_live_status(cfg, state))
     spend = state.load("spend.json")
     if spend:
         lines.append(f"API spend ~${spend.get('total', 0):.2f} of ${spend.get('cap', 0):.2f}")
@@ -593,6 +610,98 @@ def _doctor_review_authors(cfg: Config, check: Callable[..., None]) -> None:
     )
 
 
+def _doctor_deploy(cfg: Config, check: Callable[..., None], probe: bool) -> None:
+    """A deploy judged by its exit code alone, and live_version where nothing would read it (DEP-14, DEP-15)."""
+    ic = cfg.integrate
+    if ic.deploy or ic.cd_workflow:
+        check(
+            bool(ic.post_deploy_check),
+            "post_deploy_check runs after each deploy",
+            ("[integrate] deploy" if ic.deploy else "[integrate] cd_workflow")
+            + " is set but post_deploy_check is not: a deploy is judged only by its exit code, so a release that "
+            "breaks the live app looks done (add a command that checks the main pages)",
+            fatal=False,
+        )
+    elif ic.post_deploy_check:
+        check(
+            False,
+            "",
+            "[integrate] post_deploy_check is set but nothing deploys (no deploy, no cd_workflow): it never runs",
+            fatal=False,
+        )
+    if ic.live_version and ic.mode == "none":
+        check(
+            False, "", "[integrate] live_version needs mode direct or train: with a human merging, nothing reads it", fatal=False
+        )
+    if ic.live_version and probe:
+        cp = subprocess.run(["bash", "-c", ic.live_version], cwd=cfg.repo_path, capture_output=True, text=True, timeout=120)
+        out = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
+        check(
+            cp.returncode == 0 and bool(out),
+            f"live_version reports {out[-1] if out else ''!r}",
+            f"live_version exited {cp.returncode}" + (f" printing {out[-1]!r}" if out else " with no output"),
+            fatal=False,
+        )
+
+
+def _doctor_windows(cfg: Config, check: Callable[..., None]) -> None:
+    """``[integrate.train] windows``, ``timezone`` and ``days`` parse at load; here: do they do what they seem to (DEP-13)."""
+    from .integrate.windows import DAYS, Schedule, duration
+
+    t = cfg.integrate.train
+    if not (t.windows or t.timezone or t.days):
+        return
+    if not t.windows:
+        check(
+            False,
+            "",
+            "[integrate.train] timezone or days is set but windows is empty: the train releases at any time",
+            fatal=False,
+        )
+        return
+    if cfg.integrate.mode != "train":
+        check(
+            False,
+            "",
+            f"[integrate.train] windows is set but mode is {cfg.integrate.mode!r}: only the train uses them",
+            fatal=False,
+        )
+        return
+    sched = Schedule(t.windows, t.timezone, t.days)
+    ts = now()
+    days = ", ".join(DAYS[d] for d in sorted(sched.days)) if t.days else "every day"
+    nxt = sched.next(ts)
+    when = f"; next {nxt.window.label} in {duration(nxt.start.timestamp() - ts)}" if nxt else ""
+    check(
+        nxt is not None or sched.current(ts) is not None,
+        f"release windows {', '.join(w.label for w in sched.windows)} {sched.label(ts)}, {days}{when}",
+        "[integrate.train] windows never open (no day in days has one): normal releases never happen",
+        fatal=False,
+    )
+    check(
+        bool(t.timezone),
+        "release windows have a time zone",
+        f"[integrate.train] timezone is not set: windows follow this host's clock ({sched.label(ts)}); set an IANA zone "
+        "so a host in another zone, or in UTC, does not move them",
+        fatal=False,
+    )
+    starts = sorted(w.start for w in sched.windows)
+    ends = sorted((w.start, w.start + ((w.end - w.start) % 1440)) for w in sched.windows)
+    overlap = any(b[0] < a[1] for a, b in itertools.pairwise(ends)) or (len(ends) > 1 and ends[-1][1] > 1440 + ends[0][0])
+    check(
+        not overlap and len(set(starts)) == len(starts),
+        "release windows do not overlap",
+        "[integrate.train] windows overlap: each counts its own per_window quota, so more releases go out than it looks",
+        fatal=False,
+    )
+    check(
+        bool(t.hotfix_labels) or t.hotfix_priority,
+        "a hotfix lane exists outside the windows",
+        "[integrate.train] no hotfix_labels and hotfix_priority = false: only a red base's fix may release outside a window",
+        fatal=False,
+    )
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
 
@@ -712,6 +821,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             check(p._probe(m), f"{m} answers", f"{m} does not answer a probe", fatal=False)
     if cfg.integrate.required_checks:
         _doctor_check_drift(cfg, check)
+    _doctor_deploy(cfg, check, args.probe)
+    _doctor_windows(cfg, check)
     if cfg.integrate.mode != "none" and not cfg.integrate.required_checks and not cfg.integrate.ignore_checks:
         check(False, "", "[integrate] required_checks is empty: every check run must pass (fine if intended)", fatal=False)
     if cfg.state_dir.is_dir():

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from .. import queue
 from ..forge import CLOSED, OPEN, Check, ForgeError, verdict
 from ..forge.base import GREEN, PENDING, RED
-from ..state import READY
+from ..state import READY, RELEASED
 from ..util import now
 
 if TYPE_CHECKING:
@@ -77,6 +77,29 @@ def open_no_verdict(sup: Supervisor, after: str, sha: str, cancelled: int) -> in
     return n
 
 
+def open_check_failed(sup: Supervisor, what: str, rc: int, out: str, tries: int) -> int | None:
+    """A post-deploy check that fails is the next thing worked on, like a red pipeline (DEP-14)."""
+    from .live import OUTPUT_KEPT, summary
+
+    try:
+        n = sup.forge.create_issue(
+            f"Post-deploy check failed on {what}: {summary(out)}",
+            f"nohalt deployed {what}, and `post_deploy_check` exited {rc} on each of {tries} tries. Merging and "
+            "deploys are stopped (`DEPLOY_BLOCKED`), except for the fix for this issue, which goes out like a "
+            "fix-forward. Once a deploy passes the check again, the block lifts by itself.\n\n"
+            f"The check's last output:\n\n```\n{out[-OUTPUT_KEPT:].strip()}\n```\n\n"
+            "Find out whether the release broke the live app or the check is wrong, and fix it forward in a pull "
+            "request.\n\n## Done when\n- [ ] `post_deploy_check` passes after the fix is deployed",
+            labels=["bug"],
+        )
+    except ForgeError as e:
+        sup.say(f"could not open an issue for the failed post-deploy check: {e}")
+        return None
+    queue.append(sup.cfg.queue_file, n, front=True)
+    sup.say(f"opened #{n} about the failed post-deploy check; it goes to the front of the queue")
+    return n
+
+
 def is_network_failure(sup: Supervisor, run_ids: list[int]) -> bool:
     """A red that is only the network (DNS, resets) is not the code's fault."""
     pats = sup.cfg.integrate.network_errors
@@ -131,6 +154,11 @@ class PipelineGate:
     line keeps moving (``base_no_verdict``). With ``red_base = "with_fix"`` (train
     mode) the batch after a red carries the fix and every green PR. A failed
     deploy (``DEPLOY_BLOCKED``) also stops merging until a human clears it.
+
+    After a deploy, ``post_deploy_check`` runs (DEP-14): merging waits while it
+    retries. If it still fails, ``DEPLOY_BLOCKED`` is written and an issue
+    opened, which is then treated like a fix-forward issue; a later deploy that
+    passes the check lifts the block.
     """
 
     def __init__(self, sup: Supervisor):
@@ -138,6 +166,7 @@ class PipelineGate:
         self.cfg = sup.cfg
         self.counted: list[Check] = []  # the checks behind the last verdict, for the log
         self.only: int | None = None  # while a fix-forward issue is open: the one issue that may merge
+        self.clock = now  # post-deploy check retries; tests move time by replacing it
 
     def _st(self) -> dict[str, Any]:
         return self.sup.state.load("integrate.json", {})
@@ -161,25 +190,25 @@ class PipelineGate:
                 )
             return False
         self.sup.state.clear_flag("base-no-verdict-said")
-        if self.sup.state.has("DEPLOY_BLOCKED"):
-            if not self.sup.state.has("deploy-blocked-said"):
-                self.sup.state.set_flag("deploy-blocked-said")
-                self.sup.say("merging stopped: a deploy failed (clear <state>/DEPLOY_BLOCKED once it is fixed)")
-            return False
-        self.sup.state.clear_flag("deploy-blocked-said")
+        if self.post_check() in ("pending", "failed"):
+            return False  # a post-deploy check is retrying, or has just failed
         st = self._st()
+        if self.sup.state.has("DEPLOY_BLOCKED"):
+            if st.get("check_block") and st.get("watch"):
+                return self._check(st)  # the fix's own merge: its deploy and check may lift the block
+            fix = self._check_fix(st)
+            if fix is None:
+                if not self.sup.state.has("deploy-blocked-said"):
+                    self.sup.state.set_flag("deploy-blocked-said")
+                    self.sup.say("merging stopped: a deploy failed (clear <state>/DEPLOY_BLOCKED once it is fixed)")
+                return False
+            return self._fix_only(fix)
+        self.sup.state.clear_flag("deploy-blocked-said")
+        if st.pop("check_block", None):
+            self._save(st)  # a human cleared DEPLOY_BLOCKED
         if st.get("fix_issue"):
             if self.sup.issue(st["fix_issue"], fresh=True).state != CLOSED:
-                fix = int(st["fix_issue"])
-                if self.cfg.integrate.red_base == "with_fix" and self.cfg.integrate.mode == "train":
-                    # The fix rides with every other green PR, once it is ready
-                    # itself (INT-14): a batch without it would only go red again.
-                    rec = self.sup.state.get(fix)
-                    return rec.status == READY and bool(rec.pr)
-                # Nothing merges on a red pipeline -- except the fix for it, or the
-                # fix-forward issue could never close.
-                self.only = fix
-                return True
+                return self._fix_only(int(st["fix_issue"]))
             self.sup.say(f"pipeline fix #{st['fix_issue']} closed; merging resumes")
             st.pop("fix_issue")
             self._save(st)
@@ -187,24 +216,137 @@ class PipelineGate:
             return self._check(st)
         return True
 
+    def _fix_only(self, fix: int) -> bool:
+        if self.cfg.integrate.red_base == "with_fix" and self.cfg.integrate.mode == "train":
+            # The fix rides with every other green PR, once it is ready
+            # itself (INT-14): a batch without it would only go red again.
+            rec = self.sup.state.get(fix)
+            return rec.status == READY and bool(rec.pr)
+        # Nothing merges on a red pipeline -- except the fix for it, or the
+        # fix-forward issue could never close.
+        self.only = fix
+        return True
+
+    def _check_fix(self, st: dict[str, Any]) -> int | None:
+        """The open issue of a failed post-deploy check, if that is what DEPLOY_BLOCKED is about."""
+        n = (st.get("check_block") or {}).get("issue")
+        if not n or self.sup.issue(int(n), fresh=True).state != OPEN:
+            return None
+        return int(n)
+
     def fix_issue(self) -> int | None:
-        """The open fix-forward issue for a red base, if any: it may release outside any window."""
-        n = self._st().get("fix_issue")
+        """The open fix-forward issue (a red base, a failed post-deploy check), if any: it may release outside any window."""
+        st = self._st()
+        n = st.get("fix_issue")
+        if not n and self.sup.state.has("DEPLOY_BLOCKED"):
+            n = (st.get("check_block") or {}).get("issue")
         return int(n) if n else None
 
-    def merged(self, what: str, deploy_after: bool) -> None:
-        """Record a merge: watch the base branch's new head."""
+    def merged(self, what: str, deploy_after: bool, ctx: dict[str, Any] | None = None) -> str:
+        """Record a merge: watch the base branch's new head. Returns that head, or "" if unknown.
+
+        ``ctx`` (``tag``, ``issues``) describes the merge to a post-deploy check.
+        """
         try:
             sha = self.sup.forge.branch_sha(self.cfg.project.base_branch)
         except ForgeError:
             sha = ""
+        ctx = {**(ctx or {}), "what": what, "sha": sha}
         if not sha:
             if deploy_after:
-                run_deploy(self.sup, what)
+                self.deploy(what, ctx)
+            return ""
+        st = self._st()
+        st["watch"] = {"sha": sha, "what": what, "since": now(), "deploy": deploy_after, "ctx": ctx}
+        self._save(st)
+        return sha
+
+    # -- deploy and the post-deploy check (DEP-14) ------------------------------------------------------
+    def deploy(self, what: str, ctx: dict[str, Any]) -> bool:
+        """Run ``deploy``; once it succeeds, the post-deploy check (unless a CD workflow deploys)."""
+        if not run_deploy(self.sup, what):
+            st = self._st()
+            if st.pop("check_block", None):
+                self._save(st)  # a deploy that fails outright is a human's, as it always was
+            return False
+        if self.cfg.integrate.deploy and not self.cfg.integrate.cd_workflow:
+            self.start_check(ctx)
+        return not self.sup.state.has("DEPLOY_BLOCKED")
+
+    def start_check(self, ctx: dict[str, Any]) -> None:
+        """Something was deployed: run ``post_deploy_check`` now, and again later while it fails."""
+        if not self.cfg.integrate.post_deploy_check:
             return
         st = self._st()
-        st["watch"] = {"sha": sha, "what": what, "since": now(), "deploy": deploy_after}
+        st["post_check"] = {"ctx": ctx, "tries": 0, "next_at": self.clock()}
         self._save(st)
+        self.post_check()
+
+    def post_check(self) -> str:
+        """Run a due post-deploy check: "" (none waiting), "pending" (retrying), "passed" or "failed"."""
+        st = self._st()
+        pc = st.get("post_check")
+        if not pc:
+            return ""
+        if self.clock() < pc["next_at"]:
+            return "pending"
+        from .live import label as label_of
+        from .live import run_post_check, summary
+
+        ctx = pc["ctx"]
+        what = label_of(ctx)
+        rc, out = run_post_check(self.sup, ctx)
+        pc["tries"] += 1
+        if rc == 0:
+            st.pop("post_check")
+            self.sup.say(f"post-deploy check passed on {what}" + (f" (try {pc['tries']})" if pc["tries"] > 1 else ""))
+            if st.pop("check_block", None) and self.sup.state.has("DEPLOY_BLOCKED"):
+                self.sup.state.clear_flag("DEPLOY_BLOCKED")
+                self.sup.say("DEPLOY_BLOCKED cleared: the post-deploy check passes again; merging resumes")
+            self._save(st)
+            return "passed"
+        retries = self.cfg.integrate.post_deploy_retries
+        if pc["tries"] <= retries:
+            delay = self.cfg.integrate.post_deploy_delay
+            pc["next_at"] = self.clock() + delay
+            self._save(st)
+            self.sup.say(
+                f"post-deploy check on {what} exited {rc} (try {pc['tries']} of {retries + 1}): {summary(out)}; "
+                f"again in {delay} s"
+            )
+            return "pending"
+        st.pop("post_check")
+        self._check_failed(st, what, rc, out, pc["tries"])
+        self._save(st)
+        return "failed"
+
+    def _check_failed(self, st: dict[str, Any], what: str, rc: int, out: str, tries: int) -> None:
+        from .live import OUTPUT_KEPT, summary
+
+        self.sup.state.set_flag(
+            "DEPLOY_BLOCKED",
+            f"post-deploy check on {what} exited {rc} after {tries} tries; its last output:\n{out[-OUTPUT_KEPT:]}\n",
+        )
+        self.sup.say(f"post-deploy check FAILED on {what} (exit {rc}, {tries} tries): {summary(out)} -- merging and deploys stop")
+        n = None
+        if self.cfg.integrate.fix_forward:
+            old = (st.get("check_block") or {}).get("issue")
+            if old and self.sup.issue(int(old), fresh=True).state == OPEN and self.sup.state.get(int(old)).status != RELEASED:
+                n = int(old)  # still being worked: one issue, not one per failure
+                try:
+                    self.sup.forge.comment(
+                        n,
+                        f"**nohalt:** the post-deploy check failed again on {what} (exit {rc}):\n\n```\n{out[-OUTPUT_KEPT:].strip()}\n```",
+                    )
+                except ForgeError as e:
+                    self.sup.state.log(f"#{n}: could not comment the failed post-deploy check: {e}")
+            else:
+                n = open_check_failed(self.sup, what, rc, out, tries)
+        st["check_block"] = {"issue": n or 0, "what": what}
+
+    def _clear(self) -> bool:
+        """Nothing deployed is still being checked, and no deploy is blocked: the line may move."""
+        return not self.sup.state.has("DEPLOY_BLOCKED") and "post_check" not in self._st()
 
     def _pipeline(self, sha: str) -> str:
         """'success', 'failure', 'ci-failure', 'cancelled', 'pending' or 'none' (nothing runs on this commit).
@@ -275,8 +417,8 @@ class PipelineGate:
                     open_no_verdict(self.sup, w["what"], w["sha"], w["cancelled"])
                 self._save(st)
                 if w.get("deploy") and not self.cfg.integrate.cd_workflow:
-                    run_deploy(self.sup, f"{w['sha'][:7]} ({w['what']}, no verdict)")
-                return not self.sup.state.has("DEPLOY_BLOCKED")
+                    self.deploy(f"{w['sha'][:7]} ({w['what']}, no verdict)", _ctx(w))
+                return self._clear()
             self.sup.state.set_flag("BASE_NO_VERDICT", reason + "\n")
             self.sup.say(f"{reason}: no verdict -- merging held until a human looks")
             self._save(st)
@@ -310,11 +452,11 @@ class PipelineGate:
             if now() - w["since"] < self.cfg.integrate.base_pipeline_grace:
                 return False
             self.sup.say(f"no pipeline ran on {w['sha'][:7]} after {w['what']} within the grace; nothing to watch, carrying on")
-            if w.get("deploy") and not self.cfg.integrate.cd_workflow:
-                run_deploy(self.sup, f"{w['sha'][:7]} ({w['what']})")
             st.pop("watch")
             self._save(st)
-            return not self.sup.state.has("DEPLOY_BLOCKED")
+            if w.get("deploy") and not self.cfg.integrate.cd_workflow:
+                self.deploy(f"{w['sha'][:7]} ({w['what']})", _ctx(w))
+            return self._clear()
         elif result == "cancelled":
             return self._cancelled(st)
         elif result == "pending":
@@ -326,11 +468,13 @@ class PipelineGate:
         if result == "success":
             seen = ", ".join(f"{c.name} ✓" for c in self.counted) if self.counted else "workflow"
             self.sup.say(f"pipeline green on {w['sha'][:7]} after {w['what']} ({seen})")
-            if w.get("deploy") and not self.cfg.integrate.cd_workflow:
-                run_deploy(self.sup, f"{w['sha'][:7]} ({w['what']})")
             st.pop("watch")
             self._save(st)
-            return not self.sup.state.has("DEPLOY_BLOCKED")
+            if self.cfg.integrate.cd_workflow:
+                self.start_check(_ctx(w))  # a green CD workflow is the deploy
+            elif w.get("deploy"):
+                self.deploy(f"{w['sha'][:7]} ({w['what']})", _ctx(w))
+            return self._clear()
         bad = ", ".join(
             f"{c.name} {c.conclusion or c.status}" for c in self.counted if c.conclusion not in ("success", "skipped", "neutral")
         )
@@ -342,6 +486,11 @@ class PipelineGate:
                 st["fix_issue"] = n
         self._save(st)
         return False
+
+
+def _ctx(w: dict[str, Any]) -> dict[str, Any]:
+    """What a watched merge deployed, for the post-deploy check (older watches have no ``ctx``)."""
+    return {"what": w["what"], "sha": w["sha"], **(w.get("ctx") or {})}
 
 
 def _run_result(conclusion: str) -> str:

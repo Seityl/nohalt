@@ -27,6 +27,7 @@ READY = "ready"  # PR green (and approved, when reviewed), waiting for the integ
 DONE = "done"  # the forge says CLOSED (queued again if it is reopened)
 BLOCKED = "blocked"  # needs a human; carries the blocked label
 AWAITING_GREEN = "awaiting_green"  # async-red issue whose agent found nothing to change: the next green run closes it
+RELEASED = "released"  # merged, not yet live: closed once [integrate] live_version reports a version containing it
 
 ACTIVE = (RUNNING, WAITING_CI, IN_REVIEW, READY)
 
