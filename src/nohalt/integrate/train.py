@@ -35,7 +35,8 @@ from ..forge.base import GREEN, RED
 from ..state import READY
 from ..util import now
 from ..worktree import GitError, git
-from .common import PipelineGate, cancel_superseded, close_merged, is_network_failure, run_deploy
+from .common import PipelineGate, cancel_superseded, close_merged, is_network_failure
+from .live import LiveWatch
 from .mergers import effective, resolve
 from .refresh import REFRESHED, record_conflicts, refresh
 from .windows import Schedule, duration
@@ -59,6 +60,7 @@ class Train:
         self.t = sup.cfg.integrate.train
         self.tree = sup.cfg.worktree_root / "_release"
         self.gate = PipelineGate(sup)
+        self.live = LiveWatch(sup)
         self.schedule = Schedule(self.t.windows, self.t.timezone, self.t.days)
         self.clock = now  # tests move time by replacing it
 
@@ -69,6 +71,8 @@ class Train:
         self.sup.state.save("train.json", st)
 
     def tick(self) -> None:
+        if self.live.enabled:
+            self.live.tick()
         if self.cfg.integrate.cancel_superseded:
             cancel_superseded(self.sup)
         if not self.gate.open():
@@ -118,7 +122,12 @@ class Train:
         if version:
             self._tag(version)
         carried = rel.get("carried", [])
-        close_merged(self.sup, [int(c[0]) for c in carried], f"release {self.sup.pr(p.number)}")
+        issues = [int(c[0]) for c in carried]
+        sha = self.gate.merged(version or p.head_ref, deploy_after=False, ctx={"tag": version, "issues": issues})
+        if self.live.enabled and sha:
+            self.live.released(issues, sha, version, f"release {self.sup.pr(p.number)}")  # closed once live (DEP-15)
+        else:
+            close_merged(self.sup, issues, f"release {self.sup.pr(p.number)}")
         # The release merged each PR's branch, not the PR itself: close the PRs,
         # or every one of them stays open forever.
         for _issue, pr_number, _sha in carried:
@@ -126,7 +135,7 @@ class Train:
                 f.close_pull(int(pr_number), f"nohalt: merged into {version or p.head_ref} by release {self.sup.pr(p.number)}.")
             except ForgeError as e:
                 self.sup.say(f"could not close carried {self.sup.pr(int(pr_number))}: {e}")
-        run_deploy(self.sup, version or p.head_ref)
+        self.gate.deploy(version or p.head_ref, {"what": version or p.head_ref, "sha": sha, "tag": version, "issues": issues})
         if rel.get("kind") == "normal" and rel.get("window"):
             # A window's quota is spent by a merge: a batch that went red or was closed retries.
             used = st.setdefault("windows_used", {})
@@ -135,7 +144,6 @@ class Train:
                 used.pop(old)
         st["releases"].pop(p.head_ref, None)
         self._save(st)
-        self.gate.merged(version or p.head_ref, deploy_after=False)
 
     def _red(self, p: PullRequest) -> None:
         f = self.sup.forge

@@ -62,6 +62,8 @@ merge_method = "squash"
 # cd_workflow = "CD"
 # async_workflows = ["Tests"]  # slow suites: watched on the base, never waited for; one self-closing issue each
 # deploy = "./scripts/deploy.sh"
+# post_deploy_check = "./scripts/smoke.sh"   # after each deploy: the main pages answer; non-zero stops merging
+# live_version = "curl -fsS https://app.example.com/version"   # issues close once production runs their merge
 # refresh_conflicts = true   # merge the base into a PR whose conflicts the merge drivers settle, instead of handing it back
 
 [stack]

@@ -58,6 +58,7 @@ from .state import (
     IN_REVIEW,
     QUEUED,
     READY,
+    RELEASED,
     RUNNING,
     WAITING_CI,
     FileLock,
@@ -879,8 +880,8 @@ class Supervisor:
                 self.state.put(rec)
                 report.blocked.append(entry.issue)
                 continue
-            if rec.status in ACTIVE or rec.status in (EXITED, AWAITING_GREEN):
-                continue
+            if rec.status in ACTIVE or rec.status in (EXITED, AWAITING_GREEN, RELEASED):
+                continue  # RELEASED: merged, waiting to be live (integrate/live.py)
             if issue.has_label(*self.cfg.queue.held_labels):
                 report.waiting.append(f"#{entry.issue}(held)")
                 continue
