@@ -13,6 +13,7 @@ src/nohalt/
   budget.py        paid-API spend estimate and caps
   prompt.py        core prompt + stack addendum + project files + the issue's lane; strict placeholders
   verify.py        the verification lock (slot pool) and refused commands
+  upgrade.py       a new nohalt installed under the running supervisor: modules preloaded, re-exec once it settles
   forge/           the forge interface; GitHub (gh REST), GitLab (REST v4); a file-backed forge
   agents/          opencode, claude-code, any command
   stacks/          generic (shell hooks), frappe (site pool on a shared bench)
@@ -37,7 +38,7 @@ Every `tick` (default 60 s):
 4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed (or, with `early_start`, closed or with a PR green -- or approved -- on its current head; see below), and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback with a free slot does). An unpinned issue that has waited `overflow_after` for a slot overflows to the first `overflow_to` model with a free slot (outside `overflow_reserve`) that answers; the next launch is routed as usual. An unpinned issue whose model is down or whose pool is cooling down is diverted at once to the first fallback or overflow target that can start (`capacity: … → …`). A pinned issue, or one stopped by its model's usage limit, waits.
 5. **Budget.** Every few minutes, estimate paid-API spend and move issues over their cap to a fallback model.
 
-Before each tick the supervisor checks `nohalt.toml` and the `RESTART` flag. A valid change to the file, or a restart request, makes it release its lock and `exec` itself; the new process adopts the running agents like any restarted supervisor. An invalid file keeps the running configuration and raises `CONFIG_INVALID` (see [CONFIGURATION.md](CONFIGURATION.md#changing-it-while-nohalt-runs)).
+Before each tick the supervisor checks `nohalt.toml`, the `RESTART` flag and the nohalt package on disk. A valid change to the file, a restart request, or a newly installed nohalt that has settled and imports cleanly (LIV-14; every module was imported at start, so nothing mixes versions meanwhile), makes it release its lock and `exec` itself; the new process adopts the running agents like any restarted supervisor. An invalid file keeps the running configuration and raises `CONFIG_INVALID` (see [CONFIGURATION.md](CONFIGURATION.md#changing-it-while-nohalt-runs)).
 
 The supervisor holds an exclusive lock, so only one runs per state directory. A tick never blocks on long waits: watching a pipeline after a merge, or waiting for a usage limit to reset, is a state that later ticks re-examine.
 

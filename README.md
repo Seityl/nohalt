@@ -57,7 +57,7 @@ Keep it running without a terminal:
 
 Control while it runs: `nohalt restart` (now, with the config on disk; agents keep running), `nohalt stop` (a drain: launch nothing more, exit once no agent runs), `nohalt stop --now`, `nohalt pause [--for 2h]`, `nohalt resume` (undo `stop`/`pause`), `nohalt release-now` (train: one release outside the windows), `nohalt route <issue> <model>`, `nohalt unblock <issue>`, `nohalt queue --add 42 --after 41`, `nohalt prompt <issue>` (see exactly what an agent will be told).
 
-Edits to `nohalt.toml` apply on their own: the supervisor notices the change between ticks, re-executes itself and adopts its running agents. A file that does not parse or validate is reported in `nohalt status` (`CONFIG_INVALID`) and the last good configuration keeps running.
+Edits to `nohalt.toml` apply on their own: the supervisor notices the change between ticks, re-executes itself and adopts its running agents. A file that does not parse or validate is reported in `nohalt status` (`CONFIG_INVALID`) and the last good configuration keeps running. Upgrading works the same way: `pip install -U nohalt`, and the running supervisor re-executes on the new version within a tick (or run `nohalt restart`).
 
 ## Before you run it
 

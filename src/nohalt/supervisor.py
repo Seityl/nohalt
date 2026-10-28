@@ -44,6 +44,7 @@ from . import config as config_mod
 from . import early as early_mod
 from . import forge as forge_mod
 from . import prompt as prompt_mod
+from . import upgrade as upgrade_mod
 from .config import Config
 from .forge import CLOSED, MISSING, OPEN, UNKNOWN, Forge, ForgeError, Issue, PullRequest
 from .forge import verdict as ci_verdict
@@ -144,6 +145,7 @@ class Supervisor:
         from .integrate.async_watch import AsyncWatch
 
         self.async_watch = AsyncWatch(self)
+        self.upgrade = upgrade_mod.Watch()  # the nohalt package this process was loaded from
 
     # -- forge vocabulary ----------------------------------------------------------------------
     def pr(self, n: int) -> str:
@@ -218,6 +220,7 @@ class Supervisor:
 
         signal.signal(signal.SIGTERM, on_signal)
         signal.signal(signal.SIGINT, on_signal)
+        upgrade_mod.preload()  # no lazy import may read a newer nohalt mid-run (LIV-14)
         shims.install(self.state.bin_dir)
         (self.state.logs_dir / "guard.log").touch()  # exists, and stays empty while no agent oversteps
         self.state.clear_flag("CONFIG_INVALID")  # this configuration loaded and validated
@@ -312,16 +315,33 @@ class Supervisor:
         if self.state.has("RESTART"):
             self.state.clear_flag("RESTART")
             return "restart requested"
+        if self._upgraded():
+            return "nohalt upgraded on disk"
         if self.check_config():
             return f"{self.cfg.source} changed"
         return ""
 
     def _restart_pending(self) -> bool:
         """Cheap check between ticks: end the wait early for a restart or a changed config."""
-        if self.state.has("RESTART"):
+        if self.state.has("RESTART") or self.upgrade.settled():
             return True
         src = self.cfg.source
         return src is not None and config_mod.fingerprint(src) not in (self.cfg.source_hash, self._bad_config)
+
+    def _upgraded(self) -> bool:
+        """Is a new nohalt installed, settled and importable? Then re-execute on it (LIV-14).
+
+        One that does not import is reported once and the loaded code keeps running.
+        """
+        if not self.upgrade.settled():
+            return False
+        new = self.upgrade.installed()
+        why = self.upgrade.broken()
+        if why:
+            self.say(f"nohalt {new} on disk does not import ({why}); still running {self.upgrade.running}")
+            return False
+        self.say(f"nohalt on disk changed ({self.upgrade.running} -> {new})")
+        return True
 
     def reexec_argv(self, exit_when_done: bool = False) -> list[str]:
         argv = [sys.executable, "-m", "nohalt"]
