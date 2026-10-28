@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 from .. import queue
 from ..forge import ForgeError, verdict
 from ..forge.base import GREEN
-from ..state import READY
-from .common import PipelineGate, cancel_superseded, close_merged
+from ..state import READY, IssueRecord
+from .common import PipelineGate, approved, approved_first, cancel_superseded, close_merged
 from .live import LiveWatch
 from .refresh import before_hand_back
 
@@ -50,7 +50,15 @@ class Direct:
         ready = [r for r in ready if not self.sup.early.held(r.issue)]
         if not ready:
             return
-        ready.sort(key=lambda r: order.index(r.issue) if r.issue in order else len(order))
+        first = approved_first(self.sup)
+
+        def rank(r: IssueRecord) -> tuple[int, float, int]:
+            at = order.index(r.issue) if r.issue in order else len(order)
+            if first and approved(r, r.pr_sha):
+                return (0, r.review_approved_at, at)  # approved PRs first, in approval order (INT-17)
+            return (1, 0, at)
+
+        ready.sort(key=rank)
         rec = ready[0]
         f = self.sup.forge
         base = self.cfg.project.base_branch

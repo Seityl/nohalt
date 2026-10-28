@@ -12,6 +12,7 @@ from ..state import READY, RELEASED
 from ..util import now
 
 if TYPE_CHECKING:
+    from ..state import IssueRecord
     from ..supervisor import Supervisor
 
 
@@ -28,6 +29,16 @@ def run_deploy(sup: Supervisor, what: str) -> bool:
     if rc != 0:
         sup.state.set_flag("DEPLOY_BLOCKED", f"deploy of {what} exited {rc}\n")
     return rc == 0
+
+
+def approved_first(sup: Supervisor) -> bool:
+    """Approved PRs go first (INT-17): ``[integrate.train] approved_first``, and only with ``[review]``."""
+    return sup.cfg.review.enabled and sup.cfg.integrate.train.approved_first
+
+
+def approved(rec: IssueRecord, head: str) -> bool:
+    """The issue's PR is approved for ``head``, its current head."""
+    return bool(rec.review_approved) and rec.review_approved == head
 
 
 def open_fix_forward(sup: Supervisor, after: str, sha: str, verdict: str) -> int | None:

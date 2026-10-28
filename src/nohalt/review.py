@@ -433,7 +433,7 @@ class Reviews:
     def _approve(self, rec: IssueRecord, text: str) -> None:
         sup = self.sup
         rec.review_verdict, rec.review_text, rec.review_approved = APPROVE, text, rec.review_sha
-        rec.review_carried = ""
+        rec.review_carried, rec.review_approved_at = "", now()
         rec.status = READY
         rec.event(f"review approved {rec.review_sha[:8]} ({rec.review_model})")
         sup.state.put(rec)
