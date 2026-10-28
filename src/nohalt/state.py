@@ -24,7 +24,7 @@ RUNNING = "running"  # an agent process is alive
 WAITING_CI = "waiting_ci"  # agent finished with a PR whose checks have not settled
 IN_REVIEW = "in_review"  # PR green; a reviewer agent checks it against the issue before it is ready
 READY = "ready"  # PR green (and approved, when reviewed), waiting for the integrator
-DONE = "done"  # the forge says CLOSED
+DONE = "done"  # the forge says CLOSED (queued again if it is reopened)
 BLOCKED = "blocked"  # needs a human; carries the blocked label
 AWAITING_GREEN = "awaiting_green"  # async-red issue whose agent found nothing to change: the next green run closes it
 
@@ -57,6 +57,7 @@ class IssueRecord:
     fresh: bool = False  # force a new session even if one exists
     last_exit: str = ""
     blocked_reason: str = ""
+    done_at: float = 0.0  # when nohalt saw the issue closed; comments after it are handed over on a reopen
     labelled: bool = False  # the forge carries the blocked label we put there
     swept: list[str] = field(default_factory=list)  # PR head SHAs already handed back
     # The review gate (review.py). A reviewer runs beside the record's own agent slot.

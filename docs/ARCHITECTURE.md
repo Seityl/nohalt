@@ -58,6 +58,8 @@ The supervisor holds an exclusive lock, so only one runs per state directory. A 
                                          └─ any other issue: blocked ("agent says no change needed: <reason>")
 ```
 
+`done` is not the end if a human reopens the issue (AGT-20). Each tick, one listing of the forge's open issues updated since the last one finds done records whose issue is open again. Such a record goes back to `queued` with fresh counters and its history kept, and a fresh launch is told the issue was reopened, with the comments made since nohalt saw it closed. The branch is kept unless it was merged (its PR merged, or the branch is in the base); then a new `<branch>-reopened` is cut from the base.
+
 With `[review]`, a selected issue goes `waiting_ci ──green──► in_review ──approve──► ready`. A `changes` verdict hands it back to `queued` (resumed with the review) like a red CI, up to `max_rounds`, then `blocked`. A push after an approval sends it back to `waiting_ci`, and then to a new review.
 
 How an exit is judged, in order:

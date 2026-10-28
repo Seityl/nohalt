@@ -15,6 +15,8 @@ from importlib import resources
 from pathlib import Path
 
 from .config import Config
+from .forge import Comment
+from .util import stamp
 
 _VAR = re.compile(r"\{\{\s*([A-Z][A-Z0-9_]*)\s*\}\}")
 
@@ -126,3 +128,28 @@ def values(
     v.update(cfg.prompt.vars)
     v.update(extra or {})
     return v
+
+
+def reopen_note(comments: list[Comment], *, since_known: bool, branch: str, old_branch: str, base: str, limit: int = 20) -> str:
+    """What a relaunched agent is told about an issue that was closed and reopened on the forge."""
+    lines = [
+        "This issue was closed, and has since been reopened on the forge: the work done for it is not complete. "
+        "Read the issue and the comments below, work out what is still missing, and finish it. "
+        "A merged PR did not finish it; a PR of yours still open for it is where to continue."
+    ]
+    if old_branch and old_branch != branch:
+        lines.append(f"The earlier branch `{old_branch}` was merged; you are on a fresh branch `{branch}`, cut from `{base}`.")
+    elif branch:
+        lines.append(f"You are on the earlier branch `{branch}`: check what is on it, and merge `{base}` first.")
+    head = "Comments since it was closed" if since_known else "Comments on the issue (when it was closed was not recorded)"
+    shown = comments[-limit:]
+    lines.append(f"\n### {head}")
+    if len(comments) > len(shown):
+        lines.append(f"({len(comments) - len(shown)} earlier comment(s) left out; read the issue for them.)")
+    if not shown:
+        lines.append("(none -- read the issue again for what is missing)")
+    for c in shown:
+        when = f" at {stamp(c.at)}" if c.at else ""
+        body = c.body if len(c.body) <= 4000 else c.body[:4000] + "\n[... cut; read the issue for the rest]"
+        lines.append(f"\n--- {c.author}{when}\n{body}")
+    return "\n".join(lines)

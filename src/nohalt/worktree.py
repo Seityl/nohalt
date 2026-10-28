@@ -9,6 +9,7 @@ behind is preserved, not cleaned: uncommitted changes are committed to a
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -82,6 +83,28 @@ class Worktrees:
         git(tree, "config", "push.default", "current", check=False)
         self._link_shared(tree)
         return tree
+
+    def merged(self, branch: str) -> bool:
+        """Is everything on ``branch`` already in the base? (A merge commit or a fast-forward;
+        a squash merge leaves no trace here -- ask the forge about the PR for that.)"""
+        git(self.repo, "fetch", "-q", self.remote, check=False)
+        for ref in (f"refs/heads/{branch}", f"refs/remotes/{self.remote}/{branch}"):
+            if self._has_ref(ref):
+                cp = run(["git", "-C", str(self.repo), "merge-base", "--is-ancestor", ref, f"{self.remote}/{self.base}"])
+                return cp.returncode == 0
+        return False
+
+    def next_branch(self, branch: str) -> str:
+        """A new branch name beside ``branch`` that no local or remote ref uses:
+        ``<branch>-reopened``, then ``-reopened-2``, ... It keeps the ``<prefix>/<issue>-``
+        shape, so the issue's PR is still found by its branch name."""
+        stem = re.sub(r"-reopened(?:-\d+)?$", "", branch)
+        k = 1
+        while True:
+            name = f"{stem}-reopened" + (f"-{k}" if k > 1 else "")
+            if not self._has_ref(f"refs/heads/{name}") and not self._has_ref(f"refs/remotes/{self.remote}/{name}"):
+                return name
+            k += 1
 
     def _link_shared(self, tree: Path) -> None:
         for rel in self.cfg.project.shared_paths:

@@ -42,7 +42,7 @@ from . import config as config_mod
 from . import forge as forge_mod
 from . import prompt as prompt_mod
 from .config import Config
-from .forge import CLOSED, MISSING, UNKNOWN, Forge, ForgeError, Issue, PullRequest
+from .forge import CLOSED, MISSING, OPEN, UNKNOWN, Forge, ForgeError, Issue, PullRequest
 from .forge import verdict as ci_verdict
 from .models import Router
 from .review import Reviews
@@ -730,6 +730,7 @@ class Supervisor:
             self._kill(rec, "done", "the issue is closed")
         rec.status = DONE
         rec.pid = 0
+        rec.done_at = now()
         rec.event(how)
         self.state.put(rec)
         report.finished.append(rec.issue)
@@ -795,15 +796,17 @@ class Supervisor:
         for p, n in self.reviews.in_use().items():
             in_use[p] = in_use.get(p, 0) + n
 
+        reopened = self._reopened([records[e.issue] for e in entries if e.issue in records and records[e.issue].status == DONE])
         open_count = 0
         for entry in entries:
             rec = records.get(entry.issue) or IssueRecord(issue=entry.issue)
-            if rec.status == DONE:
+            if rec.status == DONE and not (entry.issue in reopened and self._reopen(rec)):
                 continue
             issue = self.issue(entry.issue)
             if issue.state == MISSING:
                 if rec.status != DONE and not self.dry_run:
                     rec.status = DONE
+                    rec.done_at = now()
                     rec.event("does not exist on the forge; dropped")
                     self.state.put(rec)
                     self.say(f"#{entry.issue} does not exist -- dropped from the queue")
@@ -911,6 +914,98 @@ class Supervisor:
             in_use[p2] = in_use.get(p2, 0) + 1
         report.open_ = open_count
         report.complete = open_count == 0 and not any(r.status in ACTIVE for r in self.state.all())
+
+    # -- reopened issues (AGT-20) ----------------------------------------------------------------------------
+    def _reopened(self, done: list[IssueRecord]) -> set[int]:
+        """The queued issues recorded done that the forge lists as open again.
+
+        One listing per tick, of open issues updated since the last listing
+        (API-05): a reopen updates the issue. The first listing reaches back to
+        the oldest done record (or lists every open issue, for records written
+        before ``done_at`` existed). A failed listing is no answer (API-02).
+        Candidates stay pending until ``_reopen`` settles them: the next listing
+        starts after their reopen, so dropping one would lose it.
+        """
+        if not done or self.dry_run:
+            return set()
+        saved = self.state.load("reopen.json", {})
+        ids = {r.issue for r in done}
+        pending = set(saved.get("pending", [])) & ids
+        since = saved.get("since")
+        if since is None:
+            since = min(r.done_at for r in done)
+        started = now()
+        try:
+            listed = self.forge.open_issues(since)
+        except ForgeError as e:
+            self.state.log(f"cannot list open issues: {e}")
+            return pending
+        pending |= listed & ids
+        # Overlap the next listing a little: the forge's clock is not ours.
+        self.state.save("reopen.json", {"since": max(0.0, started - 300), "pending": sorted(pending)})
+        return pending
+
+    def _settled(self, issue: int) -> None:
+        saved = self.state.load("reopen.json", {})
+        if issue in saved.get("pending", []):
+            saved["pending"] = [n for n in saved["pending"] if n != issue]
+            self.state.save("reopen.json", saved)
+
+    def _reopen(self, rec: IssueRecord) -> bool:
+        """A done issue is open on the forge again: it is new work. Queue it again.
+
+        The attempt counters start over; the history stays. The branch is kept
+        unless it was merged -- then a fresh one is cut from the base, beside it.
+        Anything the forge cannot answer leaves the record done until a later tick.
+        """
+        issue = self.issue(rec.issue, fresh=True)
+        if issue.state != OPEN:
+            if issue.state != UNKNOWN:
+                self._settled(rec.issue)  # closed again (or gone) before nohalt got to it
+            return False
+        merged = False
+        if rec.pr:
+            try:
+                merged = self.forge.pull(rec.pr).merged
+            except ForgeError as e:
+                self.state.log(f"#{rec.issue}: reopened, but {self.pr(rec.pr)} cannot be read yet ({e})")
+                return False
+        try:
+            if not merged and rec.branch:
+                merged = self.trees.merged(rec.branch)
+            comments = self.forge.comments_since(rec.issue, rec.done_at)
+        except (ForgeError, GitError) as e:
+            self.state.log(f"#{rec.issue}: reopened, but not queued yet ({e})")
+            return False
+        old = rec.branch
+        if merged and old:
+            if (self.trees.path(rec.issue) / ".git").exists():
+                rescued = self.trees.remove(rec.issue)  # a tree left on the merged branch
+                if rescued:
+                    self.say(f"#{rec.issue}: uncommitted work kept on branch {rescued}")
+            rec.branch, rec.worktree = self.trees.next_branch(old), ""
+        rec.attempts = rec.provider_retries = rec.launch_failures = rec.timeouts = rec.ci_rounds = rec.revivals = 0
+        rec.review_rounds = rec.review_failures = rec.review_retries = 0
+        rec.review_verdict = rec.review_text = rec.review_approved = rec.review_sha = rec.review_exit = ""
+        rec.review_not_before = 0
+        # Not the old PR: the agent is launched, and finds (and continues) a PR still open on its branch.
+        rec.pr, rec.pr_sha, rec.pid = 0, "", 0
+        rec.blocked_reason, rec.labelled, rec.stalled_since, rec.overflow = "", False, 0, ""
+        rec.status, rec.not_before, rec.last_exit = QUEUED, 0, ""
+        rec.resume, rec.fresh = False, True
+        rec.note = prompt_mod.reopen_note(
+            comments, since_known=bool(rec.done_at), branch=rec.branch, old_branch=old, base=self.cfg.project.base_branch
+        )
+        rec.event(
+            "reopened on the forge -- queued again"
+            + (f"; {old} was merged, new branch {rec.branch}" if rec.branch != old else "")
+        )
+        self.state.put(rec)
+        self._settled(rec.issue)
+        self.say(f"#{rec.issue}: reopened on the forge -- queued again")
+        if rec.branch != old:
+            self.say(f"#{rec.issue}: {old} was merged; a fresh branch {rec.branch} is cut from {self.cfg.project.base_branch}")
+        return True
 
     def _agent(self, model: str) -> agents.Agent | None:
         if not model:

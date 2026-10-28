@@ -13,11 +13,11 @@ import json
 import os
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..util import run
-from .base import CLOSED, MISSING, OPEN, Check, ForgeError, Issue, PullRequest, Run
+from .base import CLOSED, MISSING, OPEN, Check, Comment, ForgeError, Issue, PullRequest, Run
 
 
 class GitHub:
@@ -119,6 +119,21 @@ class GitHub:
         for c in comments:
             parts += ["", f"--- comment by {(c.get('user') or {}).get('login', '?')}", c.get("body") or ""]
         return "\n".join(parts)
+
+    def open_issues(self, since: float) -> set[int]:
+        # One listing, not one call per done issue (API-05). A reopen updates the
+        # issue, so `since` (GitHub's updated-at filter) keeps the listing short.
+        q = "issues?state=open&per_page=100" + (f"&since={_iso(since)}" if since else "")
+        rows = self._api(self._r(q), paginate=True, items=".[] | {number, pr: (.pull_request != null)}")
+        return {int(r["number"]) for r in rows if not r.get("pr")}
+
+    def comments_since(self, number: int, since: float) -> list[Comment]:
+        q = f"issues/{number}/comments?per_page=100" + (f"&since={_iso(since)}" if since else "")
+        rows = self._api(self._r(q), paginate=True, items=".[]")
+        out = [
+            Comment((c.get("user") or {}).get("login", "?"), c.get("body") or "", _ts(c.get("created_at") or "")) for c in rows
+        ]
+        return [c for c in out if c.at >= since]  # `since` filters on updated-at: an old comment edited later is not new
 
     # -- pull requests --------------------------------------------------------------------
     @staticmethod
@@ -260,3 +275,14 @@ class GitHub:
     def branch_sha(self, branch: str) -> str:
         d = self._api(self._r(f"branches/{branch}"), ok_404=True)
         return (d or {}).get("commit", {}).get("sha", "")
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ts(iso: str) -> float:
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
