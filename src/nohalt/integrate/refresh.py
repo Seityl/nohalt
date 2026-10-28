@@ -21,6 +21,16 @@ file with its merge driver, re-run the regenerate command, commit, push.
 Refreshes are counted in ``refresh.json``, apart from hand-back rounds. Files
 left in conflict at a hand-back are kept in ``conflicts.json`` for
 ``nohalt doctor``.
+
+A refresh and the review gate must not chase each other (#69): every release
+moved every conflicting PR's head, and every moved head restarted its review.
+
+* A PR in review is never refreshed: it waits for the verdict, like a running
+  agent. In ``train`` mode a green PR whose conflicts the drivers settle is not
+  refreshed at all (``left_to_batch``): the batch settles them the same way.
+* An approval carries over a refresh that changed, apart from what came from
+  the base verbatim, only paths a merge driver owns or ``after_version``
+  outputs (``_carry``). CI still has to be green on the new head.
 """
 
 from __future__ import annotations
@@ -31,8 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..forge import PullRequest
-from ..state import RUNNING, WAITING_CI, IssueRecord, StateStore
+from ..forge import ForgeError, PullRequest
+from ..state import IN_REVIEW, RUNNING, WAITING_CI, IssueRecord, StateStore
 from ..util import now, run
 from ..worktree import GitError, git
 from .mergers import driver_for, effective, resolve
@@ -45,9 +55,14 @@ REFRESHED = "refreshed"  # pushed: the PR goes through CI again, no hand-back
 DEFERRED = "deferred"  # not now (its agent is running, the branch moved): ask again next tick
 CONFLICT = "conflict"  # files no driver settles: hand back
 FAILED = "failed"  # anything else (disabled, not our branch, push refused): hand back
+SETTLES = "settles"  # a dry run: the drivers settle every conflict; nothing was pushed
 
 IDENT = ["-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost"]
 HISTORY_DAYS = 14
+FETCH_EVERY = 30  # seconds between fetches for dry runs: one per tick, not one per PR
+
+_settles: dict[tuple[str, str, str], bool] = {}  # (refresh tree, PR head, base) -> the drivers settle their merge
+_fetched: dict[str, float] = {}  # refresh tree -> when dry runs last fetched it
 
 
 @dataclass
@@ -71,19 +86,24 @@ def _git(tree: Path, *args: str, timeout: int = 300) -> subprocess.CompletedProc
     )
 
 
-def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool = False) -> Outcome:
+def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool = False, dry: bool = False) -> Outcome:
     """Merge the base into ``pr``'s branch if the merge drivers settle every conflict.
 
     ``clean``: a merge without conflicts is pushed too (an early dependant moving
     onto the real base once its dependencies merged, SCH-10). Otherwise there is
     nothing a refresh can fix in it.
+    ``dry``: only find out whether the drivers settle the merge (``SETTLES``);
+    nothing is committed or pushed, whatever the issue is doing.
     """
     cfg = sup.cfg
     base, remote = cfg.project.base_branch, cfg.project.remote
     if not cfg.integrate.refresh_conflicts or cfg.integrate.mode == "none":
         return Outcome(FAILED, "refresh_conflicts is off")
-    if rec.status == RUNNING:
+    if rec.status == RUNNING and not dry:
         return Outcome(DEFERRED, "its agent is running")
+    if rec.status == IN_REVIEW and not dry:
+        # A new head would stop the reviewer and start the review again (#69). After the verdict.
+        return Outcome(DEFERRED, "it is in review")
     branch = pr.head_ref
     if (
         not branch
@@ -95,7 +115,9 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
     tree = cfg.worktree_root / "_refresh"
     try:
         _ensure_tree(cfg, tree)
-        git(tree, "fetch", "-q", remote)
+        if not dry or now() - _fetched.get(str(tree), 0) >= FETCH_EVERY:
+            git(tree, "fetch", "-q", remote)
+            _fetched[str(tree)] = now()
         _git(tree, "merge", "--abort")
         git(tree, "reset", "-q", "--hard")
         git(tree, "clean", "-qfd")
@@ -105,6 +127,8 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
             return Outcome(FAILED, f"{remote}/{branch} not found (a fork?)")
         if head != pr.head_sha:
             return Outcome(DEFERRED, f"{branch} moved to {head[:8]} since the forge was asked")
+        if dry and (str(tree), head, base_sha) in _settles:
+            return Outcome(SETTLES if _settles[(str(tree), head, base_sha)] else CONFLICT, "cached")
         if _git(tree, "merge-base", "--is-ancestor", base_sha, head).returncode == 0:
             return Outcome(FAILED, f"{branch} already contains {base}: nothing to refresh")
         git(tree, "checkout", "-q", "--detach", base_sha)
@@ -119,14 +143,20 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
         left = resolve(tree, conflicted, effective(cfg.integrate.mergers, cfg.integrate.train.version_files))
         if left:
             _git(tree, "merge", "--abort")
+            if dry:
+                _remember(tree, head, base_sha, False)
             return Outcome(CONFLICT, "conflicts no merge driver settles", files=left)
         settled = conflicted
-    elif clean:
+    elif clean or dry:
         settled = []
     else:
         # git merged it cleanly, so the forge's conflict is nothing a refresh can fix.
         _git(tree, "merge", "--abort")
         return Outcome(FAILED, f"{branch} merges {base} cleanly here")
+    if dry:
+        _git(tree, "merge", "--abort")
+        _remember(tree, head, base_sha, True)
+        return Outcome(SETTLES, files=settled)
 
     try:
         snapshot = git(tree, "write-tree")
@@ -139,6 +169,7 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
         _git(tree, "merge", "--abort")
         return Outcome(FAILED, f"cannot commit the merge: {e}")
     regen = cfg.integrate.train.after_version
+    outputs: list[str] = []
     if regen:
         cp = run(["bash", "-c", regen], cwd=tree, timeout=1800)
         if cp.returncode != 0:
@@ -163,8 +194,78 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
     rec.pr_sha = new
     rec.status = WAITING_CI
     rec.event(f"{sup.pr(pr.number)} refreshed: merged {base} ({', '.join(settled) or 'cleanly'}) as {new[:8]}")
+    if rec.review_approved and rec.review_approved == head:
+        _carry(sup, rec, pr, tree, head, base_sha, new, outputs)
     sup.state.put(rec)
     return Outcome(REFRESHED, sha=new, files=settled)
+
+
+def left_to_batch(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> bool:
+    """Train mode: the batch settles ``pr``'s conflicts with the same drivers, so it is not refreshed.
+
+    A refresh would only move the head -- a new CI run, and a new review -- for
+    nothing the release branch needs (#69). Only when the drivers cannot settle
+    the merge is it refreshed (it then fails) and handed back as before.
+    """
+    if sup.cfg.integrate.mode != "train":
+        return False
+    out = refresh(sup, rec, pr, dry=True)
+    if out.status == SETTLES and out.why != "cached":
+        sup.state.log(
+            f"#{rec.issue}: {sup.pr(pr.number)} conflicts with {sup.cfg.project.base_branch} only in "
+            f"{', '.join(out.files) or 'nothing git cannot merge'}; left to the release batch, not refreshed"
+        )
+    return out.status == SETTLES
+
+
+def _carry(
+    sup: Supervisor, rec: IssueRecord, pr: PullRequest, tree: Path, old: str, base_sha: str, new: str, outputs: list[str]
+) -> None:
+    """Move the approval of ``old`` to ``new`` if the refresh changed nothing a reviewer has to see.
+
+    A path counts as changed only if ``new`` differs from both the approved head
+    and the base: what came from the base verbatim was merged and released
+    already, and the release branch would merge it in just the same. Such a path
+    must be owned by a merge driver (configured or implicit, not ``fail``) or be
+    an ``after_version`` output. Anything else -- and any commit nohalt did not
+    make -- needs a new review. CI is not carried: the new head runs it.
+    """
+    mergers = effective(sup.cfg.integrate.mergers, sup.cfg.integrate.train.version_files)
+    try:
+        touched = set(_diff(tree, old, new)) & set(_diff(tree, base_sha, new))
+        other = sorted(p for p in touched if p not in outputs and driver_for(mergers, p) in (None, "fail"))
+    except GitError as e:
+        touched, other = set(), [f"(unknown: {e})"]  # no diff, no carry
+    if other:
+        rec.event(f"approval of {old[:8]} not carried to {new[:8]}: the refresh changed {', '.join(other[:5])}")
+        sup.say(f"#{rec.issue}: the refresh changed {', '.join(other[:5])} -- {sup.pr(pr.number)} needs a new review")
+        return
+    rec.review_approved, rec.review_carried = new, old
+    what = ", ".join(sorted(touched)) or "nothing of its own"
+    rec.event(f"approval of {old[:8]} carried to {new[:8]} (the refresh changed {what})")
+    sup.say(f"#{rec.issue}: approval carried over the nohalt refresh to {new[:8]}; CI must be green again")
+    try:
+        sup.forge.comment_pull(
+            pr.number,
+            f"**nohalt:** the approval of `{old[:12]}` carries to `{new[:12]}`: this refresh merged "
+            f"`{sup.cfg.project.base_branch}` and changed only paths a merge driver settles or `after_version` "
+            f"regenerates ({what}). CI must still be green on the new head.",
+        )
+    except ForgeError as e:
+        sup.state.log(f"#{rec.issue}: could not comment the carried approval on {sup.pr(pr.number)}: {e}")
+
+
+def _diff(tree: Path, a: str, b: str) -> list[str]:
+    cp = _git(tree, "diff", "--no-renames", "--name-only", "-z", a, b)
+    if cp.returncode != 0:
+        raise GitError(f"git diff {a[:8]} {b[:8]}: {cp.stderr.strip()[:200]}")
+    return [p for p in cp.stdout.split("\0") if p]
+
+
+def _remember(tree: Path, head: str, base_sha: str, settles: bool) -> None:
+    if len(_settles) > 1000:
+        _settles.clear()
+    _settles[(str(tree), head, base_sha)] = settles
 
 
 def before_hand_back(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> bool:

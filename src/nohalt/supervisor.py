@@ -658,19 +658,20 @@ class Supervisor:
             if pr.mergeable is False:
                 if pr.head_sha in rec.swept:
                     return
-                from .integrate.refresh import before_hand_back
+                if not self._conflict_left_to_batch(rec, pr, v):
+                    from .integrate.refresh import before_hand_back
 
-                if before_hand_back(self, rec, pr):
-                    return  # bookkeeping only: nohalt merged the base itself (INT-12)
-                return self._hand_back(
-                    rec,
-                    pr,
-                    "conflicts with the base branch",
-                    f"Your {self.pr_long(pr.number)} conflicts with "
-                    f"`{self.cfg.project.base_branch}`. Fetch and merge "
-                    f"`origin/{self.cfg.project.base_branch}` into your branch, keeping both "
-                    "sides' behaviour, re-run the tests you touched, push, and stop.",
-                )
+                    if before_hand_back(self, rec, pr):
+                        return  # bookkeeping only: nohalt merged the base itself (INT-12)
+                    return self._hand_back(
+                        rec,
+                        pr,
+                        "conflicts with the base branch",
+                        f"Your {self.pr_long(pr.number)} conflicts with "
+                        f"`{self.cfg.project.base_branch}`. Fetch and merge "
+                        f"`origin/{self.cfg.project.base_branch}` into your branch, keeping both "
+                        "sides' behaviour, re-run the tests you touched, push, and stop.",
+                    )
         if v == forge_mod.base.GREEN and pr.draft:
             # The prompt asks agents to open a draft early. The agent has finished
             # and the checks are green: the draft has done its job, and forges
@@ -683,6 +684,15 @@ class Supervisor:
             self.say(f"#{rec.issue}: {self.pr(pr.number)} was a draft; marked ready (green, agent finished)")
         if v == forge_mod.base.GREEN:
             self.reviews.gate(rec, pr)  # ready, or in review when the issue needs one
+
+    def _conflict_left_to_batch(self, rec: IssueRecord, pr: PullRequest, v: str) -> bool:
+        """Train: a green PR whose conflicts the drivers settle goes on to the batch unrefreshed (#69).
+
+        Not green (a conflicted PR may get no CI at all): the refresh is what lets CI run.
+        """
+        from .integrate.refresh import left_to_batch
+
+        return v == forge_mod.base.GREEN and left_to_batch(self, rec, pr)
 
     def _hand_back(self, rec: IssueRecord, pr: PullRequest, why: str, note: str) -> None:
         rec.swept.append(pr.head_sha)
