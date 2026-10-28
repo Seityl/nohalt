@@ -19,6 +19,7 @@ class Issue:
     state: str  # OPEN | CLOSED | MISSING | UNKNOWN
     title: str = ""
     labels: list[str] = field(default_factory=list)
+    body: str = ""  # the description, without comments (prompt lanes select on it)
 
     def has_label(self, *names: str) -> bool:
         low = {lab.lower() for lab in self.labels}

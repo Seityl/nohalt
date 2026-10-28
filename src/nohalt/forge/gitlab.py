@@ -142,7 +142,13 @@ class GitLab:
         d = self._get(self._p(f"issues/{number}"), ok_404=True)
         if d is None:
             return Issue(number, MISSING)
-        return Issue(number, OPEN if d.get("state") == "opened" else CLOSED, d.get("title") or "", list(d.get("labels") or []))
+        return Issue(
+            number,
+            OPEN if d.get("state") == "opened" else CLOSED,
+            d.get("title") or "",
+            list(d.get("labels") or []),
+            body=d.get("description") or "",
+        )
 
     def add_label(self, number: int, label: str) -> None:
         self._request("PUT", self._p(f"issues/{number}"), {"add_labels": label})

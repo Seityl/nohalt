@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from . import agents
 from . import prompt as prompt_mod
+from .config import Config
 from .forge import ForgeError, Issue, PullRequest
 from .state import BLOCKED, DONE, IN_REVIEW, READY, RUNNING, IssueRecord
 from .util import kill_tree, mem_available_mb, now, pid_alive, tail
@@ -56,6 +57,24 @@ def parse_verdict(text: str) -> tuple[str, str]:
     return found[-1].group(1).lower(), text.strip()
 
 
+def reviewer_models(cfg: Config, author: str = "") -> list[str]:
+    """Reviewer models to try, in order, for a PR written on ``author``.
+
+    ``[review] models`` maps the author's model (the longest matching prefix) to its reviewer, then
+    come ``model`` (default: ``[models] default``) and ``fallbacks``. With ``distinct``, the author's
+    own model is never among them: an empty list means nothing may review this author's work."""
+    r = cfg.review
+    mapped = ""
+    if author:
+        prefix = max((p for p in r.models if author.startswith(p)), key=len, default=None)
+        mapped = r.models[prefix] if prefix is not None else ""
+    out: list[str] = []
+    for m in (mapped, r.model or cfg.models.default, *r.fallbacks):
+        if m and m not in out and not (r.distinct and author and m == author):
+            out.append(m)
+    return out
+
+
 class Reviews:
     def __init__(self, sup: Supervisor):
         self.sup = sup
@@ -73,10 +92,8 @@ class Reviews:
             return True
         return bool(r.title and re.search(r.title, issue.title or "", re.I))
 
-    def models(self) -> list[str]:
-        r = self.cfg.review
-        first = r.model or self.cfg.models.default
-        return [first, *(m for m in r.fallbacks if m != first)]
+    def models(self, author: str = "") -> list[str]:
+        return reviewer_models(self.cfg, author)
 
     # -- the gate, called by the supervisor when a PR is green --------------------------------------------
     def gate(self, rec: IssueRecord, pr: PullRequest) -> None:
@@ -152,8 +169,8 @@ class Reviews:
                 in_use[p] = in_use.get(p, 0) + 1
         return sup._has_slot(model, in_use)
 
-    def _choose(self) -> str | None:
-        for m in self.models():
+    def _choose(self, models: list[str]) -> str | None:
+        for m in models:
             if self._slots_free(m) and self.sup.router.prober.answers(m):
                 return m
         return None
@@ -164,7 +181,14 @@ class Reviews:
         if free is not None and free < self.cfg.agents.min_free_mb:
             sup.state.log(f"#{rec.issue} review waiting: {free} MB available, need {self.cfg.agents.min_free_mb}")
             return
-        model = self._choose()
+        models = self.models(rec.model)
+        if not models:
+            return sup._block(
+                rec,
+                f"review: no reviewer model differs from the author's ({rec.model}); add one to [review] models or "
+                "fallbacks, or set [review] distinct = false",
+            )
+        model = self._choose(models)
         if not model:
             sup.state.log(f"#{rec.issue} review waiting: no reviewer model has a free slot and answers")
             return
@@ -181,7 +205,8 @@ class Reviews:
 
     def render_prompt(self, rec: IssueRecord, issue: Issue, tree: Path) -> str:
         sup = self.sup
-        text = prompt_mod.review_template(self.cfg, sup.stack.prompt_addendum)
+        lane = prompt_mod.find_lane(self.cfg, rec.lane)
+        text = prompt_mod.review_template(self.cfg, sup.stack.prompt_addendum, lane)
         slug = self.cfg.project.repo
         if self.cfg.project.forge == "gitlab":
             pr_view = f"glab mr view {rec.pr} --repo {slug} --comments"
@@ -194,7 +219,9 @@ class Reviews:
             "HEAD": rec.pr_sha,
             "REVIEW_FILE": str(self.review_file(rec.issue)),
         }
-        values = prompt_mod.values(self.cfg, issue=issue.number, title=issue.title, branch=rec.branch, worktree=tree, extra=extra)
+        values = prompt_mod.values(
+            self.cfg, issue=issue.number, title=issue.title, branch=rec.branch, worktree=tree, extra=extra, lane=lane
+        )
         body = prompt_mod.render(text, values)
         try:
             body += f"\n## The issue, as it read when you were launched\n\n{sup.forge.issue_text(issue.number)}\n"
@@ -214,6 +241,7 @@ class Reviews:
         issue = sup.issue(rec.issue)
         name, mid = agents.split_model(model)
         agent = agents.get(name, self.cfg.agents.options.get(name))
+        sup.settle_lane(rec, issue)  # an adopted PR's issue never launched: choose its lane now
         tree = sup.trees.prepare_review(rec.issue, rec.pr_sha, rec.branch)
         out_file = self.review_file(rec.issue)
         out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -256,7 +284,7 @@ class Reviews:
         sup.state.save("pids.json", pids)
         rec.review_pid, rec.review_model, rec.review_started = proc.pid, model, now()
         rec.review_sha, rec.review_exit = rec.pr_sha, ""
-        rec.event(f"reviewer launched on {model} for {rec.pr_sha[:8]}")
+        rec.event(f"reviewer launched on {model} for {rec.pr_sha[:8]}" + (f" (author {rec.model})" if rec.model else ""))
         sup.state.put(rec)
         sup.say(f"#{rec.issue}: reviewer launched on {model} for {sup.pr(rec.pr)} at {rec.pr_sha[:8]}")
 
@@ -379,6 +407,8 @@ class Reviews:
     def _post(self, rec: IssueRecord, verdict: str, text: str) -> None:
         sup = self.sup
         head = f"**nohalt review: {verdict}** -- reviewer `{rec.review_model}` on `{rec.review_sha[:12]}`"
+        if rec.model:
+            head += f", author `{rec.model}`"
         if verdict == CHANGES:
             head += f" (round {rec.review_rounds}/{self.cfg.review.max_rounds})"
         body = f"{head}\n\n{text}"

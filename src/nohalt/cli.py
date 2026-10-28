@@ -359,6 +359,10 @@ def render_status(cfg: Config) -> str:
         lines.append("")
         lines.append("^ overflowed (not pinned; the next launch is routed as usual):")
         lines.extend(f"  #{r.issue}: {r.overflow}" for r in overflows)
+    lanes = [r for r in recs if r.lane]
+    if lanes:
+        lines.append("")
+        lines.append("lanes: " + "  ".join(f"#{r.issue} {r.lane}" for r in lanes[:30]))
     reviewed = [r for r in recs if r.review_verdict]
     if reviewed:
         lines.append("")
@@ -434,13 +438,23 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
 
 def cmd_prompt(args: argparse.Namespace) -> int:
+    from . import prompt as prompt_mod
     from .state import IssueRecord
 
     cfg = _cfg(args)
     sup = _sup(cfg, quiet=True)
     issue = sup.issue(args.issue, fresh=True)
     branch = sup.trees.branch_for(issue.number, issue.title, issue.labels)
-    print(sup.render_prompt(IssueRecord(issue=args.issue), issue, branch, sup.trees.path(args.issue)))
+    # The lane the next launch would use: the record's, unless the lanes changed since it was chosen.
+    # Nothing is saved: this only shows.
+    rec = sup.state.get(args.issue) if sup.state.exists(args.issue) else IssueRecord(issue=args.issue)
+    kept = rec.lane_digest == prompt_mod.lanes_digest(cfg)
+    if not kept:
+        lane = prompt_mod.select_lane(cfg, issue)
+        rec.lane = lane.name if lane else ""
+    how = "kept on the issue record" if kept else "would be chosen at the next launch"
+    print(f"# lane: {rec.lane or '(none)'} -- {how}", file=sys.stderr)
+    print(sup.render_prompt(IssueRecord(issue=args.issue, lane=rec.lane), issue, branch, sup.trees.path(args.issue)))
     return 0
 
 
@@ -497,6 +511,22 @@ def _doctor_check_drift(cfg: Config, check: Callable[..., None]) -> None:
         "every check CI runs is required or ignored",
         f"check(s) CI runs that count for nothing -- red would go unnoticed (add to required_checks or ignore_checks): "
         f"{', '.join(uncounted)}",
+        fatal=False,
+    )
+
+
+def _doctor_review_authors(cfg: Config, check: Callable[..., None]) -> None:
+    """With ``[review] distinct``, an author model no reviewer differs from is never reviewed (its issues block)."""
+    from .review import reviewer_models
+
+    m = cfg.models
+    authors = sorted({m.default, *m.fallbacks, *m.overflow_to, *(r.model for r in m.route)})
+    alone = [a for a in authors if not reviewer_models(cfg, a)]
+    check(
+        not alone,
+        "every author model has a reviewer on another model",
+        f"[review] distinct: nothing may review work written on {', '.join(alone)} (the only reviewer is the same "
+        "model); add [review] models or fallbacks, or set distinct = false",
         fatal=False,
     )
 
@@ -610,6 +640,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             check(shutil.which(binary) is not None, f"{m}: {binary} found", f"{m}: {binary} not on PATH")
         except ValueError as e:
             check(False, "", f"{m}: {e}")
+    if cfg.review.enabled and cfg.review.distinct:
+        _doctor_review_authors(cfg, check)
     if args.probe:
         from .models import Prober
 
