@@ -1,4 +1,4 @@
-"""Capacity: a model that is down, a pool cooling down after a usage limit, and a pause that expires (MOD-14, MOD-15, LIV-13)."""
+"""Capacity: a model that is down, a pool cooling down after a usage limit, and a pause that expires (MOD-14 to MOD-16, LIV-13)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ import time
 import pytest
 
 from nohalt import cli
+from nohalt import config as config_mod
+from nohalt.agents import UsageSignal
 from nohalt.agents.claude_code import ClaudeCode
-from nohalt.state import BLOCKED, DONE, QUEUED, RUNNING
+from nohalt.state import BLOCKED, DONE, QUEUED, READY, RUNNING
 
 
 # -- the endpoint is down (MOD-14) ------------------------------------------------------------------------------
@@ -237,6 +239,85 @@ def test_the_cool_down_ends_and_the_waiting_issue_resumes_on_its_model(world, cl
     assert w.rec(1).status == DONE
     log = (w.sup.state.issue_log(1)).read_text()
     assert "model=command:claude resume=True" in log
+
+
+# -- reviews during a warning cool-down (MOD-16) -----------------------------------------------------------------
+def review_world(world, during: str = "warning"):  # type: ignore[no-untyped-def]
+    review = {"enabled": True, "labels": ["careful"], "model": "command:claude", "fallbacks": ["command:local"]}
+    return world(
+        agents={"max_parallel": 1, "pools": {"command:claude": 2, "command:local": 2}},
+        models={"default": "command:claude", "fallbacks": ["command:local"]},
+        review={**review, "distinct": False, "during_cooldown": during},
+    )
+
+
+def cool(w, kind: str, hours: float, source: str = "#9") -> None:  # type: ignore[no-untyped-def]
+    reset = time.time() + hours * 3600
+    w.sup.capacity.usage("command:claude", UsageSignal(kind, "seven_day", reset, f"{kind} {reset}"), source)
+
+
+def green_in_review(w):  # type: ignore[no-untyped-def]
+    w.issue(1, "pr-green", labels=["careful"])
+    w.review(1, "approve")
+    w.sup.tick()
+    w.wait_agents()
+    w.sup.tick()  # green -> in review; the reviewer launched
+    return w.rec(1)
+
+
+def test_a_reviewer_runs_on_a_warned_pool_while_authoring_diverts(world):
+    """MOD-16: a warning diverts the author; with during_cooldown = "warning" the short review still runs there."""
+    w = review_world(world)
+    cool(w, "warning", 5 * 24)
+    r = green_in_review(w)
+    assert r.model == "command:local" and r.overflow.startswith("capacity: command:claude cooling down")
+    assert r.review_pid and r.review_model == "command:claude"
+    assert "command:claude cooling down (seven_day)" in r.review_cooling
+    assert any("a warning: reviews still run there" in m for m in w.messages)
+    status = cli.render_status(w.cfg)
+    assert "reviewed on a pool cooling down for a usage warning" in status and "#1: command:claude;" in status
+    w.drive(2)
+    assert w.rec(1).status == READY
+
+
+def test_a_hard_limited_pool_diverts_the_reviewer(world):
+    w = review_world(world)
+    cool(w, "limit", 5)
+    r = green_in_review(w)
+    assert r.review_pid and r.review_model == "command:local" and not r.review_cooling
+    assert "reviewed on a pool cooling down" not in cli.render_status(w.cfg)
+    w.wait_agents()
+
+
+def test_by_default_reviews_divert_with_authoring(world):
+    w = review_world(world, during="none")
+    cool(w, "warning", 5 * 24)
+    r = green_in_review(w)
+    assert r.model == "command:local" and r.review_model == "command:local" and not r.review_cooling
+    w.wait_agents()
+
+
+def test_a_limit_during_a_warning_diverts_reviews_until_its_own_reset(world, clock):
+    """A reviewer (or author) hitting the limit on a warned pool hardens it; a later warning does not soften it."""
+    w = review_world(world)
+    cap = w.sup.capacity
+    cool(w, "warning", 5 * 24)
+    assert cap.unavailable("command:claude") and not cap.unavailable("command:claude", warned_ok=True)
+    cool(w, "limit", 5, source="review #1")  # sooner than the warning's reset: the cool-down does not move
+    assert cap.cooling_until("command:claude") == pytest.approx(time.time() + 5 * 24 * 3600, abs=5)
+    assert cap.unavailable("command:claude", warned_ok=True)
+    assert any("usage limit reached (review #1); hard until" in m for m in w.messages)
+    cool(w, "warning", 6 * 24, source="#8")  # moves the cool-down, keeps the limit
+    assert cap.unavailable("command:claude", warned_ok=True)
+    assert "usage limit (#8)" in cli.render_status(w.cfg)
+    clock.advance(5 * 3600 + 60)  # the limit's window reset; the warning's has not
+    assert cap.unavailable("command:claude") and not cap.unavailable("command:claude", warned_ok=True)
+    assert "near its usage limit (#8)" in cli.render_status(w.cfg)
+
+
+def test_during_cooldown_is_checked(tmp_path):
+    with pytest.raises(config_mod.ConfigError, match="during_cooldown"):
+        config_mod.from_dict({"project": {"repo": "o/r"}, "review": {"during_cooldown": "always"}}, root=tmp_path)
 
 
 def test_claude_stream_lines_carry_the_window_and_reset():

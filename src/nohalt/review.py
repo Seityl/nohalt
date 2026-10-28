@@ -206,8 +206,9 @@ class Reviews:
         return sup._has_slot(model, in_use)
 
     def _choose(self, models: list[str]) -> str | None:
+        warned_ok = self.cfg.review.during_cooldown == "warning"  # a review is short; only a hard limit diverts it (#76)
         for m in models:
-            if self._slots_free(m) and self.sup.router.prober.answers(m):
+            if self._slots_free(m) and self.sup.router.prober.answers(m, warned_ok):
                 return m
         return None
 
@@ -336,9 +337,11 @@ class Reviews:
         sup.state.save("pids.json", pids)
         rec.review_pid, rec.review_model, rec.review_started = proc.pid, model, now()
         rec.review_sha, rec.review_body, rec.review_exit = rec.pr_sha, body_hash(description), ""
-        rec.event(f"reviewer launched on {model} for {rec.pr_sha[:8]}" + (f" (author {rec.model})" if rec.model else ""))
+        rec.review_cooling = sup.capacity.unavailable(model)  # chosen, so only a warning: let through (#76)
+        warned = f"; {rec.review_cooling}, a warning: reviews still run there" if rec.review_cooling else ""
+        rec.event(f"reviewer launched on {model} for {rec.pr_sha[:8]}" + (f" (author {rec.model})" if rec.model else "") + warned)
         sup.state.put(rec)
-        sup.say(f"#{rec.issue}: reviewer launched on {model} for {sup.pr(rec.pr)} at {rec.pr_sha[:8]}")
+        sup.say(f"#{rec.issue}: reviewer launched on {model} for {sup.pr(rec.pr)} at {rec.pr_sha[:8]}{warned}")
 
     # -- reaping -------------------------------------------------------------------------------------------
     def _alive(self, rec: IssueRecord) -> bool:

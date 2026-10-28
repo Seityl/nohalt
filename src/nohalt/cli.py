@@ -223,7 +223,7 @@ def _pause_detail(state: StateStore) -> str:
 
 def _capacity_status(state: StateStore) -> list[str]:
     """Down models and cooling pools (capacity.py): where new work is not going, and until when."""
-    from .capacity import FILE, ago
+    from .capacity import FILE, ago, hard_until
 
     snap = state.load(FILE, {}) or {}
     lines = []
@@ -238,7 +238,7 @@ def _capacity_status(state: StateStore) -> list[str]:
         if c.get("until", 0) <= t:
             continue
         window = f" {c['window']}" if c.get("window") else ""
-        what = "usage limit" if c.get("kind") == "limit" else "near its usage limit"
+        what = "usage limit" if hard_until(c) > t else "near its usage limit"
         reset = "reset" if c.get("reported") else "default cool-down, no reset reported"
         lines.append(
             f"pool cooling down: {pool}{window} {what} ({c.get('source', '?')}) until {stamp(c['until'])} "
@@ -452,6 +452,11 @@ def render_status(cfg: Config) -> str:
                 for r in reviewed[:15]
             )
         )
+    warned = [r for r in recs if r.review_cooling]
+    if warned:
+        lines.append("")
+        lines.append('reviewed on a pool cooling down for a usage warning ([review] during_cooldown = "warning"):')
+        lines.extend(f"  #{r.issue}: {r.review_model}; {r.review_cooling}" for r in warned[:15])
     snap = state.load("status.json", {})
     if snap:
         lines.append("")
