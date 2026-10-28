@@ -840,6 +840,7 @@ class Supervisor:
                 rec.attempts = rec.provider_retries = rec.ci_rounds = rec.timeouts = rec.revivals = rec.launch_failures = 0
                 rec.review_rounds = rec.review_failures = rec.review_retries = 0
                 rec.review_verdict = ""
+                rec.hold_model, rec.down_waiting = "", 0.0
                 rec.status, rec.resume, rec.not_before, rec.labelled = QUEUED, True, 0, False
                 rec.note = "A human removed the blocked label: try again."
                 rec.event("unblocked by a human")
