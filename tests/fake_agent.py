@@ -14,7 +14,9 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     setup-fail       die the way an agent dies when its CLI is not logged in
     busy <seconds>   run a quiet shell command that long (a test run, not a hang)
     provider-error   die the way an agent dies when the model server is down
-    usage-limit      stop on a subscription usage limit
+    usage-limit [<reset>]  stop on a subscription usage limit (reset: epoch seconds the window resets)
+    usage-warning <reset> <seconds>  report being close to the usage limit, then run that long
+    provider-error-after <seconds>   run that long, then die on a model-server error
     nothing          exit 0 having done nothing
     no-change <why>  exit 0 having changed nothing, saying why (NOHALT-RESULT: no-change -- <why>)
     sleep <seconds>  run that long (to be timed out or found hung)
@@ -153,8 +155,17 @@ def main() -> int:
     elif action == "setup-fail":
         print("Failed to authenticate. API Error: 401 -- try 'claude login'", flush=True)
         return 1
-    elif action == "usage-limit":
-        print("[agent] rate_limit five_hour rejected", flush=True)
+    elif action.startswith("usage-limit"):
+        reset = action.split()[1:]
+        print("[agent] rate_limit five_hour rejected" + (f" resets={reset[0]}" if reset else ""), flush=True)
+        return 1
+    elif action.startswith("usage-warning"):
+        _, reset, secs = action.split()
+        print(f"[agent] rate_limit five_hour allowed_warning resets={reset} used=0.91", flush=True)
+        time.sleep(float(secs))
+    elif action.startswith("provider-error-after"):
+        time.sleep(float(action.split()[1]))
+        print("Error: Bad Gateway", flush=True)
         return 1
     elif action.startswith("sleep"):
         time.sleep(float(action.split()[1]))

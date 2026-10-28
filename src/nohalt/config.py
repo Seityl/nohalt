@@ -89,6 +89,12 @@ class ModelsCfg:
     overflow_after: int = 0  # waited this long for a slot: start on an overflow model. 0: never
     overflow_to: list[str] = field(default_factory=list)  # default: fallbacks minus premium
     overflow_reserve: dict[str, int] = field(default_factory=dict)  # pool prefix -> slots overflow may not take
+    down_after: int = 3  # issues with endpoint errors within down_window, or probes failed in a row: model down. 0: never
+    down_window: int = 10 * 60
+    down_probe: int = 2 * 60  # a down model is probed again after this, doubling ...
+    down_probe_max: int = 30 * 60  # ... up to this
+    down_block_after: int = 6 * 3600  # block for endpoint reasons only when the model and every fallback were down this long
+    usage_cooldown: int = 3600  # a pool's cool-down after a usage signal that reports no reset time
 
 
 @dataclass
@@ -272,6 +278,11 @@ _DURATIONS = {
     "base_pipeline_grace",
     "overflow_after",
     "timeout",
+    "down_window",
+    "down_probe",
+    "down_probe_max",
+    "down_block_after",
+    "usage_cooldown",
 }
 _OFF_WHEN_EMPTY = {"overflow_after"}
 
@@ -395,6 +406,20 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"[models] overflow_reserve: {pool!r} is not one of [agents] pools")
         if not isinstance(n, int) or n < 0:
             raise ConfigError(f"[models] overflow_reserve: {pool!r} must be a whole number of slots, got {n!r}")
+    if not isinstance(models.down_after, int) or isinstance(models.down_after, bool) or models.down_after < 0:
+        raise ConfigError(f"[models] down_after must be a whole number, 0 to turn it off, got {models.down_after!r}")
+    for name, opts in cfg.agents.options.items():
+        for key in ("usage_limit", "usage_warning"):
+            pats = opts.get(key) if isinstance(opts, dict) else None
+            if pats is None:
+                continue
+            if isinstance(pats, str):
+                opts[key] = pats = [pats]
+            for pat in pats:
+                try:
+                    re.compile(pat)
+                except (re.error, TypeError) as e:
+                    raise ConfigError(f"[agents.options.{name}] {key}: {pat!r} is not a regular expression: {e}") from None
     from .integrate.mergers import DRIVERS
     from .integrate.windows import Schedule, WindowError
 

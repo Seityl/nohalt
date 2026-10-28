@@ -20,7 +20,7 @@ from . import config as config_mod
 from . import queue as queue_mod
 from .config import Config, ConfigError
 from .state import AWAITING_GREEN, BLOCKED, IN_REVIEW, QUEUED, RUNNING, FileLock, StateStore
-from .util import now, pid_alive, stamp, tail
+from .util import now, parse_duration, pid_alive, stamp, tail
 
 if TYPE_CHECKING:
     from .supervisor import Supervisor
@@ -121,10 +121,24 @@ def cmd_pause(args: argparse.Namespace) -> int:
     state = StateStore(_cfg(args).state_dir)
     if args.off:
         state.clear_flag("PAUSE")
+        state.set_flag("WAKE")
         print("launching resumed")
+        return 0
+    if args.for_:
+        try:
+            secs = parse_duration(args.for_)
+        except ValueError as e:
+            print(f"nohalt: --for: {e}", file=sys.stderr)
+            return 2
+        if secs <= 0:
+            print("nohalt: --for must be longer than 0", file=sys.stderr)
+            return 2
+        until = now() + secs
+        state.set_flag("PAUSE", f"{stamp()}\nuntil={int(until)}\n")
+        print(f"no new agents will launch until {stamp(until)} (running ones continue); `nohalt resume` undoes it sooner")
     else:
-        state.set_flag("PAUSE", stamp())
-        print("no new agents will launch (running ones continue); `nohalt resume` to undo")
+        state.set_flag("PAUSE", f"{stamp()}\n")
+        print("no new agents will launch (running ones continue), with no expiry; `nohalt resume` to undo")
     return 0
 
 
@@ -191,6 +205,43 @@ def _windows_status(cfg: Config, state: StateStore) -> list[str]:
         lines.append(
             f"  as of {stamp(w.get('at'))}: {w.get('why', '')}; {len(w.get('ready', []))} ready, "
             f"hotfixes waiting: {hot or 'none'}"
+        )
+    return lines
+
+
+def _pause_detail(state: StateStore) -> str:
+    from .capacity import ago
+    from .state import pause_until
+
+    until = pause_until(state)
+    if until:
+        return f" -- expires {stamp(until)}, in {ago(until - now())}"
+    age = state.flag_age("PAUSE")
+    return f" -- paused for {ago(age)}, no expiry" if age is not None else ""
+
+
+def _capacity_status(state: StateStore) -> list[str]:
+    """Down models and cooling pools (capacity.py): where new work is not going, and until when."""
+    from .capacity import FILE, ago
+
+    snap = state.load(FILE, {}) or {}
+    lines = []
+    t = now()
+    for model, v in sorted((snap.get("down") or {}).items()):
+        nxt = v.get("next_probe", 0)
+        lines.append(
+            f"model DOWN: {model} since {stamp(v.get('since'))} ({ago(t - v.get('since', t))}; {v.get('why', '')}); "
+            f"next probe {'due' if nxt <= t else 'in ' + ago(nxt - t)}"
+        )
+    for pool, c in sorted((snap.get("cooling") or {}).items()):
+        if c.get("until", 0) <= t:
+            continue
+        window = f" {c['window']}" if c.get("window") else ""
+        what = "usage limit" if c.get("kind") == "limit" else "near its usage limit"
+        reset = "reset" if c.get("reported") else "default cool-down, no reset reported"
+        lines.append(
+            f"pool cooling down: {pool}{window} {what} ({c.get('source', '?')}) until {stamp(c['until'])} "
+            f"(in {ago(c['until'] - t)}; {reset}); new work goes to fallbacks, pinned issues wait"
         )
     return lines
 
@@ -290,7 +341,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 # Control flags `nohalt status` shows, and what each one means.
 FLAGS = {
     "STOP": "draining -- no new launches; the supervisor exits when no agent runs (`nohalt resume` undoes)",
-    "PAUSE": "no new launches; running agents continue (`nohalt resume` undoes)",
+    "PAUSE": "no new launches; running agents continue (`nohalt resume` undoes; `pause --for` expires)",
     "RESTART": "a restart was asked for; the supervisor re-executes after its current tick",
     "CONFIG_INVALID": "nohalt.toml has an error; the supervisor runs on the last good configuration",
     "DEPLOY_BLOCKED": "a deploy failed; nothing merges until a human deletes the flag",
@@ -323,8 +374,11 @@ def render_status(cfg: Config) -> str:
         detail = ""
         if f == "CONFIG_INVALID":
             detail = " -- " + " ".join(state.read_lines(f))[:300]
+        if f == "PAUSE":
+            detail = _pause_detail(state)
         lines.append(f"  {f}: {FLAGS[f]}{detail}")
     lines.extend(_windows_status(cfg, state))
+    lines.extend(_capacity_status(state))
     spend = state.load("spend.json")
     if spend:
         lines.append(f"API spend ~${spend.get('total', 0):.2f} of ${spend.get('cap', 0):.2f}")
@@ -698,8 +752,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--timeout", type=float, default=120, metavar="SECONDS", help="wait this long for each step")
     s.set_defaults(fn=cmd_restart)
 
-    s = sub.add_parser("pause", help="launch no new agents until `pause --off`")
+    s = sub.add_parser("pause", help="launch no new agents until `pause --off`, or for a while (--for 2h)")
     s.add_argument("--off", action="store_true")
+    s.add_argument("--for", dest="for_", metavar="DURATION", help="expire after this long, e.g. 30m or 2h")
     s.set_defaults(fn=cmd_pause)
 
     s = sub.add_parser("release-now", help="train: open one normal batch now, ignoring the release windows")

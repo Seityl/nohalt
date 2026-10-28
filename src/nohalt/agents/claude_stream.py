@@ -31,7 +31,14 @@ def render(event: dict[str, Any]) -> list[str]:
                 out.append(f"$ {what}")
     elif t == "rate_limit_event":
         info = event.get("rate_limit_info") or {}
-        out.append(f"[agent] rate_limit {info.get('rateLimitType', '?')} {info.get('status', '?')}")
+        line = f"[agent] rate_limit {info.get('rateLimitType', '?')} {info.get('status', '?')}"
+        # The reset time and how much of the window is used, when claude reports them:
+        # the supervisor reads them to cool a pool down until the reset (usage-aware routing).
+        if isinstance(info.get("resetsAt"), (int, float)):
+            line += f" resets={int(info['resetsAt'])}"
+        if isinstance(info.get("utilization"), (int, float)):
+            line += f" used={info['utilization']:g}"
+        out.append(line)
     elif t == "result":
         result = str(event.get("result") or "")[:400].replace("\n", " ")
         out.append(f"[agent] result: {event.get('subtype', '')} {str(bool(event.get('is_error'))).lower()} {result}")

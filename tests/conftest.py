@@ -127,3 +127,24 @@ def world(tmp_path: Path, repo: Path):  # type: ignore[no-untyped-def]
         return World(tmp_path, repo, **overrides)
 
     return make
+
+
+class Clock:
+    """``now()`` for nohalt, moved forward by hand. Agents keep real time, so move it only while none runs."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch):
+        self.offset = 0.0
+        for name, mod in list(sys.modules.items()):
+            if name.startswith("nohalt") and getattr(mod, "now", None) is not None and callable(mod.now):
+                monkeypatch.setattr(mod, "now", self)
+
+    def __call__(self) -> float:
+        return time.time() + self.offset
+
+    def advance(self, seconds: float) -> None:
+        self.offset += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):  # type: ignore[no-untyped-def]
+    return Clock(monkeypatch)

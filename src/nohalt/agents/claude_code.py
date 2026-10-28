@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import SETUP_ERROR, Launch
+from . import SETUP_ERROR, Launch, UsageSignal, usage_signal
 
 # Sub-agents, schedulers and remote triggers multiply spend on a shared plan
 # and outlive the supervisor's view of the agent; the worktree tools fight
@@ -30,9 +30,14 @@ DISALLOWED = [
 ]
 
 _PROVIDER = re.compile(r"^\[agent\] result: \S* true .*(overloaded|api_error|50[0234]|529|ECONNRESET|fetch failed)", re.I | re.M)
-_LIMIT = re.compile(
-    r"^\[agent\] (rate_limit \S+ rejected|result: \S* true .*(usage limit|limit reached|rate limit))", re.I | re.M
-)
+# Usage lines, as claude_stream prints them: the window (five_hour, seven_day, ...)
+# and, when claude reports it, the reset time. ``[agents.options.claude-code]
+# usage_limit`` / ``usage_warning`` replace these.
+USAGE_LIMIT = [
+    r"^\[agent\] rate_limit (?P<window>\S+) rejected\b(?:.*?\bresets=(?P<resets>\d+))?",
+    r"^\[agent\] result: \S* true .*(usage limit|limit reached|rate limit)",
+]
+USAGE_WARNING = [r"^\[agent\] rate_limit (?P<window>\S+) allowed_warning\b(?:.*?\bresets=(?P<resets>\d+))?"]
 
 
 class ClaudeCode:
@@ -44,11 +49,15 @@ class ClaudeCode:
         disallowed_tools: list[str] | None = None,
         extra_args: list[str] | None = None,
         mcp: bool = False,
+        usage_limit: list[str] | None = None,
+        usage_warning: list[str] | None = None,
     ):
         self.binary = binary
         self.disallowed = DISALLOWED if disallowed_tools is None else disallowed_tools
         self.extra_args = extra_args or []
         self.mcp = mcp
+        self.usage_limit = USAGE_LIMIT if usage_limit is None else usage_limit
+        self.usage_warning = USAGE_WARNING if usage_warning is None else usage_warning
 
     def _base(self, model: str) -> list[str]:
         argv = [self.binary, "-p", "--model", model, "--dangerously-skip-permissions"]
@@ -81,5 +90,9 @@ class ClaudeCode:
     def provider_failed(self, log_tail: str) -> bool:
         return _PROVIDER.search(log_tail) is not None
 
+    def usage_signal(self, log_tail: str) -> UsageSignal | None:
+        return usage_signal(log_tail, self.usage_limit, self.usage_warning)
+
     def usage_limited(self, log_tail: str) -> bool:
-        return _LIMIT.search(log_tail) is not None
+        sig = self.usage_signal(log_tail)
+        return sig is not None and sig.kind == "limit"

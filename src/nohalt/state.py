@@ -47,6 +47,8 @@ class IssueRecord:
     not_before: float = 0.0  # backoff: do not relaunch before this time
     stalled_since: float = 0.0  # launchable but no slot for its model since then (overflow clock)
     overflow: str = ""  # why the current launch is on an overflow model; "" when routed as usual
+    hold_model: str = ""  # stopped by its model's usage limit: waits for that model and resumes there (MOD-07)
+    down_waiting: float = 0.0  # since when its endpoint failures went uncounted because its model was down
     branch: str = ""
     worktree: str = ""
     log: str = ""
@@ -80,6 +82,17 @@ class IssueRecord:
     def event(self, text: str) -> None:
         self.history.append(f"{stamp()}  {text}")
         del self.history[:-50]
+
+
+def pause_until(state: StateStore) -> float:
+    """When ``nohalt pause --for`` makes PAUSE expire (epoch seconds), or 0 if it does not."""
+    for line in state.read_lines("PAUSE"):
+        if line.startswith("until="):
+            try:
+                return float(line.split("=", 1)[1])
+            except ValueError:
+                return 0.0
+    return 0.0
 
 
 class StateStore:

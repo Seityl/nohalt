@@ -16,7 +16,7 @@ Changes apply to what the supervisor does next, never to an agent already runnin
 
 `nohalt restart` does the same on demand: it validates the file first (a broken config never replaces a running supervisor), asks the supervisor to re-execute after its current tick, and starts one, detached, if none is running -- no cron needed. Agents are never signalled. If the supervisor does not respond within `--timeout` (default 120 s), it is sent SIGTERM and a new one is started. `restart` clears `STOP`.
 
-`nohalt stop` is not a restart: it is a **drain**. Nothing new launches and the supervisor exits once no agent is running, which can take hours, and `keepalive` starts nothing while `STOP` exists. `nohalt resume` clears `STOP` and `PAUSE`.
+`nohalt stop` is not a restart: it is a **drain**. Nothing new launches and the supervisor exits once no agent is running, which can take hours, and `keepalive` starts nothing while `STOP` exists. `nohalt resume` clears `STOP` and `PAUSE`. `nohalt pause` launches nothing new but keeps the supervisor running; `nohalt pause --for 2h` expires on its own (the supervisor clears `PAUSE` once the time passes and logs `PAUSE expired`). Without `--for` it lasts until `nohalt resume` or `pause --off`, and `nohalt status` shows how long it has been paused.
 
 Durations accept `90`, `"90s"`, `"30m"`, `"4h"` or `"2d"`. Models are always written `<agent>:<model>`: `opencode:anthropic/claude-sonnet-4-5`, `claude-code:sonnet`, `command:anything`.
 
@@ -101,6 +101,29 @@ probe_argv = ["my-agent", "--model", "{model}", "--ping"]
 | `overflow_after` | `""` (off) | an unpinned issue that could start but has waited this long for a slot -- its model's pool (or `max_parallel`) is full, or its model does not answer and no fallback has a free slot -- starts on the first `overflow_to` model with a free slot that answers a probe, e.g. `"10m"` |
 | `overflow_to` | `fallbacks` minus `premium` | models allowed to take overflow, in order. A premium model is used only for issues approved for it |
 | `overflow_reserve` | `{}` | `[agents] pools` prefix → slots overflow may not take, e.g. `{ "claude-code:" = 2 }` keeps the last two Claude slots for work routed there |
+| `down_after` | `3` | a model is **down** when agents on this many different issues hit endpoint errors on it within `down_window`, or when this many probes in a row fail. `0`: never |
+| `down_window` | `"10m"` | |
+| `down_probe` | `"2m"` | a down model is probed again after this, then after twice as long each time it still fails ... |
+| `down_probe_max` | `"30m"` | ... up to this. With `probe = false` a down model is simply let back after `down_probe`, and goes down again on the next storm |
+| `down_block_after` | `"6h"` | an issue whose endpoint failures went uncounted is blocked only once its model **and every fallback** (only its model, if pinned) have been down this long |
+| `usage_cooldown` | `"1h"` | how long a pool cools down after a usage signal that reports no reset time |
+
+### Down models and usage cool-downs
+
+Some trouble belongs to a model, not to an issue (MOD-14, MOD-15):
+
+- **Down.** A storm (agents on `down_after` different issues hitting endpoint errors on one model within `down_window`; a restarted model server kills all of its agents at once) or `down_after` failed probes in a row mark the model down. The storm's own failures are refunded, and later failures on a down model are never counted toward an issue's `provider_retries`. New launches routed to it go at once to the first fallback, then overflow target, that has a free slot and answers. With none, they wait. It is probed again at `down_probe` (doubling up to `down_probe_max`). When it answers, it is up again (`model … is UP again … after 2h 10m down` in the log). An issue is blocked for the endpoint only after `down_block_after`, as above. One issue failing on its own is still that issue's `provider_retries` (MOD-01).
+- **Cooling down.** An agent's usage line (claude-code: `rate_limit five_hour rejected`, or `allowed_warning` when it is close) cools down the model's **pool** until the reset time the line reports, else for `usage_cooldown`. The pool is its `[agents] pools` prefix, or else the model itself, so give a subscription's models one pool (`"claude-code:" = 4`) to cool them together. Running agents' logs are read every tick, so a warning steers new work away before the limit hits. While a pool cools down, new launches routed to it go to a fallback or overflow target at once, never premium unless approved, and never using `overflow_reserve` slots. Pinned issues wait. Running agents are left alone. An agent that **stopped** on the limit waits for its own model's reset and resumes its session there (MOD-07).
+- `nohalt status` shows `model DOWN: … since …; next probe in …` and `pool cooling down: claude-code: five_hour usage limit (#12) until 05:30 (in 2h 10m; reset)`. Diverted launches are marked `^` with the reason (`capacity: claude-code: cooling down (five_hour) until … → opencode:local/coder`), like overflow. State is `<state>/capacity.json`.
+
+The usage patterns are per agent, in `[agents.options.<agent>]`: `usage_limit` and `usage_warning`, lists of regular expressions matched per line of the agent's output. A named group `window` names the usage window, and `resets` gives the reset time in epoch seconds. claude-code's defaults read the `[agent] rate_limit <window> <status> resets=<epoch> used=<fraction>` lines nohalt prints from Claude's stream. To react to a high `used=` on plain `allowed` events too:
+
+```toml
+[agents.options.claude-code]
+usage_warning = ['^\[agent\] rate_limit (?P<window>\S+) allowed\S* .*?resets=(?P<resets>\d+) used=0\.(8|9)']
+```
+
+opencode has no usage events of its own, so it has no defaults. Name your provider's limit text there if it prints one.
 
 Pins (`nohalt route <issue> <model>`) beat rules and are never failed over or overflowed: a pinned issue waits for its model. Overflow is not a pin: the issue's next launch (a resume, a retry, a hand-back) is routed as usual, and starts a fresh session if that lands on a different model. Running agents are never moved. Overflowed launches are marked `^` in `nohalt status`, with the reason (`overflow: opencode:local/ pool full (8/8) for 12m → claude-code:sonnet`), which is also in the issue's history and the log.
 
