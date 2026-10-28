@@ -78,6 +78,7 @@ class IssueRecord:
     review_text: str = ""  # the last verdict's review, handed to the author on "changes"
     review_approved: str = ""  # the head SHA an approval covers; any other head needs a new review
     review_carried: str = ""  # the head actually approved, when nohalt refreshes carried it to review_approved (#69)
+    review_approved_at: float = 0.0  # when the approval was given (a carry keeps it): approved PRs batch in this order
     review_rounds: int = 0  # "changes" verdicts handed back
     review_failures: int = 0  # reviews that ended without a verdict
     review_retries: int = 0  # reviewer endpoint failures; never failures

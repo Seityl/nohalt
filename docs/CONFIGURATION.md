@@ -270,9 +270,21 @@ days = ["mon", "tue", "wed", "thu", "fri"]
 per_window = 1
 hotfix_labels = ["hotfix"]
 hotfix_priority = true
+
+approved_first = true              # with [review]: approved PRs go first, and may join an open batch
 ```
 
 `<state>/priority` and `<state>/hold` (one issue per line) put issues first in, or keep them out of, the next batch.
+
+### Approved PRs first
+
+A PR approved just after a batch opened used to wait for the next one, and the siblings in that batch -- often editing the same files -- could turn its clean merge into a code conflict: handed back, CI again, a new review, and the next batch missed too (INT-17). With `[review]` enabled, `approved_first` (default `true`) changes that:
+
+- **The next batch** takes, in order: `<state>/priority`, then issues whose PR is approved **for its current head**, in approval order, then every other ready issue in queue order. An approval of an older head does not count; an approval carried over a nohalt refresh (INT-16) does, and keeps its time.
+- **The open batch.** While a release this train opened has no check beyond `queued` on its head (its CI has not started: no runner has picked it up), an approved PR that merges cleanly with the batch, using the same merge drivers, is merged into the release branch and pushed (no force; the version files are stamped with the batch's version again and `after_version` re-runs). It is carried, closed and parked like the batch's other PRs, and the release PR gets a comment naming it. One that does not merge cleanly is not handed back: it stays `ready` and goes first in the next batch (tried once per head). Once any check has started, nothing joins.
+- **Windows** are unchanged: a hotfix-only release takes approved hotfixes only, and an approval never makes an issue a hotfix.
+- **`direct` mode** merges approved PRs (approval order) before the other ready PRs (queue order). The key lives in `[integrate.train]` but applies there too.
+- `approved_first = false`, or `[review]` off, gives the old order and nothing joins an open batch.
 
 ### Release windows
 

@@ -145,6 +145,7 @@ class TrainCfg:
     per_window: int = 1  # normal releases merged per window instance; 0: unlimited
     hotfix_labels: list[str] = field(default_factory=lambda: ["hotfix"])  # these may release outside a window
     hotfix_priority: bool = True  # issues in <state>/priority count as hotfixes too
+    approved_first: bool = True  # with [review]: approved PRs batch (or merge, direct) first and may join an open batch
 
 
 @dataclass

@@ -16,7 +16,11 @@ batching them by hand cost a night. So, on every tick:
    on the batch is the gate.
 3. An issue started early on unmerged dependencies (SCH-10) is batched only
    after them, or together with them.
-4. With ``windows`` set, a normal batch opens only inside a release window, and
+4. With ``[review]``, a PR approved for its current head goes first, after
+   ``<state>/priority``, in approval order; while an open batch's CI has not
+   started, it joins that batch if it merges cleanly with the batch's drivers
+   (INT-17).
+5. With ``windows`` set, a normal batch opens only inside a release window, and
    ``per_window`` of them merge per window. Outside, a batch carries hotfixes
    only (a hotfix label, ``<state>/priority``, the fix for a red base), or
    nothing; ``nohalt release-now`` opens one normal batch regardless (DEP-13).
@@ -32,10 +36,10 @@ from typing import TYPE_CHECKING, Any
 from .. import queue
 from ..forge import CLOSED, ForgeError, PullRequest, verdict
 from ..forge.base import GREEN, RED
-from ..state import READY
+from ..state import READY, IssueRecord
 from ..util import now
 from ..worktree import GitError, git
-from .common import PipelineGate, cancel_superseded, close_merged, is_network_failure
+from .common import PipelineGate, approved, approved_first, cancel_superseded, close_merged, is_network_failure
 from .live import LiveWatch
 from .mergers import effective, resolve
 from .refresh import REFRESHED, record_conflicts, refresh
@@ -82,7 +86,8 @@ class Train:
             return
         releases = [p for p in pulls if p.head_ref.startswith(self.t.branch_prefix)]
         for p in releases:
-            self._advance(p)
+            if not self._join(p):  # a release that took a PR has a new head: its CI starts again
+                self._advance(p)
         if not releases:
             self._build()
 
@@ -270,13 +275,18 @@ class Train:
         priority = [int(x) for x in self.sup.state.read_lines("priority") if x.isdigit()]
         held = {int(x) for x in self.sup.state.read_lines("hold") if x.isdigit()}
 
-        def rank(issue: int) -> tuple[int, int]:
-            if issue in priority:
-                return (0, priority.index(issue))
-            return (1, order.index(issue) if issue in order else len(order))
+        first = approved_first(self.sup)
+
+        def rank(rec: IssueRecord) -> tuple[int, float, int]:
+            at = order.index(rec.issue) if rec.issue in order else len(order)
+            if rec.issue in priority:
+                return (0, priority.index(rec.issue), at)
+            if first and approved(rec, rec.pr_sha):
+                return (1, rec.review_approved_at, at)  # approved, in approval order (INT-17)
+            return (2, 0, at)
 
         out = []
-        recs = sorted((r for r in self.sup.state.all() if r.status == READY and r.pr), key=lambda r: rank(r.issue))
+        recs = sorted((r for r in self.sup.state.all() if r.status == READY and r.pr), key=rank)
         if self.gate.only is not None:
             recs = [r for r in recs if r.issue == self.gate.only]
         for rec in recs:
@@ -302,6 +312,25 @@ class Train:
 
     def _git(self, *args: str, check: bool = True) -> str:
         return git(self.tree, *args, check=check)
+
+    def _commit(self, *args: str) -> bool:
+        ident = ["-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost"]
+        cmd = ["git", "-C", str(self.tree), "-c", "core.hooksPath=/dev/null", *ident, *args]
+        return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
+
+    def _merge(self, pr: PullRequest) -> list[str]:
+        """Merge ``pr``'s head into the release tree, the drivers settling bookkeeping.
+
+        Returns the files left in conflict ([] on success); the merge is aborted then."""
+        if self._commit("merge", "-q", "--no-ff", "--no-edit", f"{self.cfg.project.remote}/{pr.head_ref}"):
+            return []
+        conflicted = self._git("diff", "--name-only", "--diff-filter=U", check=False).split()
+        mergers = effective(self.cfg.integrate.mergers, self.t.version_files)
+        left = resolve(self.tree, conflicted, mergers) if conflicted else ["(merge failed)"]
+        if not left and self._commit("commit", "-q", "--no-edit"):
+            return []
+        self._git("merge", "--abort", check=False)
+        return left or ["(commit failed)"]
 
     def _ensure_tree(self) -> None:
         repo = self.cfg.repo_path
@@ -352,66 +381,33 @@ class Train:
             self.sup.say(f"integrator: cannot prepare the release tree: {e}")
             return
         merged: list[tuple[int, int, str]] = []
-        ident = ["-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost"]
         for issue, pr in cands:
             if self.sup.early.held(issue, {i for i, _, _ in merged}):
                 continue  # its dependencies are neither merged nor in this batch
-            ok = (
-                subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(self.tree),
-                        "-c",
-                        "core.hooksPath=/dev/null",
-                        *ident,
-                        "merge",
-                        "-q",
-                        "--no-ff",
-                        "--no-edit",
-                        f"{remote}/{pr.head_ref}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                ).returncode
-                == 0
-            )
-            if not ok:
-                conflicted = self._git("diff", "--name-only", "--diff-filter=U", check=False).split()
-                mergers = effective(self.cfg.integrate.mergers, self.t.version_files)
-                left = resolve(self.tree, conflicted, mergers) if conflicted else ["(merge failed)"]
-                if not left:
-                    ok = (
-                        subprocess.run(
-                            ["git", "-C", str(self.tree), "-c", "core.hooksPath=/dev/null", *ident, "commit", "-q", "--no-edit"],
-                            capture_output=True,
-                        ).returncode
-                        == 0
-                    )
-                if not ok:
-                    self._git("merge", "--abort", check=False)
-                    files = ", ".join(left)
-                    out = refresh(self.sup, self.sup.state.get(issue), pr)
-                    if out.status == REFRESHED:
-                        self.sup.say(
-                            f"  ~ #{issue} ({self.sup.pr(pr.number)}) conflicted with {base} only in "
-                            f"{', '.join(out.files)}: refreshed as {out.sha[:8]}, joins a later batch once green"
-                        )
-                        continue
-                    if out.handled:
-                        self.sup.state.log(f"  ~ #{issue} ({self.sup.pr(pr.number)}) left out, refresh deferred: {out.why}")
-                        continue
-                    record_conflicts(self.sup.state, issue, out.files or [f for f in left if not f.startswith("(")])
-                    self.sup.say(f"  - #{issue} ({self.sup.pr(pr.number)}) conflicts in code: {files} -- handed back to rebase")
-                    self.sup.hand_back(
-                        issue,
-                        f"{self.sup.pr(pr.number)} conflicts in code",
-                        f"Your {self.sup.pr_long(pr.number)} conflicts with `{base}` in code (`{files}`), so it "
-                        f"was left out of this release. Merge `origin/{base}` into your branch, keeping both "
-                        "sides' behaviour, verify, and push. You will be picked up in the next batch once "
-                        "your checks are green again.",
+            left = self._merge(pr)
+            if left:
+                files = ", ".join(left)
+                out = refresh(self.sup, self.sup.state.get(issue), pr)
+                if out.status == REFRESHED:
+                    self.sup.say(
+                        f"  ~ #{issue} ({self.sup.pr(pr.number)}) conflicted with {base} only in "
+                        f"{', '.join(out.files)}: refreshed as {out.sha[:8]}, joins a later batch once green"
                     )
                     continue
+                if out.handled:
+                    self.sup.state.log(f"  ~ #{issue} ({self.sup.pr(pr.number)}) left out, refresh deferred: {out.why}")
+                    continue
+                record_conflicts(self.sup.state, issue, out.files or [f for f in left if not f.startswith("(")])
+                self.sup.say(f"  - #{issue} ({self.sup.pr(pr.number)}) conflicts in code: {files} -- handed back to rebase")
+                self.sup.hand_back(
+                    issue,
+                    f"{self.sup.pr(pr.number)} conflicts in code",
+                    f"Your {self.sup.pr_long(pr.number)} conflicts with `{base}` in code (`{files}`), so it "
+                    f"was left out of this release. Merge `origin/{base}` into your branch, keeping both "
+                    "sides' behaviour, verify, and push. You will be picked up in the next batch once "
+                    "your checks are green again.",
+                )
+                continue
             merged.append((issue, pr.number, pr.head_sha))
             self.sup.say(f"  + #{issue} ({self.sup.pr(pr.number)})")
         if not merged:
@@ -421,6 +417,7 @@ class Train:
             kind = "hotfix"  # only the hotfixes merged cleanly: the window's release is still to come
         version = self._stamp_version()
         issues = " ".join(f"#{i}" for i, _, _ in merged)
+        ident = ["-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost"]
         try:
             self._git("add", "-A")
             msg = f"chore(release): {version} -- {issues}" if version else f"chore(release): {issues}"
@@ -442,6 +439,7 @@ class Train:
                 capture_output=True,
             )
             self._git("push", "-q", "-f", "-u", remote, branch, check=True)
+            head = self._git("rev-parse", "HEAD")
         except (GitError, subprocess.CalledProcessError) as e:
             self.sup.say(f"integrator: could not push {branch}: {e}")
             return
@@ -466,12 +464,115 @@ class Train:
             "pr": n,
             "kind": kind,
             "window": window,
+            "head": head,  # what nohalt pushed: an approved PR joins only on top of it (INT-17)
         }
         self._save(st)
         if manual:
             self.sup.state.clear_flag(RELEASE_NOW)
         what = {"hotfix": " (hotfix)", "manual": " (release-now)"}.get(kind, "") if self.schedule.enabled or manual else ""
         self.sup.say(f"opened release {self.sup.pr(n)} ({version or branch}){what} carrying {issues}")
+
+    # -- 3. approved PRs ride the open batch (INT-17) -------------------------------------------------
+    def _join(self, p: PullRequest) -> bool:
+        """An approved PR joins the open batch ``p`` while its CI has not started. True if ``p`` moved.
+
+        A batch opened just before an approval would otherwise release without it, and the
+        siblings it carries -- often in the same files -- would turn its clean merge into a
+        code conflict: handed back, CI again, review again, and the next batch missed too.
+        Only a PR that merges cleanly with the batch's drivers joins; any other is first in
+        the next batch. A hotfix-only release takes hotfixes only, as when it opened.
+        """
+        if not approved_first(self.sup):
+            return False
+        st = self._st()
+        rel = st["releases"].get(p.head_ref)
+        if not rel:
+            return False  # not a batch this train opened
+        inside = {int(c[0]) for c in rel.get("carried", [])}
+        tried = set(rel.get("join_tried", []))
+        waiting = [
+            r
+            for r in self.sup.state.all()
+            if r.status == READY and r.pr and r.issue not in inside and approved(r, r.pr_sha) and r.pr_sha not in tried
+        ]
+        if not waiting or self._ci_started(p):
+            return False  # nothing approved waits (no forge call), or too late: the batch is under test
+        cands = [(i, pr) for i, pr in self._candidates() if i not in inside and approved(self.sup.state.get(i), pr.head_sha)]
+        if rel.get("kind") == "hotfix":
+            priority = {int(x) for x in self.sup.state.read_lines("priority") if x.isdigit()}
+            fix = self.gate.fix_issue()
+            cands = [c for c in cands if self._is_hotfix(c[0], priority, fix)]
+        cands = [c for c in cands if c[1].head_sha not in tried]
+        if not cands:
+            return False
+        remote, branch = self.cfg.project.remote, p.head_ref
+        try:
+            self._ensure_tree()
+            self._git("fetch", "-q", remote)
+            self._git("merge", "--abort", check=False)
+            self._git("reset", "-q", "--hard")
+            self._git("clean", "-qfd")
+            self._git("checkout", "-q", "-B", branch, f"{remote}/{branch}")
+            start = self._git("rev-parse", "HEAD")
+        except GitError as e:
+            self.sup.state.log(f"integrator: cannot prepare {branch} for an approved PR: {e}")
+            return False
+        if rel.get("head") and start != rel["head"]:
+            return False  # someone else pushed to the release branch: leave it alone
+        joined: list[tuple[int, int, str]] = []
+        for issue, pr in self.sup.early.order(cands):
+            if self.sup.early.held(issue, inside | {i for i, _, _ in joined}):
+                continue
+            left = self._merge(pr)
+            if left:
+                rel.setdefault("join_tried", []).append(pr.head_sha)
+                self.sup.say(
+                    f"  ~ #{issue} ({self.sup.pr(pr.number)}) approved, but does not merge cleanly with release "
+                    f"{self.sup.pr(p.number)} ({', '.join(left)}): first in the next batch"
+                )
+                continue
+            joined.append((issue, pr.number, pr.head_sha))
+        if not joined:
+            self._save(st)
+            return False
+        issues = " ".join(f"#{i}" for i, _, _ in joined)
+        version = rel.get("version", "")
+        if version and self.t.version_files:
+            self._write_version(version.removeprefix(self.t.tag_prefix))  # the joiner may have moved it
+        self._git("add", "-A")
+        if self._git("status", "--porcelain", check=False):
+            self._commit("commit", "-q", "-m", f"chore(release): {version or branch} -- joined by {issues}")
+        if self._ci_started(p):
+            self.sup.say(f"integrator: release {self.sup.pr(p.number)}'s CI started meanwhile; {issues} wait for the next batch")
+            return False
+        try:
+            self._git("push", "-q", remote, f"HEAD:refs/heads/{branch}")  # no force: a moved branch refuses
+            head = self._git("rev-parse", "HEAD")
+        except GitError as e:
+            self.sup.say(f"integrator: could not add {issues} to release {self.sup.pr(p.number)}: {e}")
+            return False
+        rel["carried"] = rel.get("carried", []) + [list(j) for j in joined]
+        rel["head"] = head
+        self._save(st)
+        try:
+            self.sup.forge.comment_pull(
+                p.number,
+                f"nohalt: {issues} joined this release before its CI started (approved: "
+                + " ".join(self.sup.pr(n) for _, n, _ in joined)
+                + "). It closes them too.",
+            )
+        except ForgeError as e:
+            self.sup.state.log(f"could not comment on release {self.sup.pr(p.number)}: {e}")
+        for issue, n, _sha in joined:
+            self.sup.say(f"  + #{issue} ({self.sup.pr(n)}) approved: joined the open release {self.sup.pr(p.number)}")
+        return True
+
+    def _ci_started(self, p: PullRequest) -> bool:
+        """Any check on the release head beyond ``queued``: the batch is under test. Unknown counts as started."""
+        try:
+            return any(c.status != "queued" for c in self.sup.forge.checks(p.head_sha))
+        except ForgeError:
+            return True
 
     # -- versions ------------------------------------------------------------------------------------
     def next_version(self) -> str:
@@ -500,6 +601,10 @@ class Train:
             return ""
         self._git("fetch", "-q", self.cfg.project.remote, "--tags", check=False)
         v = self.next_version()
+        self._write_version(v)
+        return f"{self.t.tag_prefix}{v}"
+
+    def _write_version(self, v: str) -> None:
         for vf in self.t.version_files:
             p = self.tree / vf["path"]
             if not p.exists():
@@ -512,7 +617,6 @@ class Train:
                 p.write_text(text)
         if self.t.after_version:
             subprocess.run(["bash", "-c", self.t.after_version], cwd=self.tree, capture_output=True, timeout=1800)
-        return f"{self.t.tag_prefix}{v}"
 
     def _tag(self, version: str) -> None:
         remote, base = self.cfg.project.remote, self.cfg.project.base_branch
