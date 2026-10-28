@@ -87,6 +87,8 @@ A *resumed* launch continues the agent's previous session in the same worktree w
 
 **train.** With no release PR open, every `ready` issue's green PR (priority list first, then queue order, minus held issues and parked SHAs) is merged into `release/auto-<time>` off the base. Conflicts go to the merge drivers by glob (`[integrate.mergers]`). If any file stays in conflict, that PR is left out. It is refreshed against the base if the drivers settle that (see `refresh_conflicts`), otherwise handed back to rebase. The batch gets the next free version (from tags, or the version files), an optional regeneration command, and a PR closing every carried issue. On a later tick: green and mergeable → merge, tag, deploy, then the same pipeline gate as `direct` watches the base branch. Red → re-run the failed jobs once (more if the failure was the network). Still red → close the release, park the carried heads until their agents push, and hand each issue back.
 
+**Release windows** (`[integrate.train] windows`, DEP-13) decide when a batch may *open*. Inside a window the train batches as above, until `per_window` normal releases have merged in that window instance (a red or closed batch does not count). Outside a window, or once the quota is used, a batch opens only if a ready issue is a hotfix (a `hotfix_labels` label, `<state>/priority`, or the fix-forward issue of a red base), and it carries only the hotfixes. An open release always runs to the end (CI, merge, tag, deploy, base watch), whatever the time. `nohalt release-now` writes `RELEASE_NOW`: the next batch is a normal one regardless of windows, used once. The train records each release's kind (`normal`, `hotfix`, `manual`) and window in `train.json`, the merged count per window (`windows_used`), and what waits on the schedule (`waiting`, shown by `nohalt status`).
+
 ## State on disk
 
 ```
@@ -103,7 +105,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   async.json               per async workflow: its open issue, the last run read, its failures, what the agent saw
   status.json              last tick's summary (for `nohalt status`)
   supervisor.json          the running supervisor: pid, start time, hash of the config it loaded
-  STOP PAUSE WAKE RESTART BATCH_PAUSE DEPLOY_BLOCKED BUDGET_EXHAUSTED CONFIG_INVALID   control flags
+  STOP PAUSE WAKE RESTART BATCH_PAUSE RELEASE_NOW DEPLOY_BLOCKED BUDGET_EXHAUSTED CONFIG_INVALID   control flags
   priority hold            one issue per line (train ordering / exclusion)
   bin/                     guard shims
   locks/verify-<slot>.lock verification slots
