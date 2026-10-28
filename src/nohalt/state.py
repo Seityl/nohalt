@@ -60,6 +60,8 @@ class IssueRecord:
     done_at: float = 0.0  # when nohalt saw the issue closed; comments after it are handed over on a reopen
     labelled: bool = False  # the forge carries the blocked label we put there
     swept: list[str] = field(default_factory=list)  # PR head SHAs already handed back
+    lane: str = ""  # the [[prompt.lane]] chosen at the first launch ("" = no lane); kept across relaunches
+    lane_digest: str = ""  # the lanes' configuration it was chosen under ("" = not chosen yet)
     # The review gate (review.py). A reviewer runs beside the record's own agent slot.
     review_pid: int = 0
     review_model: str = ""

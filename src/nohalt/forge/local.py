@@ -53,7 +53,7 @@ class LocalForge:
                 self._write(data)
 
     # -- seeding (tests) ----------------------------------------------------------------
-    def add_issue(self, number: int, title: str = "", labels: list[str] | None = None, state: str = OPEN) -> None:
+    def add_issue(self, number: int, title: str = "", labels: list[str] | None = None, state: str = OPEN, body: str = "") -> None:
         with self._db() as d:
             d["issues"][str(number)] = {
                 "title": title or f"Issue {number}",
@@ -61,6 +61,8 @@ class LocalForge:
                 "state": state,
                 "updated": time.time(),
             }
+            if body:
+                d["issues"][str(number)]["body"] = body
             d["next"] = max(d["next"], number + 1)
 
     def set_state(self, number: int, state: str) -> None:
@@ -108,7 +110,7 @@ class LocalForge:
             i = d["issues"].get(str(number))
         if not i:
             return Issue(number, MISSING)
-        return Issue(number, i["state"], i["title"], list(i["labels"]))
+        return Issue(number, i["state"], i["title"], list(i["labels"]), body=i.get("body", ""))
 
     def add_label(self, number: int, label: str) -> None:
         with self._db() as d:

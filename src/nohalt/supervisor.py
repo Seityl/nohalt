@@ -1013,10 +1013,22 @@ class Supervisor:
         name, _ = agents.split_model(model)
         return agents.get(name, self.cfg.agents.options.get(name))
 
+    def settle_lane(self, rec: IssueRecord, issue: Issue) -> str:
+        """Choose (once) or re-choose (the lanes changed) the issue's prompt lane; log a change."""
+        change = prompt_mod.settle_lane(self.cfg, rec, issue)
+        if change:
+            self.say(f"#{issue.number}: {change}")
+        return change
+
+    def compose_prompt(self, rec: IssueRecord, issue: Issue, branch: str, tree: Path) -> str:
+        """The rendered author prompt in the issue's lane, without the issue text or the supervisor's note."""
+        lane = prompt_mod.find_lane(self.cfg, rec.lane)
+        text = prompt_mod.template(self.cfg, self.stack.prompt_addendum, lane)
+        values = prompt_mod.values(self.cfg, issue=issue.number, title=issue.title, branch=branch, worktree=tree, lane=lane)
+        return prompt_mod.render(text, values)
+
     def render_prompt(self, rec: IssueRecord, issue: Issue, branch: str, tree: Path) -> str:
-        text = prompt_mod.template(self.cfg, self.stack.prompt_addendum)
-        values = prompt_mod.values(self.cfg, issue=issue.number, title=issue.title, branch=branch, worktree=tree)
-        body = prompt_mod.render(text, values)
+        body = self.compose_prompt(rec, issue, branch, tree)
         if self.cfg.prompt.inline_issue:
             try:
                 body += f"\n## The issue, as it read when you were launched\n\n{self.forge.issue_text(issue.number)}\n"
@@ -1042,11 +1054,14 @@ class Supervisor:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
 
+        lane_change = self.settle_lane(rec, issue)
         resume = rec.resume and not rec.fresh and model == rec.model and rec.started_at > 0
         if resume:
             text = agents.RESUME_PROMPT.format(why=rec.note or "restarted")
             if rec.note:
                 text += f"\n\nNote from the supervisor: {rec.note}"
+            if lane_change:
+                text += self._lane_change_note(rec, issue, branch, tree, lane_change)
         else:
             text = self.render_prompt(rec, issue, branch, tree)
         title = f"{self.cfg.agents.title_prefix} #{issue.number}"
@@ -1086,6 +1101,14 @@ class Supervisor:
             f"#{issue.number}: agent launched on {model} in {tree} ({branch})"
             + (" -- resumed" if resume else "")
             + (f" -- {overflow}" if overflow else "")
+        )
+
+    def _lane_change_note(self, rec: IssueRecord, issue: Issue, branch: str, tree: Path, change: str) -> str:
+        """A resumed session was briefed in its old lane: give it the new instructions in full."""
+        return (
+            f"\n\n## Your instructions changed\n\nThe {change.replace('prompt lane', 'lane of this issue', 1)}. "
+            "The instructions below replace the ones you were given when you started; where they differ, they win.\n\n"
+            + self.compose_prompt(rec, issue, branch, tree)
         )
 
     def agent_env(self, issue: int, spec: agents.Launch) -> dict[str, str]:

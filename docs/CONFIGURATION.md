@@ -216,7 +216,47 @@ By default the train opens a batch whenever no release is open, so with a `deplo
 | `extra` | `[]` | your project's own prompt files, appended in order |
 | `vars` | `{}` | extra `{{PLACEHOLDERS}}`. **Never put secrets here**: prompts end up in logs |
 
-Placeholders available: `{{ISSUE}} {{TITLE}} {{REPO}} {{BRANCH}} {{WORKTREE}} {{BASE}} {{VERIFY}}`, `{{SITE}}` when `verify.placeholder` is set, plus `vars`. An undefined placeholder is an error, not an empty string. Run `nohalt prompt <issue>` to see exactly what an agent will be told.
+Placeholders available: `{{ISSUE}} {{TITLE}} {{REPO}} {{BRANCH}} {{WORKTREE}} {{BASE}} {{VERIFY}}`, `{{LANE}} {{LANE_NAME}}` (empty without a lane), `{{SITE}}` when `verify.placeholder` is set, plus `vars`. An undefined placeholder is an error, not an empty string. Run `nohalt prompt <issue>` to see exactly what an agent will be told.
+
+### Prompt lanes
+
+One composed prompt per project is one set of rules for every issue. A **lane** gives some issues different rules -- say, the children of a large feature tracker get "full delivery" while everything else keeps a fast lane -- without one shared prompt full of "if your issue says…, ignore the section above" (PRM-10).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | -- | required, unique. Kept on the issue record and shown by `nohalt status` |
+| `labels` | `[]` | selects issues carrying any of these labels (case-insensitive) |
+| `title` | `""` | selects issues whose title matches this regex (case-insensitive) |
+| `body` | `""` | selects issues whose description matches this regex (case-insensitive, `^`/`$` per line), e.g. `"Part of #4194"` |
+| `tracker` | `[]` | an issue number, or a list: selects that tracker's children, the issues whose description says `Part of #N` |
+| `extra` | `[]` | prompt files appended after `[prompt] extra` |
+| `replace` | `[]` | `[prompt] extra` entries this lane leaves out, written exactly as in `extra` |
+| `verify_scope` | `""` | free text for `{{LANE}}`: how this lane verifies. If no prompt file uses `{{LANE}}`, it is appended as a section of its own |
+
+A lane needs at least one selector; any one matching selects it. Lanes are tried in order: **the first match wins**, and an issue no lane matches has no lane (the project's prompt as it is).
+
+```toml
+[prompt]
+extra = ["prompts/house-rules.md", "prompts/fast-lane.md"]
+
+[[prompt.lane]]
+name = "full-delivery"
+tracker = 4194                       # every "Part of #4194" issue
+labels = ["epic"]
+extra = ["prompts/full-delivery.md"]
+replace = ["prompts/fast-lane.md"]   # no fast lane for these
+verify_scope = "Run the whole test module you touched, and attach a screenshot for every acceptance item."
+
+[[prompt.lane]]
+name = "docs"
+title = "^docs"
+verify_scope = "Build the docs; no test run is needed."
+```
+
+- **Chosen once, kept.** The lane is chosen at an issue's first launch and kept on its record (`issues/<n>.json`: `lane`, plus a digest of the lanes it was chosen under). Every relaunch -- a resume, a hand-back, a retry, a fresh session -- uses the same lane, even if the issue's labels or text change.
+- **A changed configuration chooses again.** When the `[[prompt.lane]]` tables change, each issue's lane is chosen again at its next launch; a different answer is logged (`#12: prompt lane changed from (none) to full-delivery`) and recorded in the issue's history. A resumed session, which was briefed in its old lane, is given the new instructions in full. A running agent is never touched.
+- **The reviewer** (`[review]`) is given the same lane: its files, and the issue's `verify_scope`, are among the rules it checks the PR against.
+- `nohalt status` lists each issue's lane; `nohalt prompt <issue>` prints the prompt in the lane the next launch would use, and says which (on stderr).
 
 ## [review]
 
@@ -228,8 +268,10 @@ Green CI says the tests pass, not that the issue is done. With `[review]` enable
 | `all` | `false` | every issue needs review |
 | `labels` | `[]` | issues carrying any of these labels need review |
 | `title` | `""` | a regex on the title (case-insensitive): matching issues need review |
-| `model` | `[models] default` | the reviewer, `<agent>:<model>`. It may differ from the author's: a local model reviewing Claude's work, or Claude reviewing a local model's. A reviewer takes a slot in its model's pool (`[agents] pools`, else `max_parallel`) like any agent |
-| `fallbacks` | `[]` | reviewer models tried in order when `model` has no free slot or does not answer a probe |
+| `model` | `[models] default` | the reviewer, `<agent>:<model>`, for authors `models` does not map. It may differ from the author's: a local model reviewing Claude's work, or Claude reviewing a local model's. A reviewer takes a slot in its model's pool (`[agents] pools`, else `max_parallel`) like any agent |
+| `models` | `{}` | author model prefix → reviewer, e.g. `{ "opencode:" = "claude-code:sonnet", "claude-code:" = "opencode:local/coder" }`: the reviewer is chosen from the model that wrote the PR (the issue's last launch), and the longest matching prefix wins. Then `model`, then `fallbacks` |
+| `distinct` | `true` | never review a PR with the exact model that wrote it: that model is skipped and the next one that differs is used. If none differs, the issue is blocked for a human with a message that says so (`nohalt doctor` warns beforehand). `false` allows it |
+| `fallbacks` | `[]` | reviewer models tried in order when the ones before have no free slot or do not answer a probe |
 | `max_rounds` | `2` | "changes" verdicts handed back to the author. One more, and the issue is blocked: "review: changes still requested after N round(s)" |
 | `attempts` | `3` | reviews that ended without a verdict (time limit, hang, no verdict line) before the issue goes to a human. Never an approval |
 | `timeout` | `"1h"` | a reviewer running longer is stopped (and that review counts against `attempts`) |
@@ -246,6 +288,17 @@ max_rounds = 2
 prompt = ["prompts/review-rules.md"]
 ```
 
+Two model families checking each other (AGT-21): Claude reviews what the self-hosted model wrote, and the other way round. A PR whose author overflowed or failed over is reviewed by the mapping for the model it ran on last.
+
+```toml
+[review]
+enabled = true
+all = true
+models = { "opencode:" = "claude-code:sonnet", "claude-code:" = "opencode:local/coder" }
+model = "claude-code:sonnet"          # authors no prefix matches
+fallbacks = ["opencode:local/coder"]  # distinct = true skips whichever of these wrote the PR
+```
+
 The reviewer's prompt is the built-in review prompt, your `prompt` files, then the rules your authors were given (the stack's addendum and `[prompt] extra`), so "every new string is translated" or "every endpoint checks roles" are checked as well as stated. The issue's text and comments are inlined, and on a re-review so is the previous review.
 
 How it works:
@@ -256,7 +309,7 @@ How it works:
 - **Read-only.** The reviewer runs with `NOHALT_READONLY=1`: the `git` shim refuses every push and the `gh`/`glab` shims allow reads only. As with the merge refusal, that is a speed bump; the binding rule is that a verdict counts only if the PR head is still the commit reviewed.
 - **Failures.** A reviewer that hits an endpoint error is retried with backoff (`[agents] provider_retries`, not counted); a usage limit waits; a time limit, a hang or a missing verdict is retried up to `attempts`. Never an approval.
 - **Restarts.** A reviewer runs in its own session; a restarted supervisor adopts it from the issue record. `nohalt stop --now` stops reviewers too; their reviews start again from scratch.
-- `nohalt status` shows `in_review` with the reviewer's model and round, and each issue's last verdict.
+- `nohalt status` shows `in_review` with the reviewer's model and round, and each issue's last verdict. The review posted on the PR names the reviewer's model and the author's.
 
 ## Example: self-hosted GitLab
 

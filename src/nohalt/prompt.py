@@ -4,19 +4,33 @@ Prompts are composed per project, never copied between projects: a prompt
 carried over by search-and-replace once told agents on a non-Frappe project
 to run ``bench build`` and to "use npm, never npm". So rendering is strict --
 a ``{{PLACEHOLDER}}`` that nothing defines is an error, not an empty string.
+
+A *lane* (``[[prompt.lane]]``) is a per-issue variant of the project's files:
+it drops some ``[prompt] extra`` files and appends its own. The lane is chosen
+once, at an issue's first launch, and kept on the issue record, so every
+relaunch (and the reviewer) gets the same rules. Only a change to the lanes in
+the configuration chooses again, and a different answer is logged.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shlex
 import sys
+from dataclasses import asdict
 from importlib import resources
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .config import Config
+from .config import Config, PromptLane
 from .forge import Comment
 from .util import stamp
+
+if TYPE_CHECKING:
+    from .forge import Issue
+    from .state import IssueRecord
 
 _VAR = re.compile(r"\{\{\s*([A-Z][A-Z0-9_]*)\s*\}\}")
 
@@ -43,23 +57,88 @@ def _read(cfg: Config, ref: str) -> str:
         raise PromptError(f"cannot read prompt {p}: {e}") from None
 
 
-def template(cfg: Config, stack_addendum: str = "") -> str:
+# -- lanes ---------------------------------------------------------------------------------------------
+def lane_matches(lane: PromptLane, issue: Issue) -> bool:
+    """Any of the lane's selectors matching selects it."""
+    if lane.labels and issue.has_label(*lane.labels):
+        return True
+    if lane.title and re.search(lane.title, issue.title or "", re.I):
+        return True
+    if lane.body and re.search(lane.body, issue.body or "", re.I | re.M):
+        return True
+    return any(re.search(rf"\bpart of\s+#{n}\b", issue.body or "", re.I) for n in lane.tracker)
+
+
+def select_lane(cfg: Config, issue: Issue) -> PromptLane | None:
+    """The first lane that matches the issue, or None (no lane)."""
+    return next((lane for lane in cfg.prompt.lane if lane_matches(lane, issue)), None)
+
+
+def find_lane(cfg: Config, name: str) -> PromptLane | None:
+    return next((lane for lane in cfg.prompt.lane if name and lane.name == name), None)
+
+
+def lanes_digest(cfg: Config) -> str:
+    """Identifies the lanes as configured: a record chosen under another digest chooses again."""
+    raw = json.dumps([asdict(lane) for lane in cfg.prompt.lane], sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def settle_lane(cfg: Config, rec: IssueRecord, issue: Issue) -> str:
+    """Choose the issue's lane if it has none yet, or if the lanes changed since it was chosen.
+
+    Updates ``rec`` (the caller saves it). Returns a description of a change of lane for an issue
+    that already had one chosen ("" when nothing changed, or on the first choice)."""
+    digest = lanes_digest(cfg)
+    if rec.lane_digest == digest:
+        return ""
+    lane = select_lane(cfg, issue)
+    new = lane.name if lane else ""
+    first = not rec.lane_digest
+    old, rec.lane, rec.lane_digest = rec.lane, new, digest
+    if first:
+        if new:
+            rec.event(f"prompt lane: {new}")
+        return ""
+    if new == old:
+        return ""
+    change = f"prompt lane changed from {old or '(none)'} to {new or '(none)'} (the lanes in the configuration changed)"
+    rec.event(change)
+    return change
+
+
+def _extra(cfg: Config, lane: PromptLane | None) -> list[str]:
+    refs = [r for r in cfg.prompt.extra if not lane or r not in lane.replace]
+    return refs + (lane.extra if lane else [])
+
+
+def template(cfg: Config, stack_addendum: str = "", lane: PromptLane | None = None) -> str:
     parts = [_read(cfg, cfg.prompt.template)]
     if stack_addendum:
         parts.append(_read(cfg, stack_addendum))
-    parts += [_read(cfg, ref) for ref in cfg.prompt.extra]
+    parts += [_read(cfg, ref) for ref in _extra(cfg, lane)]
+    if lane and lane.verify_scope and not any(_has_var(p, "LANE") for p in parts):
+        parts.append(f"## This issue's lane: {lane.name}\n\n{{{{LANE}}}}")
     return "\n\n".join(p.strip() for p in parts) + "\n"
 
 
-def review_template(cfg: Config, stack_addendum: str = "") -> str:
+def _has_var(text: str, name: str) -> bool:
+    return any(m.group(1) == name for m in _VAR.finditer(text))
+
+
+def review_template(cfg: Config, stack_addendum: str = "", lane: PromptLane | None = None) -> str:
     """The reviewer's prompt: the built-in review prompt, ``[review] prompt`` files, then the
-    rules the author was given (stack addendum and ``[prompt] extra``), to check the PR against."""
+    rules the author was given (stack addendum, ``[prompt] extra`` and the issue's lane), to check the PR against."""
     parts = [_read(cfg, "builtin:review"), *(_read(cfg, ref) for ref in cfg.review.prompt)]
-    rules = ([_read(cfg, stack_addendum)] if stack_addendum else []) + [_read(cfg, ref) for ref in cfg.prompt.extra]
+    rules = ([_read(cfg, stack_addendum)] if stack_addendum else []) + [_read(cfg, ref) for ref in _extra(cfg, lane)]
+    if lane and lane.verify_scope:
+        rules.append(f"How this issue must be verified ({lane.name} lane):\n\n{{{{LANE}}}}")
     if rules:
+        which = f" This issue is in the **{lane.name}** lane." if lane else ""
         parts.append(
-            "## The project's rules for authors\n\nThe author was given these rules. Check the change against them; "
-            "they do not apply to you where they ask for commits, pushes or PRs.\n\n" + "\n\n".join(r.strip() for r in rules)
+            "## The project's rules for authors\n\nThe author was given these rules." + which + " Check the change against "
+            "them; they do not apply to you where they ask for commits, pushes or PRs.\n\n"
+            + "\n\n".join(r.strip() for r in rules)
         )
     return "\n\n".join(p.strip() for p in parts) + "\n"
 
@@ -111,7 +190,14 @@ def forge_terms(cfg: Config, issue: int) -> dict[str, str]:
 
 
 def values(
-    cfg: Config, *, issue: int, title: str, branch: str, worktree: Path, extra: dict[str, str] | None = None
+    cfg: Config,
+    *,
+    issue: int,
+    title: str,
+    branch: str,
+    worktree: Path,
+    extra: dict[str, str] | None = None,
+    lane: PromptLane | None = None,
 ) -> dict[str, str]:
     v = {
         "ISSUE": str(issue),
@@ -121,6 +207,8 @@ def values(
         "WORKTREE": str(worktree),
         "BASE": cfg.project.base_branch,
         "VERIFY": verify_command(cfg, worktree),
+        "LANE": lane.verify_scope if lane else "",
+        "LANE_NAME": lane.name if lane else "",
         **forge_terms(cfg, issue),
     }
     if cfg.verify.placeholder:

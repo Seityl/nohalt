@@ -92,6 +92,7 @@ class GitHub:
             OPEN if data.get("state") == "open" else CLOSED,
             title=data.get("title") or "",
             labels=[lab["name"] for lab in data.get("labels") or []],
+            body=data.get("body") or "",
         )
 
     def add_label(self, number: int, label: str) -> None:

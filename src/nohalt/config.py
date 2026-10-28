@@ -182,11 +182,26 @@ class StackCfg:
 
 
 @dataclass
+class PromptLane:
+    """A per-issue variant of the author prompt, chosen once per issue and kept on its record."""
+
+    name: str = ""
+    labels: list[str] = field(default_factory=list)  # any label matches (case-insensitive)
+    title: str = ""  # regex on the title
+    body: str = ""  # regex on the issue's description, e.g. "Part of #4194"
+    tracker: list[int] = field(default_factory=list)  # children of these issues ("Part of #N" in their body)
+    extra: list[str] = field(default_factory=list)  # prompt files appended after [prompt] extra
+    replace: list[str] = field(default_factory=list)  # [prompt] extra entries this lane leaves out
+    verify_scope: str = ""  # the {{LANE}} placeholder
+
+
+@dataclass
 class PromptCfg:
     inline_issue: bool = False  # put the issue's text and comments in the prompt (agents need no forge CLI to read it)
     template: str = "builtin:core"
     extra: list[str] = field(default_factory=list)
     vars: dict[str, str] = field(default_factory=dict)
+    lane: list[PromptLane] = field(default_factory=list)  # [[prompt.lane]]: the first match wins; none: no lane
 
 
 @dataclass
@@ -196,6 +211,8 @@ class ReviewCfg:
     labels: list[str] = field(default_factory=list)  # issues carrying any of these need review
     title: str = ""  # regex on the title: matching issues need review
     model: str = ""  # the reviewer, <agent>:<model>; default: [models] default
+    models: dict[str, str] = field(default_factory=dict)  # author model prefix -> reviewer; the longest prefix wins
+    distinct: bool = True  # never review a PR with the exact model that wrote it
     fallbacks: list[str] = field(default_factory=list)  # tried in order when the reviewer model does not answer
     max_rounds: int = 2  # "changes" verdicts handed back before the issue goes to a human
     attempts: int = 3  # reviews that ended without a verdict (timeout, hang, no verdict) before a human is asked
@@ -286,7 +303,6 @@ def from_dict(data: dict[str, Any], root: Path, source: Path | None = None) -> C
         "queue": QueueCfg,
         "agents": AgentsCfg,
         "budget": BudgetCfg,
-        "prompt": PromptCfg,
         "review": ReviewCfg,
     }
     cfg = Config(root=root, source=source)
@@ -294,6 +310,13 @@ def from_dict(data: dict[str, Any], root: Path, source: Path | None = None) -> C
         if name in data:
             setattr(cfg, name, _build(cls, data.pop(name), name))
 
+    if "prompt" in data:
+        p = dict(data.pop("prompt"))
+        lanes = p.pop("lane", [])
+        if not isinstance(lanes, list):
+            raise ConfigError("[prompt] lane: write each lane as a [[prompt.lane]] table")
+        cfg.prompt = _build(PromptCfg, p, "prompt")
+        cfg.prompt.lane = [_build(PromptLane, ln, "prompt.lane") for ln in lanes]
     if "models" in data:
         m = dict(data.pop("models"))
         routes = [_build(RouteRule, r, "models.route") for r in m.pop("route", [])]
@@ -360,7 +383,9 @@ def validate(cfg: Config) -> None:
             re.compile(cfg.review.title)
         except re.error as e:
             raise ConfigError(f"[review] title: not a regular expression: {e}") from None
-    reviewers = [cfg.review.model, *cfg.review.fallbacks] if cfg.review.model else cfg.review.fallbacks
+    _validate_lanes(cfg)
+    reviewers = [cfg.review.model, *cfg.review.fallbacks] if cfg.review.model else list(cfg.review.fallbacks)
+    reviewers += list(cfg.review.models.values())
     models = cfg.models
     for model in [models.default, *models.fallbacks, *models.overflow_to, *(r.model for r in models.route), *reviewers]:
         if ":" not in model:
@@ -387,6 +412,34 @@ def validate(cfg: Config) -> None:
     for glob, driver in cfg.integrate.mergers.items():
         if driver not in DRIVERS:
             raise ConfigError(f"[integrate.mergers] {glob!r}: unknown driver {driver!r} (known: {', '.join(DRIVERS)})")
+
+
+def _validate_lanes(cfg: Config) -> None:
+    seen: set[str] = set()
+    for i, lane in enumerate(cfg.prompt.lane, 1):
+        where = f"[[prompt.lane]] {lane.name or '#' + str(i)}"
+        for key in ("labels", "extra", "replace"):
+            if isinstance(getattr(lane, key), str):
+                setattr(lane, key, [getattr(lane, key)])
+        if isinstance(lane.tracker, int) and not isinstance(lane.tracker, bool):
+            lane.tracker = [lane.tracker]
+        if not lane.name:
+            raise ConfigError(f"{where}: every lane needs a name (it is kept on the issue record)")
+        if lane.name in seen:
+            raise ConfigError(f"{where}: two lanes are called {lane.name!r}")
+        seen.add(lane.name)
+        if not (lane.labels or lane.title or lane.body or lane.tracker):
+            raise ConfigError(f"{where}: give it a selector (labels, title, body or tracker)")
+        for key in ("title", "body"):
+            try:
+                re.compile(getattr(lane, key))
+            except re.error as e:
+                raise ConfigError(f"{where}: {key}: not a regular expression: {e}") from None
+        if any(isinstance(t, bool) or not isinstance(t, int) or t < 1 for t in lane.tracker):
+            raise ConfigError(f"{where}: tracker must be an issue number, or a list of them")
+        unknown = [r for r in lane.replace if r not in cfg.prompt.extra]
+        if unknown:
+            raise ConfigError(f"{where}: replace {', '.join(map(repr, unknown))}: not in [prompt] extra")
 
 
 def load(path: Path | str | None = None) -> Config:
