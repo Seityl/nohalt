@@ -10,7 +10,7 @@ import pytest
 
 from nohalt import config as config_mod
 from nohalt.forge import Issue
-from nohalt.review import Reviews, parse_verdict
+from nohalt.review import Reviews, body_hash, parse_verdict
 from nohalt.state import BLOCKED, DONE, IN_REVIEW, QUEUED, READY, WAITING_CI
 from nohalt.supervisor import Supervisor
 
@@ -73,7 +73,86 @@ def test_nothing_pushed_after_changes_counts_another_round_without_a_new_review(
     r = w.rec(1)
     assert r.status == READY and r.review_rounds == 2
     assert len(w.review_prompts(1)) == 2
-    assert "pushing anything" in w.prompts(1)[2]
+    assert "pushing anything or editing the PR description" in w.prompts(1)[2]
+
+
+def test_a_description_edit_alone_is_reviewed_again_without_a_round(world):
+    """#74: the review asked for the description; the author edited it and pushed nothing."""
+    w = world(review={**REVIEW, "max_rounds": 1})
+    w.issue(1, "pr-green", "describe Acceptance: real-backend run PASS", labels=["careful"])
+    w.review(1, "changes add an Acceptance section", "approve")
+    w.drive(10)
+    r = w.rec(1)
+    assert r.status == READY and r.review_rounds == 1  # the one "changes" verdict; the edit cost nothing
+    assert r.review_approved == r.pr_sha == r.review_sha  # the same head, reviewed twice
+    assert "updated-description" in w.prompts(1)[1]  # the hand-back says how to report a description fix
+    first, second = w.review_prompts(1)
+    assert "Acceptance: real-backend run PASS" not in first
+    assert "Acceptance: real-backend run PASS" in second  # the reviewer judges the description it now has
+    assert "the author edited the description instead" in second
+    assert any("the author says it updated the PR description" in h for h in r.history)
+    assert any("its description changed (the author: Acceptance: real-backend run PASS)" in h for h in r.history)
+
+
+def test_the_description_hash_decides_not_the_marker(world):
+    w = world(review={**REVIEW, "max_rounds": 3})
+    script = ["pr-green", "describe-quiet Acceptance table", "claim-describe screenshots listed", "push-green"]
+    w.issue(1, *script, labels=["careful"])
+    w.review(1, "changes list the screenshots", "changes the screenshots are still missing", "approve")
+    w.drive(16)
+    r = w.rec(1)
+    # An edit nobody announced is a change (reviewed again); an announced edit that never reached the PR is not.
+    assert r.status == READY and r.review_rounds == 3
+    assert len(w.review_prompts(1)) == 3
+    assert "Acceptance table" in w.review_prompts(1)[1]
+    assert "the edit did not reach the PR" in w.prompts(1)[3]
+
+
+def test_a_description_edit_after_approval_keeps_the_approval(world):
+    w = world(review=REVIEW)
+    w.issue(1, "pr-green", labels=["careful"])
+    w.review(1, "approve", "changes should never run")
+    w.drive(4)
+    first = w.rec(1)
+    assert first.status == READY and first.review_approved == first.pr_sha
+    with w.forge._db() as d:
+        d["pulls"][str(first.pr)]["body"] += "\n\nA late note on the description."
+    w.drive(2)
+    r = w.rec(1)
+    assert r.status == READY and r.review_approved == first.pr_sha
+    # Even through the gate again (back from a green re-check): the code it approved has not changed.
+    r.status = WAITING_CI
+    w.sup.state.put(r)
+    w.sup.reviews.gate(r, w.forge.pull(r.pr))
+    assert w.rec(1).status == READY and w.rec(1).review_approved == first.pr_sha
+    assert len(w.review_prompts(1)) == 1
+
+
+def test_a_review_from_before_descriptions_were_recorded_trusts_the_marker_once(tmp_path):
+    from nohalt.forge import PullRequest
+    from nohalt.state import IssueRecord
+
+    pr = PullRequest(7, "b", "a" * 40, body="Closes #1")
+    old = IssueRecord(issue=1)  # review_body "": written before #74
+    assert Reviews._description_changed(old, pr, "added the Acceptance table")
+    assert not Reviews._description_changed(old, pr, "")
+    new = IssueRecord(issue=1, review_body=body_hash("Closes #1"))
+    assert not Reviews._description_changed(new, pr, "added the Acceptance table")  # the hash decides
+    assert Reviews._description_changed(new, PullRequest(7, "b", "a" * 40, body="Closes #1\n\nAcceptance"), "")
+
+
+def test_body_hash_ignores_what_the_forge_rewrites():
+    assert body_hash("a\r\nb  \n\n") == body_hash("a\nb")
+    assert body_hash("a\nb") != body_hash("a\nb\nc")
+    assert body_hash("") == body_hash(None)  # type: ignore[arg-type]
+
+
+def test_updated_description_reads_the_marker():
+    from nohalt.agents import updated_description
+
+    assert updated_description("done\nNOHALT-RESULT: updated-description -- Acceptance table\n") == "Acceptance table"
+    assert updated_description("end with `NOHALT-RESULT: updated-description -- <what you changed>`") is None
+    assert updated_description("NOHALT-RESULT: no-change -- fixed on main") is None
 
 
 def test_the_reviewer_cannot_push(world):

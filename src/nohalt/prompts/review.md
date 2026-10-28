@@ -13,7 +13,7 @@ Read anything, run anything that only reads or tests: the diff, the code, the te
        {{ISSUE_VIEW}}
 
    Follow what it references (a tracking issue, a parent, a spec, a linked document) far enough to know what "done" means here.
-2. The {{PR}} and its description: `{{PR_VIEW}}`
+2. The {{PR}} and its description: `{{PR_VIEW}}`. The description as it read at your launch is also at the end of this prompt; judge that one -- it is the one your verdict is recorded against.
 3. The change itself: `git diff origin/{{BASE}}...HEAD` (and `git log --oneline origin/{{BASE}}..HEAD`).
 4. The repository's own agent and contributor instructions (`AGENTS.md`, `CONTRIBUTING.md`, `CLAUDE.md` or similar), and the project rules below, if any. The author was bound by them; so is the {{PR}}.
 
@@ -27,6 +27,7 @@ Then look for what green CI does not catch:
 - **Stubs and placeholders.** `TODO`, `FIXME`, `pass`, `NotImplemented`, hard-coded sample data, mocked behaviour standing in for the real thing, a feature behind a flag nothing turns on.
 - **Tests.** New behaviour without a test that would fail without it; tests weakened, skipped or deleted; assertions that cannot fail.
 - **Safety of anything exposed.** New endpoints, handlers or commands: who may call them (role and permission checks), input validation, error handling.
+- **The description.** Claims the code does not back, stale claims from an earlier version of the {{PR}}, evidence the issue or the project rules require but the description lacks. A fix that is only a description edit is a valid fix: the author can make it without pushing, and you are run again when the description changes.
 - **Docs, translations, migrations, changelog entries** -- whatever the project's rules require alongside a change like this one.
 - **Unrelated changes.** Edits the issue did not ask for.
 - **Already done, or no longer wanted.** Check `origin/{{BASE}}`: the fix may already be there (a duplicate), or the issue may have been superseded or closed in favour of another. Either is a reason to ask for changes, saying which commit or issue.
