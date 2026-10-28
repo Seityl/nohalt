@@ -32,6 +32,10 @@ Linux is the supported platform (the supervisor reads `/proc`).
 
 Releases are automated with [release-please](https://github.com/googleapis/release-please):
 
+**Versions before 1.0:** a `feat:` or `fix:` is a **patch** (0.2.0 → 0.2.1). Only a breaking change (`feat!:` or a `BREAKING CHANGE:` footer) moves the **minor**, because below 1.0 the minor is the only compatibility signal left. From 1.0 on, normal semver applies.
+
+**Cadence:** releases are cut **weekly**, batched, by merging the open `chore: release` PR. Unreleased work on `main` waits for the next one.
+
 1. Conventional commits land on `main`; release-please keeps a `chore: release x.y.z` PR open with the version bump and changelog.
 2. Pull requests opened by GitHub Actions do not trigger other workflows, so run CI on the release PR's branch once: `gh workflow run CI --ref release-please--branches--main`. Its checks then satisfy branch protection.
 3. Merge the release PR. release-please tags `vX.Y.Z`, creates the GitHub release and dispatches `publish.yml`, which builds the distributions, attaches them to the release and publishes to PyPI via trusted publishing (publisher: workflow `publish.yml`, environment `pypi`). To re-publish an existing tag: `gh workflow run publish.yml -f tag=vX.Y.Z`.
