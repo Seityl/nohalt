@@ -115,10 +115,13 @@ class Reviews:
         if rec.status == READY:
             return
         reviewed = rec.review_approved == pr.head_sha and bool(rec.review_approved)
+        how = " and approved" if reviewed else ""
+        if reviewed and rec.review_carried:
+            how += f" (the approval of {rec.review_carried[:8]}, carried over nohalt refreshes)"
         rec.status = READY
-        rec.event(f"{sup.pr(pr.number)} green on {pr.head_sha[:8]}" + (" and approved" if reviewed else ""))
+        rec.event(f"{sup.pr(pr.number)} green on {pr.head_sha[:8]}{how}")
         sup.state.put(rec)
-        sup.say(f"#{rec.issue}: {sup.pr(pr.number)} green{' and approved' if reviewed else ''} -- ready to integrate")
+        sup.say(f"#{rec.issue}: {sup.pr(pr.number)} green{how} -- ready to integrate")
 
     # -- each tick ---------------------------------------------------------------------------------------
     def tick(self) -> None:
@@ -430,6 +433,7 @@ class Reviews:
     def _approve(self, rec: IssueRecord, text: str) -> None:
         sup = self.sup
         rec.review_verdict, rec.review_text, rec.review_approved = APPROVE, text, rec.review_sha
+        rec.review_carried = ""
         rec.status = READY
         rec.event(f"review approved {rec.review_sha[:8]} ({rec.review_model})")
         sup.state.put(rec)

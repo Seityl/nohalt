@@ -448,6 +448,7 @@ def render_status(cfg: Config) -> str:
             "reviews: "
             + "  ".join(
                 f"#{r.issue} {r.review_verdict} on {r.review_sha[:8]} (round {r.review_rounds}/{cfg.review.max_rounds})"
+                + (f", carried to {r.review_approved[:8]}" if r.review_carried and r.review_approved == r.pr_sha else "")
                 for r in reviewed[:15]
             )
         )

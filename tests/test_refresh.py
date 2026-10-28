@@ -9,11 +9,25 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 from conftest import git
 from nohalt.integrate.mergers import effective
-from nohalt.integrate.refresh import CONFLICT, DEFERRED, before_hand_back, record_conflicts, recurring_conflicts, refresh
-from nohalt.state import READY, RUNNING, WAITING_CI
+from nohalt.integrate.refresh import (
+    CONFLICT,
+    DEFERRED,
+    before_hand_back,
+    left_to_batch,
+    record_conflicts,
+    recurring_conflicts,
+    refresh,
+)
+from nohalt.state import IN_REVIEW, READY, RUNNING, WAITING_CI
+
+
+def pull_comments(w) -> list[str]:  # type: ignore[no-untyped-def]
+    return [c[1] for c in w.forge.data().get("pull_comments", [])]
+
 
 VERSION = {"path": "pkg/__init__.py", "pattern": '__version__ = "([^"]+)"'}
 PKG_VERSION = {"path": "package.json", "pattern": '"version": "([^"]+)"'}
@@ -263,3 +277,138 @@ def test_doctor_warns_about_a_recurring_conflict(tmp_path, repo):
     )
     assert "warn locale/fr.csv was left in conflict at 2 hand-backs" in cp.stdout, cp.stdout
     assert '"keep_both_lines"' in cp.stdout
+
+
+# -- the refresh and the review gate (#69) ----------------------------------------------------------------
+REVIEW = {"enabled": True, "labels": ["careful"], "model": "command:reviewer"}
+TRANSLATIONS = {"mergers": {"translations.csv": "keep_both_lines"}}
+
+
+def approved_pr(w, head: str, status: str = READY) -> None:  # type: ignore[no-untyped-def]
+    """PR 101 for issue #1 (needs review), green and approved on ``head``, conflicting with the base."""
+    conflicting_pr(w, head, status=status)
+    with w.forge._db() as d:
+        d["issues"]["1"]["labels"] = ["careful"]
+    w.forge.set_checks(head, [("ci", "completed", "success")])
+    r = w.rec(1)
+    r.review_verdict, r.review_sha, r.review_approved, r.review_model = "approve", head, head, "command:reviewer"
+    w.sup.state.put(r)
+
+
+def move_pull(w, sha: str) -> None:  # type: ignore[no-untyped-def]
+    with w.forge._db() as d:
+        d["pulls"]["101"]["head_sha"] = sha
+        d["pulls"]["101"]["mergeable"] = True
+
+
+def test_a_pr_in_review_is_not_refreshed_until_its_verdict(world, repo):
+    """INT-16 (#69): a refresh during a review moved the head, which stopped the review and started it again."""
+    head, _ = scenario(repo, {"translations.csv": "hello,hola\nbye,adios\n"}, {"translations.csv": "hello,hola\nyes,si\n"})
+    w = world(integrate={"mode": "direct", **TRANSLATIONS}, review=REVIEW)
+    conflicting_pr(w, head, status=IN_REVIEW)
+    rec, pr = w.rec(1), w.forge.pull(101)
+    out = refresh(w.sup, rec, pr)
+    assert out.status == DEFERRED and "in review" in out.why
+    assert before_hand_back(w.sup, rec, pr)  # no hand-back either: it waits, as for a running agent
+    assert remote_sha(repo, "feature/1-x") == head
+    assert w.rec(1).ci_rounds == 0 and w.rec(1).status == IN_REVIEW
+
+
+def test_train_leaves_a_conflict_its_batch_settles_unrefreshed(world, repo):
+    """INT-16 (#69): in train mode the batch settles bookkeeping with the same drivers, so the head is left alone."""
+    head, _ = scenario(repo, {"translations.csv": "hello,hola\nbye,adios\n"}, {"translations.csv": "hello,hola\nyes,si\n"})
+    w = world(integrate={"mode": "train", **TRANSLATIONS}, review=REVIEW)
+    approved_pr(w, head, status=WAITING_CI)
+    pr = w.forge.pull(101)
+    w.sup._watch(w.rec(1), SimpleNamespace())
+    assert remote_sha(repo, "feature/1-x") == head  # not refreshed
+    assert w.rec(1).status == READY and w.rec(1).ci_rounds == 0  # the approval of this head stands
+    assert "refresh.json" not in [p.name for p in w.sup.state.root.iterdir()]
+    assert left_to_batch(w.sup, w.rec(1), pr)  # asked again: answered from the cache
+    # Not green yet (a conflicted PR may get no CI): then the refresh is what unblocks it.
+    w.forge.set_checks(head, [])
+    assert not w.sup._conflict_left_to_batch(w.rec(1), pr, "pending")
+
+
+def test_train_still_hands_back_a_code_conflict(world, repo):
+    head, _ = scenario(repo, {"app.py": "x = 1\n"}, {"app.py": "x = 2\n"})
+    w = world(integrate={"mode": "train"})
+    conflicting_pr(w, head)
+    w.forge.set_checks(head, [("ci", "completed", "success")])
+    assert not left_to_batch(w.sup, w.rec(1), w.forge.pull(101))
+    w.sup._watch(w.rec(1), SimpleNamespace())
+    assert w.rec(1).ci_rounds == 1  # handed back as before
+
+
+def test_an_approval_survives_a_refresh_that_only_settles_bookkeeping(world, repo):
+    """INT-16 (#69): the refresh changed a driver path, regenerated an output and brought in the base's own change."""
+    head, _ = scenario(
+        repo,
+        {"translations.csv": "hello,hola\nbye,adios\n"},
+        {"translations.csv": "hello,hola\nyes,si\n", "app.py": "x = 2  # another PR, already released\n"},
+    )
+    w = world(
+        integrate={
+            "mode": "direct",
+            **TRANSLATIONS,
+            "train": {"after_version": "sort translations.csv > docs/_generated/ref.md"},
+        },
+        review=REVIEW,
+    )
+    approved_pr(w, head)
+    out = refresh(w.sup, w.rec(1), w.forge.pull(101))
+    assert out.status == "refreshed", out.why
+    r = w.rec(1)
+    assert r.review_approved == out.sha and r.review_carried == head and r.status == WAITING_CI
+    assert any("carries to" in c for c in pull_comments(w))
+    assert any("approval carried" in m for m in w.messages)
+
+    # CI is not carried: no checks on the new head yet, so it is neither ready nor merged.
+    move_pull(w, out.sha)
+    w.sup.tick()
+    assert w.rec(1).status == WAITING_CI and not w.forge.data()["merged"]
+    w.forge.set_checks(out.sha, [("ci", "completed", "success")])
+    w.sup.tick()
+    assert w.forge.data()["merged"] == [101], w.messages  # green, and still approved: no new review
+    assert not w.review_prompts(1)
+    assert any("carried over nohalt refreshes" in e for e in w.rec(1).history)
+
+
+def test_an_agent_push_after_a_carried_approval_needs_a_new_review(world, repo):
+    head, _ = scenario(repo, {"translations.csv": "hello,hola\nbye,adios\n"}, {"translations.csv": "hello,hola\nyes,si\n"})
+    w = world(integrate={"mode": "direct", **TRANSLATIONS}, review=REVIEW)
+    approved_pr(w, head)
+    out = refresh(w.sup, w.rec(1), w.forge.pull(101))
+    assert w.rec(1).review_approved == out.sha
+    # The agent (or a human) pushes on top of the refresh.
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "checkout", "-q", "-B", "feature/1-x", "origin/feature/1-x")
+    pushed = commit(repo, {"feature.py": "late = True\n"}, "agent work")
+    git(repo, "push", "-q", "origin", "feature/1-x")
+    move_pull(w, pushed)
+    w.forge.set_checks(pushed, [("ci", "completed", "success")])
+    w.sup._watch(w.rec(1), SimpleNamespace())
+    r = w.rec(1)
+    assert r.status == IN_REVIEW and r.review_approved == out.sha
+
+
+def test_a_refresh_that_changes_code_does_not_carry_the_approval(world, repo):
+    """Both sides changed lib.py and git merged it: that is new code next to the PR's, so it is reviewed again."""
+    base_lib = "a = 1\n\n\n\n\nb = 1\n"
+    commit(repo, {"lib.py": base_lib}, "app")
+    head, _ = scenario(
+        repo,
+        {"translations.csv": "hello,hola\nbye,adios\n", "lib.py": base_lib.replace("a = 1", "a = 2")},
+        {"translations.csv": "hello,hola\nyes,si\n", "lib.py": base_lib.replace("b = 1", "b = 2")},
+    )
+    w = world(integrate={"mode": "direct", **TRANSLATIONS}, review=REVIEW)
+    approved_pr(w, head)
+    out = refresh(w.sup, w.rec(1), w.forge.pull(101))
+    assert out.status == "refreshed", out.why
+    r = w.rec(1)
+    assert r.review_approved == head and not r.review_carried  # still the old head's approval only
+    assert any("not carried" in e and "lib.py" in e for e in r.history)
+    move_pull(w, out.sha)
+    w.forge.set_checks(out.sha, [("ci", "completed", "success")])
+    w.sup._watch(w.rec(1), SimpleNamespace())
+    assert w.rec(1).status == IN_REVIEW
