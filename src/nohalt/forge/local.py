@@ -15,12 +15,13 @@ import fcntl
 import json
 import re
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .base import CLOSED, MISSING, OPEN, Check, ForgeError, Issue, PullRequest, Run
+from .base import CLOSED, MISSING, OPEN, Check, Comment, ForgeError, Issue, PullRequest, Run
 
 
 class LocalForge:
@@ -54,12 +55,18 @@ class LocalForge:
     # -- seeding (tests) ----------------------------------------------------------------
     def add_issue(self, number: int, title: str = "", labels: list[str] | None = None, state: str = OPEN) -> None:
         with self._db() as d:
-            d["issues"][str(number)] = {"title": title or f"Issue {number}", "labels": labels or [], "state": state}
+            d["issues"][str(number)] = {
+                "title": title or f"Issue {number}",
+                "labels": labels or [],
+                "state": state,
+                "updated": time.time(),
+            }
             d["next"] = max(d["next"], number + 1)
 
     def set_state(self, number: int, state: str) -> None:
         with self._db() as d:
             d["issues"][str(number)]["state"] = state
+            d["issues"][str(number)]["updated"] = time.time()
 
     def add_pull(
         self,
@@ -115,15 +122,25 @@ class LocalForge:
             if label in labels:
                 labels.remove(label)
 
-    def comment(self, number: int, body: str) -> None:
+    def comment(self, number: int, body: str, author: str = "nohalt") -> None:
         with self._db() as d:
-            d["comments"].append([number, body])
+            d["comments"].append([number, body, time.time(), author])  # [issue, body(, at, author)]
 
     def issue_text(self, number: int) -> str:
         with self._db() as d:
             i = d["issues"].get(str(number)) or {}
             comments = [c[1] for c in d["comments"] if c[0] == number]
         return "\n\n".join([f"# #{number}: {i.get('title', '')}", i.get("body", "(no description)"), *comments])
+
+    def open_issues(self, since: float) -> set[int]:
+        with self._db() as d:
+            return {int(n) for n, i in d["issues"].items() if i["state"] == OPEN and i.get("updated", 0) >= since}
+
+    def comments_since(self, number: int, since: float) -> list[Comment]:
+        with self._db() as d:
+            rows = [c for c in d["comments"] if c[0] == number]
+        out = [Comment(c[3] if len(c) > 3 else "?", c[1], c[2] if len(c) > 2 else 0.0) for c in rows]
+        return [c for c in out if c.at >= since]
 
     def close_issue(self, number: int) -> None:
         self.set_state(number, CLOSED)
@@ -205,7 +222,7 @@ class LocalForge:
         with self._db() as d:
             d["pulls"][str(number)]["state"] = "closed"
             if comment:
-                d["comments"].append([number, comment])
+                d["comments"].append([number, comment, time.time(), "nohalt"])
 
     def checks(self, sha: str) -> list[Check]:
         with self._db() as d:

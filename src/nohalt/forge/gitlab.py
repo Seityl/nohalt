@@ -25,11 +25,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..util import run
-from .base import CLOSED, MISSING, OPEN, Check, ForgeError, Issue, PullRequest, Run
+from .base import CLOSED, MISSING, OPEN, Check, Comment, ForgeError, Issue, PullRequest, Run
 
 DEFAULT_URL = "https://gitlab.com"
 
@@ -312,6 +312,20 @@ class GitLab:
             parts += ["", f"--- comment by {(n.get('author') or {}).get('username', '?')}", n.get("body") or ""]
         return "\n".join(parts)
 
+    def open_issues(self, since: float) -> set[int]:
+        # One listing, not one call per done issue (API-05); a reopen updates the issue.
+        q = "issues?state=opened" + (f"&updated_after={_iso(since)}" if since else "")
+        return {int(d["iid"]) for d in self._all(self._p(q))}
+
+    def comments_since(self, number: int, since: float) -> list[Comment]:
+        notes = self._all(self._p(f"issues/{number}/notes?sort=asc&order_by=created_at"))
+        out = [
+            Comment((n.get("author") or {}).get("username", "?"), n.get("body") or "", _ts(n.get("created_at") or ""))
+            for n in notes
+            if not n.get("system")
+        ]
+        return [c for c in out if c.at >= since]
+
     # -- for `nohalt doctor` ------------------------------------------------------------------------
     def token_scopes(self) -> list[str]:
         try:
@@ -334,3 +348,14 @@ class GitLab:
             return self._get(self._p(f"protected_branches/{urllib.parse.quote(branch, safe='')}"), ok_404=True) is not None
         except ForgeError:
             return False
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ts(iso: str) -> float:
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0

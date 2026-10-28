@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .base import CLOSED, MISSING, OPEN, UNKNOWN, Check, Forge, ForgeError, Issue, PullRequest, Run, verdict
+from .base import CLOSED, MISSING, OPEN, UNKNOWN, Check, Comment, Forge, ForgeError, Issue, PullRequest, Run, verdict
 
 if TYPE_CHECKING:
     from ..config import ProjectCfg
@@ -37,6 +37,7 @@ __all__ = [
     "OPEN",
     "UNKNOWN",
     "Check",
+    "Comment",
     "Forge",
     "ForgeError",
     "Issue",
