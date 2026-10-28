@@ -374,6 +374,9 @@ class Reviews:
             return self._retry(rec, "the reviewer was stopped", 0)
         if agent and agent.usage_limited(log_tail):
             sup.router.prober.mark_limited(rec.review_model)
+            sig = agent.usage_signal(log_tail)
+            if sig:  # the pool cools down for authors too (capacity.py)
+                sup.capacity.usage(rec.review_model, sig, f"review #{rec.issue}", launch=rec.review_started)
             return self._retry(rec, f"the reviewer's plan hit its usage limit ({rec.review_model})", 900)
         if not exit_reason and agent and (agent.provider_failed(log_tail) or (ran_for < 300 and agent.setup_failed(log_tail))):
             if agent.setup_failed(log_tail):

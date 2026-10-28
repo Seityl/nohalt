@@ -4,16 +4,26 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import PROVIDER_ERROR, SETUP_ERROR, Launch
+from . import PROVIDER_ERROR, SETUP_ERROR, Launch, UsageSignal, usage_signal
 
 
 class OpenCode:
     name = "opencode"
 
-    def __init__(self, binary: str = "opencode", agent: str = "build", extra_args: list[str] | None = None):
+    def __init__(
+        self,
+        binary: str = "opencode",
+        agent: str = "build",
+        extra_args: list[str] | None = None,
+        usage_limit: list[str] | None = None,
+        usage_warning: list[str] | None = None,
+    ):
         self.binary = binary
         self.agent = agent
         self.extra_args = extra_args or []
+        # opencode prints no usage-window events of its own; a provider's limit text can be named here.
+        self.usage_limit = usage_limit or []
+        self.usage_warning = usage_warning or []
 
     def _env(self, data_dir: Path) -> dict[str, str]:
         # One data directory per issue. A shared session database grew to tens
@@ -43,5 +53,9 @@ class OpenCode:
         lines = [ln for ln in log_tail.splitlines() if ln.strip()][-8:]
         return PROVIDER_ERROR.search("\n".join(lines)) is not None
 
+    def usage_signal(self, log_tail: str) -> UsageSignal | None:
+        return usage_signal(log_tail, self.usage_limit, self.usage_warning)
+
     def usage_limited(self, log_tail: str) -> bool:
-        return False
+        sig = self.usage_signal(log_tail)
+        return sig is not None and sig.kind == "limit"

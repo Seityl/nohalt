@@ -11,18 +11,28 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import PROVIDER_ERROR, SETUP_ERROR, Launch
+from . import PROVIDER_ERROR, SETUP_ERROR, Launch, UsageSignal, usage_signal
+from .claude_code import USAGE_LIMIT, USAGE_WARNING
 
 
 class Command:
     name = "command"
 
-    def __init__(self, argv: list[str] | None = None, resume_args: list[str] | None = None, probe_argv: list[str] | None = None):
+    def __init__(
+        self,
+        argv: list[str] | None = None,
+        resume_args: list[str] | None = None,
+        probe_argv: list[str] | None = None,
+        usage_limit: list[str] | None = None,
+        usage_warning: list[str] | None = None,
+    ):
         if not argv:
             raise ValueError("[agents.options.command] argv is required")
         self.argv = argv
         self.resume_args = resume_args or []
         self.probe_argv = probe_argv or ["true"]
+        self.usage_limit = USAGE_LIMIT if usage_limit is None else usage_limit
+        self.usage_warning = USAGE_WARNING if usage_warning is None else usage_warning
 
     def _fmt(self, items: list[str], **kw: str) -> list[str]:
         return [a.format(**kw) for a in items]
@@ -43,5 +53,9 @@ class Command:
         lines = [ln for ln in log_tail.splitlines() if ln.strip()][-8:]
         return PROVIDER_ERROR.search("\n".join(lines)) is not None
 
+    def usage_signal(self, log_tail: str) -> UsageSignal | None:
+        return usage_signal(log_tail, self.usage_limit, self.usage_warning)
+
     def usage_limited(self, log_tail: str) -> bool:
-        return "[agent] rate_limit" in log_tail and "rejected" in log_tail
+        sig = self.usage_signal(log_tail)
+        return sig is not None and sig.kind == "limit"

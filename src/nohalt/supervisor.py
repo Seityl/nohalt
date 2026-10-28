@@ -59,6 +59,7 @@ from .state import (
     FileLock,
     IssueRecord,
     StateStore,
+    pause_until,
 )
 from .util import descendants, kill_tree, mem_available_mb, now, pid_alive, stamp, tail
 from .worktree import GitError, Worktrees
@@ -122,6 +123,8 @@ class Supervisor:
         self.trees = Worktrees(cfg)
         self.stack = stacks.get(cfg)
         self.router = router or Router(cfg, self.state)
+        self.capacity = self.router.prober.capacity  # endpoint-down state and usage cool-downs
+        self.capacity.say = self.say
         self._say = say
         self._procs: dict[int, subprocess.Popen[bytes]] = {}
         self._issues: dict[int, tuple[float, Issue]] = {}
@@ -340,6 +343,7 @@ class Supervisor:
     def tick(self) -> TickReport:
         self._pulls, self._pulls_ok = None, False
         report = TickReport()
+        self._pause_expiry()
         records = {r.issue: r for r in self.state.all()}
         for rec in records.values():
             if rec.status in (RUNNING, EXITED):
@@ -355,6 +359,7 @@ class Supervisor:
                 self.say(f"integrator: {e}")
         if self.cfg.integrate.async_workflows and not self.dry_run:
             self.async_watch.tick()
+        self._capacity_tick()
         self._launch(report)
         if self.cfg.budget.enabled and not self.dry_run:
             self._budget()
@@ -466,8 +471,7 @@ class Supervisor:
         if killed == "stopped":
             return self._requeue(rec, "the supervisor was stopped", resume=True)
         if agent and agent.usage_limited(log_tail):
-            self.router.prober.mark_limited(rec.model)
-            return self._requeue(rec, "the plan's usage limit was reached", resume=True, delay=900)
+            return self._usage_limited(rec, agent, log_tail)
         if not killed and agent and ran_for < 300 and agent.setup_failed(log_tail):
             # The agent never got started: not logged in, refused by a model
             # router, given an option it rejects. Retrying the issue on the same
@@ -487,6 +491,8 @@ class Supervisor:
                 rec, f"the agent could not start on {rec.model}: {line[:160]} (not counted as an attempt)", resume=False
             )
         if not killed and agent and agent.provider_failed(log_tail):
+            if self._endpoint_down(rec):
+                return
             rec.provider_retries += 1
             if rec.provider_retries > a.provider_retries:
                 last = [ln for ln in log_tail.splitlines() if "rror" in ln][-1:]
@@ -764,6 +770,9 @@ class Supervisor:
         return in_use.get(pool, 0) < self._cap(pool) - held
 
     def _stall_reason(self, model: str, in_use: dict[str, int]) -> str:
+        unavailable = self.capacity.unavailable(model)
+        if unavailable:
+            return f"{unavailable} and no fallback or overflow model can start"
         pool = self._pool_of(model)
         if not self._has_slot(model, in_use):
             return f"{pool or 'shared'} pool full ({in_use.get(pool, 0)}/{self._cap(pool)})"
@@ -831,6 +840,7 @@ class Supervisor:
                 rec.attempts = rec.provider_retries = rec.ci_rounds = rec.timeouts = rec.revivals = rec.launch_failures = 0
                 rec.review_rounds = rec.review_failures = rec.review_retries = 0
                 rec.review_verdict = ""
+                rec.hold_model, rec.down_waiting = "", 0.0
                 rec.status, rec.resume, rec.not_before, rec.labelled = QUEUED, True, 0, False
                 rec.note = "A human removed the blocked label: try again."
                 rec.event("unblocked by a human")
@@ -874,10 +884,11 @@ class Supervisor:
                     rec.stalled_since = 0
                     self.state.put(rec)
                 continue
-            model, pinned = self.router.wanted(issue)
+            model, pinned = self._wanted(rec, issue)
             pool = self._pool_of(model)
             overflow_due = self._overflow_due(rec, pinned)
-            if not self._has_slot(model, in_use) and not overflow_due:
+            unavailable = self.capacity.unavailable(model)
+            if not self._has_slot(model, in_use) and not overflow_due and not unavailable:
                 self._stall(rec)
                 continue
             if self.dry_run:
@@ -889,8 +900,11 @@ class Supervisor:
             if free is not None and free < self.cfg.agents.min_free_mb:
                 self.state.log(f"#{entry.issue} waiting: {free} MB available, need {self.cfg.agents.min_free_mb}")
                 break
-            chosen = self.router.choose(issue, lambda m: self._has_slot(m, in_use))
             overflow = ""
+            if unavailable:  # down or cooling down: elsewhere at once, or wait if pinned
+                chosen, overflow = self._divert(issue, model, pinned, unavailable, in_use)
+            else:
+                chosen = self.router.choose(issue, lambda m: self._has_slot(m, in_use), want=(model, pinned))
             if not chosen and overflow_due:
                 chosen = self.router.overflow(issue, lambda m: self._has_slot(m, in_use, reserve=True))
                 if chosen:
@@ -898,6 +912,8 @@ class Supervisor:
                         f"overflow: {self._stall_reason(model, in_use)} for {int((now() - rec.stalled_since) // 60)}m → {chosen}"
                     )
             if not chosen:
+                if self._down_block(rec, model, pinned):
+                    continue
                 self._stall(rec)
                 self.state.log(f"#{entry.issue} waiting: {self._stall_reason(model, in_use)}")
                 continue
@@ -1094,6 +1110,7 @@ class Supervisor:
         rec.note = ""
         rec.last_exit = ""
         rec.stalled_since = 0
+        rec.hold_model, rec.down_waiting = "", 0.0
         rec.overflow = overflow  # not a pin: the next launch is routed as usual (fail-back)
         rec.event(f"launched on {model}" + (" (resumed)" if resume else "") + (f" -- {overflow}" if overflow else ""))
         self.state.put(rec)
@@ -1142,6 +1159,90 @@ class Supervisor:
                 os.replace(log, log.with_suffix(".log.1"))
         except OSError:
             pass
+
+    # -- capacity: endpoint-down state, usage cool-downs, pause expiry (capacity.py) ---------------------------
+    def _pause_expiry(self) -> None:
+        """``nohalt pause --for``: an expired PAUSE is cleared, and says so."""
+        until = pause_until(self.state)
+        if until and now() >= until and self.state.has("PAUSE"):
+            set_at = self.state.read_lines("PAUSE")[:1]
+            self.state.clear_flag("PAUSE")
+            self.say(f"=== PAUSE expired (set {set_at[0] if set_at else '?'}, until {stamp(until)}); launching resumes")
+
+    def _capacity_tick(self) -> None:
+        """Read running agents' usage lines, end expired cool-downs, probe down models that are due."""
+        if self.dry_run:
+            return
+        for rec in self.state.all():
+            agent = self._agent(rec.model) if rec.status == RUNNING and rec.log else None
+            if agent is None:
+                continue
+            sig = agent.usage_signal(tail(Path(rec.log), 6000).rsplit("\n--- nohalt launch ", 1)[-1])
+            if sig:
+                self.capacity.usage(rec.model, sig, f"#{rec.issue}", launch=rec.started_at)
+        self.router.prober.reprobe_down()
+
+    def _wanted(self, rec: IssueRecord, issue: Issue) -> tuple[str, bool]:
+        """(model, held): routing, except that an issue stopped by a usage limit waits for its model (MOD-07)."""
+        if rec.hold_model and not self.router.pinned(rec.issue):
+            return rec.hold_model, True
+        return self.router.wanted(issue)
+
+    def _usage_limited(self, rec: IssueRecord, agent: agents.Agent, log_tail: str) -> None:
+        """The agent stopped on its plan's usage limit: cool the pool down; this issue waits and resumes there."""
+        self.router.prober.mark_limited(rec.model)
+        sig = agent.usage_signal(log_tail) or agents.UsageSignal("limit")
+        self.capacity.usage(rec.model, sig, f"#{rec.issue}", launch=rec.started_at)
+        until = self.capacity.cooling_until(rec.model)
+        rec.hold_model = rec.model
+        window = f" ({sig.window})" if sig.window else ""
+        self._requeue(
+            rec,
+            f"the plan's usage limit was reached{window}; resumes on {rec.model} once it resets",
+            resume=True,
+            delay=max(60.0, until - now()) if until else 900,
+        )
+
+    def _endpoint_down(self, rec: IssueRecord) -> bool:
+        """An endpoint error on a model that is down (or just went down): not counted, for anyone in the storm."""
+        refund = self.capacity.endpoint_error(rec.model, rec.issue)
+        if refund is None:
+            return False
+        for n in refund:
+            r = rec if n == rec.issue else self.state.get(n)
+            r.provider_retries = max(0, r.provider_retries - 1)
+            r.down_waiting = r.down_waiting or now()
+            if r is not rec:
+                r.event(f"endpoint error not counted after all: {rec.model} went down")
+                self.state.put(r)
+        rec.down_waiting = rec.down_waiting or now()
+        self._requeue(
+            rec,
+            f"model endpoint error; {self.capacity.unavailable(rec.model)} -- not counted as a retry",
+            resume=True,
+            delay=self.cfg.agents.provider_backoff,
+        )
+        return True
+
+    def _divert(self, issue: Issue, model: str, pinned: bool, why: str, in_use: dict[str, int]) -> tuple[str | None, str]:
+        """The routed model is down or cooling down: a fallback or overflow target, now (not a pin)."""
+        chosen = self.router.divert(issue, lambda m: self._has_slot(m, in_use, reserve=True), want=(model, pinned))
+        return chosen, (f"capacity: {why} → {chosen}" if chosen else "")
+
+    def _down_block(self, rec: IssueRecord, model: str, pinned: bool) -> bool:
+        """Endpoint failures block an issue only once its model and every fallback were down ``down_block_after``."""
+        after = self.cfg.models.down_block_after
+        chain = [model] if pinned else [model, *self.cfg.models.fallbacks]
+        if not rec.down_waiting or not self.capacity.all_down_for(chain, after):
+            return False
+        from .capacity import ago
+
+        self._block(
+            rec,
+            f"every model it may run on ({', '.join(chain)}) has been down for over {ago(after)}; "
+            "this is the model endpoints, not the issue -- `nohalt status` shows what is down",
+        )
+        return True
 
     # -- 5. budget -------------------------------------------------------------------------------------------
     def _budget(self) -> None:

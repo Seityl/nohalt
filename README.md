@@ -33,7 +33,7 @@ queue.txt ──► scheduler ──► agent in its own worktree ──► PR �
 - **Release windows.** Production changes when you say: the train opens a normal batch only inside daily windows (`05:00-06:00` in your time zone, chosen weekdays, one release per window), while hotfixes, priority issues and the fix for a red base go out alone at any time. `nohalt release-now` ships once, off schedule.
 - **Survives itself.** Agents run in their own sessions. Kill or restart the supervisor and it adopts the running agents from their records. `nohalt keepalive` in cron brings it back. A changed `nohalt.toml` applies without a restart by hand.
 - **Prompt lanes.** Issues that need different rules (a tracker's children delivered in full, docs issues verified lightly) get their own prompt files by label, title, description or tracker, chosen at the first launch and kept for every relaunch.
-- **Model routing and a spend guard.** Route by label or title, pin per issue, gate premium models behind approval, fall over to a model that answers, and cap paid-API spend per issue and in total.
+- **Model routing and a spend guard.** Route by label or title, pin per issue, gate premium models behind approval, fall over to a model that answers, and cap paid-API spend per issue and in total. A model server that takes all its agents down at once is marked down, and its failures cost no retries. A subscription near or at its usage window cools its pool down until the reset, and new work goes elsewhere meanwhile.
 - **Stacks.** A `generic` stack (your own `up`/`reset`/`env` hooks for the test environment) and a `frappe` stack (a pool of agent test sites on a shared bench, worktree-first `PYTHONPATH`, migrate before test, DocType/fixture/patch merge drivers).
 
 ## Quick start
@@ -55,7 +55,7 @@ Keep it running without a terminal:
 */3 * * * * cd /path/to/your-repo && nohalt keepalive
 ```
 
-Control while it runs: `nohalt restart` (now, with the config on disk; agents keep running), `nohalt stop` (a drain: launch nothing more, exit once no agent runs), `nohalt stop --now`, `nohalt pause`, `nohalt resume` (undo `stop`/`pause`), `nohalt release-now` (train: one release outside the windows), `nohalt route <issue> <model>`, `nohalt unblock <issue>`, `nohalt queue --add 42 --after 41`, `nohalt prompt <issue>` (see exactly what an agent will be told).
+Control while it runs: `nohalt restart` (now, with the config on disk; agents keep running), `nohalt stop` (a drain: launch nothing more, exit once no agent runs), `nohalt stop --now`, `nohalt pause [--for 2h]`, `nohalt resume` (undo `stop`/`pause`), `nohalt release-now` (train: one release outside the windows), `nohalt route <issue> <model>`, `nohalt unblock <issue>`, `nohalt queue --add 42 --after 41`, `nohalt prompt <issue>` (see exactly what an agent will be told).
 
 Edits to `nohalt.toml` apply on their own: the supervisor notices the change between ticks, re-executes itself and adopts its running agents. A file that does not parse or validate is reported in `nohalt status` (`CONFIG_INVALID`) and the last good configuration keeps running.
 

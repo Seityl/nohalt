@@ -49,6 +49,44 @@ def no_change(log_tail: str) -> str | None:
 
 
 @dataclass
+class UsageSignal:
+    """A usage line an agent printed: ``limit`` (it stopped on it) or ``warning`` (it is close to it)."""
+
+    kind: str
+    window: str = ""  # five_hour, seven_day, ... when the line names one
+    resets_at: float = 0.0  # epoch seconds, when the line reports it
+    line: str = ""
+
+
+def usage_signal(log_tail: str, limit: list[str], warning: list[str]) -> UsageSignal | None:
+    """The last usage line in ``log_tail`` matching a ``limit`` or ``warning`` pattern.
+
+    Patterns are regular expressions matched per line. A named group ``window``
+    names the usage window and ``resets`` the reset time (epoch seconds). A limit
+    anywhere in the tail wins over a later warning: the agent stopped on it.
+    """
+    found: dict[str, list[tuple[int, UsageSignal]]] = {"limit": [], "warning": []}
+    for kind, pats in (("limit", limit), ("warning", warning)):
+        for pat in pats:
+            for m in re.finditer(pat, log_tail, re.I | re.M):
+                start = log_tail.rfind("\n", 0, m.start()) + 1
+                end = log_tail.find("\n", m.end())
+                resets = m.groupdict().get("resets") or ""
+                line = log_tail[start : end if end >= 0 else None]
+                window = m.groupdict().get("window") or ""
+                found[kind].append((m.start(), UsageSignal(kind, window, float(resets) if resets.isdigit() else 0.0, line)))
+    for kind in ("limit", "warning"):
+        hits = [sig for _, sig in sorted(found[kind], key=lambda h: h[0])]
+        if hits:
+            # The last line decides; an earlier line of the same kind may carry the window and reset.
+            last = hits[-1]
+            last.window = last.window or next((h.window for h in reversed(hits) if h.window), "")
+            last.resets_at = last.resets_at or next((h.resets_at for h in reversed(hits) if h.resets_at), 0.0)
+            return last
+    return None
+
+
+@dataclass
 class Launch:
     argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
@@ -63,6 +101,7 @@ class Agent(Protocol):
     def usage_limited(self, log_tail: str) -> bool: ...
     def probe_launch(self, model: str, data_dir: Path) -> Launch: ...
     def setup_failed(self, log_tail: str) -> bool: ...
+    def usage_signal(self, log_tail: str) -> UsageSignal | None: ...
 
 
 def split_model(spec: str) -> tuple[str, str]:

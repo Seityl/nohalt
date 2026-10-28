@@ -226,10 +226,14 @@ def test_stop_file_stops_launching(world):
     assert not w.rec(1).started_at
 
 
-def test_usage_limit_waits_and_resumes_without_an_attempt(world):
+def test_usage_limit_waits_and_resumes_without_an_attempt(world, clock):
+    """MOD-07: wait for the reset and continue the same session on the same model."""
     w = world(agents={"max_attempts": 1})
     w.issue(1, "usage-limit", "close")
     w.drive(4)
+    assert w.rec(1).status == QUEUED and w.rec(1).hold_model == "command:fake"
+    clock.advance(w.cfg.models.usage_cooldown + 60)
+    w.drive(3)
     assert w.rec(1).status == DONE and w.rec(1).attempts == 0
 
 

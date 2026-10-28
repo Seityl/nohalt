@@ -9,6 +9,7 @@ src/nohalt/
   state.py         issue records and control files (JSON, written atomically)
   worktree.py      one git worktree per issue; rescue before removal
   models.py        routing, pins, premium gate, probes, fallbacks, overflow
+  capacity.py      models that are down (endpoint storms, failed probes), pools cooling down after a usage limit
   budget.py        paid-API spend estimate and caps
   prompt.py        core prompt + stack addendum + project files + the issue's lane; strict placeholders
   verify.py        the verification lock (slot pool) and refused commands
@@ -31,7 +32,8 @@ Every `tick` (default 60 s):
    **Review.** For each `in_review` issue: no reviewer yet → launch one (the reviewer `[review] models` maps the author's model to, else `model`, else `fallbacks`; never the author's own model with `distinct`; a slot in its model's pool, a model that answers) in a detached checkout of the PR head, read-only. Running → time limit and hang checks, as for agents. Exited → read its verdict: `approve` (and the PR head is still the commit reviewed) → `ready`; `changes` → handed back to the author with the review; no verdict → retried, never approved. A head that moves during a review stops the reviewer and voids its verdict.
 3. **Integrate.** `direct` or `train` merges `ready` PRs (see below). `none` does nothing: a human merges. Either way, an issue still open after its PR merged is closed by nohalt -- forges act on closing keywords only for the default branch.
    **Async workflows** (`async_workflows`) are read here too, in any mode: the newest completed run of each on the base branch. They never hold a merge. Red opens one issue per workflow (later reds comment on it), green closes it.
-4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback with a free slot does). An unpinned issue that has waited `overflow_after` for a slot overflows to the first `overflow_to` model with a free slot (outside `overflow_reserve`) that answers; the next launch is routed as usual.
+   **Capacity.** Running agents' logs are read for usage lines: a usage limit or a warning cools down the model's pool until its reset. Expired cool-downs end, and down models whose turn has come are probed again. An expired `pause --for` was cleared at the start of the tick.
+4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback with a free slot does). An unpinned issue that has waited `overflow_after` for a slot overflows to the first `overflow_to` model with a free slot (outside `overflow_reserve`) that answers; the next launch is routed as usual. An unpinned issue whose model is down or whose pool is cooling down is diverted at once to the first fallback or overflow target that can start (`capacity: … → …`). A pinned issue, or one stopped by its model's usage limit, waits.
 5. **Budget.** Every few minutes, estimate paid-API spend and move issues over their cap to a fallback model.
 
 Before each tick the supervisor checks `nohalt.toml` and the `RESTART` flag. A valid change to the file, or a restart request, makes it release its lock and `exec` itself; the new process adopts the running agents like any restarted supervisor. An invalid file keeps the running configuration and raises `CONFIG_INVALID` (see [CONFIGURATION.md](CONFIGURATION.md#changing-it-while-nohalt-runs)).
@@ -69,7 +71,8 @@ How an exit is judged, in order:
 | Forge says CLOSED (or the issue no longer exists) | done: worktree rescued and removed, agent data deleted | -- |
 | Forge unreachable | `exited`, judged again next tick | no |
 | Stopped by the budget guard or by `stop --now` | requeued, resumes | no |
-| The agent's output ends on a usage-limit event | requeued after 15 min, the model is not probed for 20 min | no |
+| The agent's output ends on a usage-limit event | the pool cools down until the reported reset (else `usage_cooldown`). The issue waits for that model and resumes its session there | no |
+| The agent's output ends on a model-endpoint error, and the model is down, or this error makes it down (a storm) | requeued, not counted; the storm's earlier failures are refunded. Blocked only once its model and every fallback were down `down_block_after` | no |
 | The agent's output ends on a model-endpoint error | requeued with backoff × n. Blocked after `provider_retries`, with a diagnosis that says it was not the issue's fault | no |
 | Time limit, issue still open | continues in the same worktree, up to `timeout_continues` times | no |
 | Hung | restarted, up to `revive_limit` times | no |
@@ -101,6 +104,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
   reviews/<n>.md           the last review a reviewer wrote
   pins.json approved.json  model pins and premium approvals
   probes.json limited.json model probe cache and usage-limit marks
+  capacity.json            down models (since, next probe), recent endpoint errors, pools cooling down (until, window, source)
   spend.json               budget high-water marks
   integrate.json train.json integrator state that spans ticks
   refresh.json conflicts.json  conflicting PRs refreshed by nohalt (counted per issue); files left in conflict at hand-backs (for doctor)
@@ -121,7 +125,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
 
 ## Extending
 
-- **A new agent CLI:** implement `launch`, `probe_launch`, `provider_failed` and `usage_limited` (see `agents/opencode.py`), and register it in `agents.get`. Before writing an adapter, try `command:` with `[agents.options.command] argv = [...]`.
+- **A new agent CLI:** implement `launch`, `probe_launch`, `provider_failed`, `usage_limited` and `usage_signal` (`agents.usage_signal` with `usage_limit`/`usage_warning` patterns does it; see `agents/opencode.py`), and register it in `agents.get`. Before writing an adapter, try `command:` with `[agents.options.command] argv = [...]`.
 - **A new stack:** subclass `stacks.Stack`. Implement `apply_defaults` (slots, refused commands, merge drivers) and `prepare` (bring the test environment to the worktree's commit inside the lock), and optionally a prompt addendum.
 - **A new forge:** implement the `forge.base.Forge` protocol. Keep to its rule: a failed call raises `ForgeError`. It never returns something that looks like an answer.
 - **A new merge driver:** a function `(repo, path) -> bool` in `integrate/mergers.py`, added to `DRIVERS`, with a test that runs it inside a real conflicted merge.
