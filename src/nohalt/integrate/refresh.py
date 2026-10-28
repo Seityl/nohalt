@@ -71,8 +71,13 @@ def _git(tree: Path, *args: str, timeout: int = 300) -> subprocess.CompletedProc
     )
 
 
-def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> Outcome:
-    """Merge the base into ``pr``'s branch if the merge drivers settle every conflict."""
+def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool = False) -> Outcome:
+    """Merge the base into ``pr``'s branch if the merge drivers settle every conflict.
+
+    ``clean``: a merge without conflicts is pushed too (an early dependant moving
+    onto the real base once its dependencies merged, SCH-10). Otherwise there is
+    nothing a refresh can fix in it.
+    """
     cfg = sup.cfg
     base, remote = cfg.project.base_branch, cfg.project.remote
     if not cfg.integrate.refresh_conflicts or cfg.integrate.mode == "none":
@@ -116,6 +121,8 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> Outcome:
             _git(tree, "merge", "--abort")
             return Outcome(CONFLICT, "conflicts no merge driver settles", files=left)
         settled = conflicted
+    elif clean:
+        settled = []
     else:
         # git merged it cleanly, so the forge's conflict is nothing a refresh can fix.
         _git(tree, "merge", "--abort")
@@ -123,7 +130,9 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> Outcome:
 
     try:
         snapshot = git(tree, "write-tree")
-        msg = f"merge: {base} into {branch} (nohalt refresh)\n\nSettled by merge drivers: {', '.join(settled)}"
+        msg = f"merge: {base} into {branch} (nohalt refresh)"
+        if settled:
+            msg += f"\n\nSettled by merge drivers: {', '.join(settled)}"
         commit = git(tree, *IDENT, "commit-tree", snapshot, "-p", head, "-p", base_sha, "-m", msg)
         git(tree, "reset", "-q", "--hard", commit)
     except GitError as e:
@@ -153,7 +162,7 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> Outcome:
     _follow(sup, rec, branch)
     rec.pr_sha = new
     rec.status = WAITING_CI
-    rec.event(f"{sup.pr(pr.number)} refreshed: merged {base} ({', '.join(settled)}) as {new[:8]}")
+    rec.event(f"{sup.pr(pr.number)} refreshed: merged {base} ({', '.join(settled) or 'cleanly'}) as {new[:8]}")
     sup.state.put(rec)
     return Outcome(REFRESHED, sha=new, files=settled)
 

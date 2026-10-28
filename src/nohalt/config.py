@@ -68,6 +68,8 @@ class AgentsCfg:
     pools: dict[str, int] = field(default_factory=dict)  # model prefix -> own slot cap
     options: dict[str, dict[str, Any]] = field(default_factory=dict)  # per agent adapter, e.g. [agents.options.opencode]
     copy_files: list[str] = field(default_factory=list)  # copied into each agent's data dir, e.g. opencode auth.json
+    early_start: bool = False  # start a dependant on its dependencies' unmerged PRs (a synthetic base)
+    early_start_on: str = "green"  # green | approved: the state every open dependency's PR must be in
 
 
 @dataclass
@@ -383,6 +385,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[integrate] merge_method must be merge, squash or rebase")
     if cfg.agents.max_parallel < 1:
         raise ConfigError("[agents] max_parallel must be at least 1")
+    if cfg.agents.early_start_on not in ("green", "approved"):
+        raise ConfigError(f"[agents] early_start_on must be green or approved, got {cfg.agents.early_start_on!r}")
     if cfg.agents.max_attempts < 1:
         raise ConfigError("[agents] max_attempts must be at least 1")
     if cfg.review.max_rounds < 0 or cfg.review.attempts < 1:
