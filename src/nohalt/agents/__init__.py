@@ -33,6 +33,21 @@ SETUP_ERROR = re.compile(
 )
 
 
+# An agent's structured "nothing to change" result: a line of its own output,
+#     NOHALT-RESULT: no-change -- <reason>
+# (the claude-code stream also folds it into its one-line result event). The
+# reason must be real text: a quoted "<reason>" from the prompt is not one.
+NO_CHANGE = re.compile(r"NOHALT-RESULT:\s*no-change\b[ \t]*(?:--|—|–|-|:)?[ \t]*([^<\s\-—–:][^\n]*)", re.I)
+
+
+def no_change(log_tail: str) -> str | None:
+    """The reason an agent gave for changing nothing, or None if it gave none."""
+    found = NO_CHANGE.findall(log_tail)
+    if not found:
+        return None
+    return found[-1].strip().strip("`*").strip()[:500] or None
+
+
 @dataclass
 class Launch:
     argv: list[str]

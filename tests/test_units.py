@@ -473,3 +473,17 @@ def test_github_marks_dynamic_runs_as_managed(monkeypatch):
     monkeypatch.setattr(gh, "_api", api)
     assert [c.suite for c in gh.checks("s")] == [10, 99]
     assert gh.managed_suites("s") == {99}
+
+
+def test_github_runs_on_a_branch_carry_their_check_suite(monkeypatch):
+    gh = GitHub("o/r")
+    seen = []
+
+    def api(path, **kw):
+        seen.append(path)
+        return {"workflow_runs": [{"id": 5, "name": "Tests", "head_branch": "release-2", "check_suite_id": 42}]}
+
+    monkeypatch.setattr(gh, "_api", api)
+    runs = gh.runs(branch="release-2", workflow="Tests")
+    assert "branch=release-2" in seen[0]
+    assert runs[0].suite == 42 and runs[0].branch == "release-2"

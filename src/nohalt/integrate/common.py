@@ -215,9 +215,14 @@ class PipelineGate:
         # Only the pipeline the merge triggered: forge-managed jobs (Dependabot
         # updates and the like) post their own runs on the base head afterwards.
         managed = f.managed_suites(sha)
+        # Async workflows are watched on their own (async_watch.py) and never gate.
+        runs = [r for r in f.runs(head_sha=sha) if r.event != "dynamic"]
+        asyncs = set(ic.async_workflows)
+        managed |= {r.suite for r in runs if r.name in asyncs and r.suite}
+        runs = [r for r in runs if r.name not in asyncs]
         checks = [c for c in f.checks(sha) if c.name not in ic.base_ignore_checks and not (c.suite and c.suite in managed)]
         workflows = [w for w in (ic.cd_workflow, ic.ci_workflow) if w]
-        started = [r for r in f.runs(head_sha=sha) if r.event != "dynamic" and (not workflows or r.name in workflows)]
+        started = [r for r in runs if not workflows or r.name in workflows]
         if not checks and not started:
             return "none"
         if ic.cd_workflow:
@@ -240,7 +245,7 @@ class PipelineGate:
             return "pending"
         self.counted = checks
         v = verdict(checks, [])
-        if v == GREEN and any(r.status != "completed" for r in f.runs(head_sha=sha) if r.event != "dynamic"):
+        if v == GREEN and any(r.status != "completed" for r in runs):
             # A job that waits on another, or a workflow that starts late, has no
             # check run yet: green over the checks that exist so far is not green.
             return "pending"

@@ -50,6 +50,14 @@ Other processes on this machine -- CI runners, other agents -- run as the same u
 5. **Stop at green. You do not merge.** Green CI means your work is ready, not that it is accepted. Merging is done by the integrator (or a human), in an order it controls, against a known state of `{{BASE}}`. Never merge, close {{PR}}s, push to `{{BASE}}`, or push tags -- not through `{{CLI}}`, not through the API.
 6. **The issue closing is the only definition of done.** A supervisor watches the issue's state and nothing else -- least of all your own summary.
 
+## If there is nothing to change
+
+If you find that the issue needs no change at all -- the newest `{{BASE}}` already fixes it, or what it reports is not a defect -- do not open an empty {{PR}} and do not invent work. Say why in a comment on issue #{{ISSUE}}, then end your session with this line on its own:
+
+    NOHALT-RESULT: no-change -- <the commit, test run or reason that makes a change unnecessary>
+
+The supervisor reads that line and spends no attempt on it. It does not close the issue: on an issue about a red workflow run, the next green run closes it; on any other, a human reads your reason and decides.
+
 ## If you are blocked
 
 If you need a decision only a human can make, or a check will not pass for a reason outside the issue: stop, leave your branch and {{PR}} in place, and comment on issue #{{ISSUE}} saying exactly where you stopped and why.

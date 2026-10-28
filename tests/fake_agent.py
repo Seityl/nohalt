@@ -16,6 +16,7 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     provider-error   die the way an agent dies when the model server is down
     usage-limit      stop on a subscription usage limit
     nothing          exit 0 having done nothing
+    no-change <why>  exit 0 having changed nothing, saying why (NOHALT-RESULT: no-change -- <why>)
     sleep <seconds>  run that long (to be timed out or found hung)
     dirty            leave an uncommitted file in the worktree
 
@@ -58,7 +59,9 @@ def open_pr(forge: LocalForge, issue: int, checks: str, base: str = "main") -> N
     branch = git("branch", "--show-current")
     git("push", "-q", "origin", branch)
     sha = git("rev-parse", "HEAD")
-    n = forge.data()["next"]
+    with forge._db() as d:  # taken under the forge's lock: two agents finishing together must not share a number
+        n = d["next"]
+        d["next"] = n + 1
     forge.add_pull(n, branch, sha, body=f"Closes #{issue}", base=base, mergeable=checks != "conflict", draft=draft)
     with forge._db() as d:
         d["branches"][branch] = sha
@@ -155,6 +158,9 @@ def main() -> int:
         return 1
     elif action.startswith("sleep"):
         time.sleep(float(action.split()[1]))
+    elif action.startswith("no-change"):
+        print("I looked at the newest base.", flush=True)
+        print(f"NOHALT-RESULT: no-change -- {action.partition(' ')[2]}", flush=True)
     elif action == "dirty":
         Path("uncommitted.txt").write_text("precious\n")
     return 0

@@ -147,6 +147,8 @@ class IntegrateCfg:
     merge_method: str = "squash"
     cd_workflow: str = ""
     ci_workflow: str = ""
+    async_workflows: list[str] = field(default_factory=list)  # watched on the base, never gating: one self-closing issue each
+    async_label: str = "async-red"  # put on the issue an async workflow's red run opens
     cd_timeout: int = 90 * 60
     base_pipeline_grace: int = 10 * 60  # no pipeline at all on the base after a merge for this long: nothing to watch
     deploy: str = ""  # run after a merge (direct) or a tagged release (train)
@@ -329,6 +331,14 @@ def validate(cfg: Config) -> None:
         raise ConfigError(f"[integrate] red_base must be fix_only or with_fix, got {cfg.integrate.red_base!r}")
     if cfg.integrate.base_no_verdict not in ("continue", "hold"):
         raise ConfigError(f"[integrate] base_no_verdict must be continue or hold, got {cfg.integrate.base_no_verdict!r}")
+    gating = {w for w in (cfg.integrate.ci_workflow, cfg.integrate.cd_workflow) if w}
+    both = sorted(gating & set(cfg.integrate.async_workflows))
+    if both:
+        raise ConfigError(
+            f"[integrate] async_workflows: {', '.join(both)} is also ci_workflow/cd_workflow; a workflow gates or it does not"
+        )
+    if cfg.integrate.async_workflows and not cfg.integrate.async_label:
+        raise ConfigError("[integrate] async_label must not be empty while async_workflows is set")
     if cfg.integrate.merge_method not in ("merge", "squash", "rebase"):
         raise ConfigError("[integrate] merge_method must be merge, squash or rebase")
     if cfg.agents.max_parallel < 1:

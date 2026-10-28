@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.parse
 from datetime import datetime
 from typing import Any
 
@@ -211,10 +212,12 @@ class GitHub:
             if r.get("event") == "dynamic" and r.get("check_suite_id")
         }
 
-    def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "") -> list[Run]:
+    def runs(self, *, head_sha: str = "", workflow: str = "", status: str = "", branch: str = "") -> list[Run]:
         q = ["per_page=100"]
         if head_sha:
             q.append(f"head_sha={head_sha}")
+        if branch:
+            q.append(f"branch={urllib.parse.quote(branch, safe='')}")
         if status:
             q.append(f"status={status}")
         data = self._api(self._r("actions/runs?" + "&".join(q)))
@@ -232,6 +235,7 @@ class GitHub:
                     r.get("head_branch") or "",
                     r.get("html_url") or "",
                     r.get("event") or "",
+                    int(r.get("check_suite_id") or 0),
                 )
             )
         return out

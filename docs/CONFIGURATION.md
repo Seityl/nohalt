@@ -142,6 +142,8 @@ Spend is estimated from each opencode agent's own session database, keeping the 
 | `red_base` | `"fix_only"` | while a fix-forward issue is open: `fix_only` merges only the fix; `with_fix` (train mode) waits until the fix's PR is green, then lets that batch carry the fix **and every other green PR**. Trades a strictly green base between a red and its fix for throughput, worth it when the base suite is long and reds are usually test isolation, not product. Direct mode always behaves as `fix_only` |
 | `merge_method` | `"squash"` | for `direct` (release PRs always merge with a merge commit). On GitLab, `squash` squashes; otherwise the project's merge method applies |
 | `ci_workflow` / `cd_workflow` | `""` | runs watched on the base branch after a merge: GitHub workflow names, or on GitLab a pipeline's `workflow:name` (or `"pipeline"` for any pipeline on the commit) |
+| `async_workflows` | `[]` | workflows (named as for `ci_workflow`) that are **watched on the base branch but never gate**: a slow full suite, say. nohalt reads the newest completed run of each every tick and never waits for one. Red with no open issue for that workflow: one issue at the front of the queue, with the run, its failing jobs and tests. Red again: a comment on that issue (what newly fails, what no longer does), never a second issue. Green: a comment, and the issue is closed (an unmerged PR of its own is left open, and the comment says so). Their runs' jobs never count in the base gate on GitHub; on GitLab, set `ci_workflow` so the gate watches only the pipeline that should gate |
+| `async_label` | `"async-red"` | label on the issue an async workflow's red run opens |
 | `cd_timeout` | `"90m"` | a pipeline that does not finish in time counts as red |
 | `base_pipeline_grace` | `"10m"` | if **no** pipeline appears on the base branch's new head within this time, there is nothing to watch, and merging continues. Many integration branches run no CI after a merge |
 | `deploy` | `""` | shell command after a green pipeline (`direct`, when no CD workflow deploys) or a merged release (`train`). A failure writes `DEPLOY_BLOCKED` |
@@ -150,6 +152,17 @@ Spend is estimated from each opencode agent's own session database, keeping the 
 | `network_errors` | DNS/reset patterns | failed-log substrings that mark a red as the network's, not the code's |
 | `mergers` | `{}` | glob → driver, see [STACKS.md](STACKS.md#merge-drivers-any-stack). Paths in `[integrate.train] version_files` that no glob covers get one implicitly: `package_json` for JSON, `version_lines` for anything else |
 | `refresh_conflicts` | `true` | `direct` and `train`: before handing a PR back for conflicting with the base, nohalt merges the base into the PR branch itself, in a scratch tree, when the merge drivers settle every conflicted file. It then runs `after_version` (if set), commits the merge (`merge: <base> into <branch> (nohalt refresh)`) and any regenerated files, and pushes, fast-forward only. Any file left in conflict, or a failed regenerate or push, means a hand-back as before. A branch whose agent is running is never touched. Refreshes don't count as `ci_rounds` |
+
+An agent may finish with **nothing to change**: the line `NOHALT-RESULT: no-change -- <reason>` in its output (the built-in prompt tells it how). On an async workflow's issue that moves the issue to `awaiting_green`: no attempt is spent and no agent is launched, the next green run closes it, and a red run with failures the agent has not seen sends an agent back with that run. On any other issue it is blocked for a human with the reason "agent says no change needed: <reason>".
+
+Slow suite example: releases wait only for the build, the full suite is watched without holding anything.
+
+```toml
+[integrate]
+mode = "train"
+ci_workflow = "build"          # gates every release
+async_workflows = ["Tests"]    # ~2 h: watched, one issue while it is red, closed when it is green
+```
 
 ```toml
 [integrate.train]

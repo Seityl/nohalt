@@ -60,6 +60,7 @@ required_checks = []         # check-run names that must pass; empty: all of the
 merge_method = "squash"
 # ci_workflow = "CI"
 # cd_workflow = "CD"
+# async_workflows = ["Tests"]  # slow suites: watched on the base, never waited for; one self-closing issue each
 # deploy = "./scripts/deploy.sh"
 # refresh_conflicts = true   # merge the base into a PR whose conflicts the merge drivers settle, instead of handing it back
 
