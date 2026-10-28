@@ -64,6 +64,10 @@ class IssueRecord:
     swept: list[str] = field(default_factory=list)  # PR head SHAs already handed back
     lane: str = ""  # the [[prompt.lane]] chosen at the first launch ("" = no lane); kept across relaunches
     lane_digest: str = ""  # the lanes' configuration it was chosen under ("" = not chosen yet)
+    # Early start (early.py): the unmerged dependency heads its synthetic base was built on.
+    early_on: list[dict[str, Any]] = field(default_factory=list)  # [{issue, pr, branch, sha}]; [] once they merged
+    early_note: str = ""  # handed to the next launch: a dependency moved, or they all merged
+    early_refused: list[str] = field(default_factory=list)  # [dependency heads, why] the synthetic base failed on
     # The review gate (review.py). A reviewer runs beside the record's own agent slot.
     review_pid: int = 0
     review_model: str = ""

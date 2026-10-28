@@ -16,6 +16,7 @@ src/nohalt/
   forge/           the forge interface; GitHub (gh REST), GitLab (REST v4); a file-backed forge
   agents/          opencode, claude-code, any command
   stacks/          generic (shell hooks), frappe (site pool on a shared bench)
+  early.py         early start: a dependant on a synthetic base of its dependencies' unmerged PRs
   review.py        the optional review gate: a reviewer agent, chosen by the author's model, checks green PRs against their issue
   integrate/       none | direct | train, the bookkeeping merge drivers, the async workflow watch
   shims/           gh, glab, git, pkill guards put first on every agent's PATH
@@ -33,12 +34,14 @@ Every `tick` (default 60 s):
 3. **Integrate.** `direct` or `train` merges `ready` PRs (see below). `none` does nothing: a human merges. Either way, an issue still open after its PR merged is closed by nohalt -- forges act on closing keywords only for the default branch.
    **Async workflows** (`async_workflows`) are read here too, in any mode: the newest completed run of each on the base branch. They never hold a merge. Red opens one issue per workflow (later reds comment on it), green closes it.
    **Capacity.** Running agents' logs are read for usage lines: a usage limit or a warning cools down the model's pool until its reset. Expired cool-downs end, and down models whose turn has come are probed again. An expired `pause --for` was cleared at the start of the tick.
-4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed, and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback with a free slot does). An unpinned issue that has waited `overflow_after` for a slot overflows to the first `overflow_to` model with a free slot (outside `overflow_reserve`) that answers; the next launch is routed as usual. An unpinned issue whose model is down or whose pool is cooling down is diverted at once to the first fallback or overflow target that can start (`capacity: … → …`). A pinned issue, or one stopped by its model's usage limit, waits.
+4. **Launch.** Read the queue again (it can be edited live). Walk it in order. An issue seen for the first time that already has an open PR (opened by hand, or by a runner nohalt replaced) is **adopted**: it goes straight to `waiting_ci`, and gets an agent only if that PR needs one. For each other open issue that is not blocked, not held, has its dependencies closed (or, with `early_start`, closed or with a PR green -- or approved -- on its current head; see below), and has passed its backoff time, launch an agent if a slot in its model's pool is free, enough memory is available, and the model answers a probe (or a fallback with a free slot does). An unpinned issue that has waited `overflow_after` for a slot overflows to the first `overflow_to` model with a free slot (outside `overflow_reserve`) that answers; the next launch is routed as usual. An unpinned issue whose model is down or whose pool is cooling down is diverted at once to the first fallback or overflow target that can start (`capacity: … → …`). A pinned issue, or one stopped by its model's usage limit, waits.
 5. **Budget.** Every few minutes, estimate paid-API spend and move issues over their cap to a fallback model.
 
 Before each tick the supervisor checks `nohalt.toml` and the `RESTART` flag. A valid change to the file, or a restart request, makes it release its lock and `exec` itself; the new process adopts the running agents like any restarted supervisor. An invalid file keeps the running configuration and raises `CONFIG_INVALID` (see [CONFIGURATION.md](CONFIGURATION.md#changing-it-while-nohalt-runs)).
 
 The supervisor holds an exclusive lock, so only one runs per state directory. A tick never blocks on long waits: watching a pipeline after a merge, or waiting for a usage limit to reset, is a state that later ticks re-examine.
+
+**Early start** (`[agents] early_start`, SCH-10). An issue whose open dependencies all have PRs in the `early_start_on` state is launched on a synthetic base: `early.py` merges each dependency's PR head into the fresh worktree (dependency order, merge drivers) before the agent starts, records the heads on the record (`early_on`), and the prompt says what was merged and that it is not merged yet. A conflict in code aborts that launch (`NoEarlyStart`) and the issue waits as usual. Every tick, before the integrator, each early dependant is followed: a dependency head that moved leaves a note for its next launch (`early_note`); once all its dependencies have closed, its branch is refreshed onto the real base (`integrate/refresh.py`, clean merges too) and `early_on` is cleared. Until then `Early.held` keeps it out of `direct` merges and out of any train batch its dependencies are not in, and the train orders a batch so dependencies merge first.
 
 ## Issue lifecycle
 
@@ -99,7 +102,7 @@ A *resumed* launch continues the agent's previous session in the same worktree w
 ```
 <state_dir>/
   supervisor.lock          one supervisor at a time
-  issues/<n>.json          IssueRecord: status, counters, model, pid, branch, worktree, PR, lane (and the lanes' digest), history, review_* (reviewer pid, verdict, rounds)
+  issues/<n>.json          IssueRecord: status, counters, model, pid, branch, worktree, PR, lane (and the lanes' digest), history, review_* (reviewer pid, verdict, rounds), early_* (the dependency heads an early start was built on)
   pids.json                process start times (a recycled pid is not our agent or reviewer)
   reviews/<n>.md           the last review a reviewer wrote
   pins.json approved.json  model pins and premium approvals

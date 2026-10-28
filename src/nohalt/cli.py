@@ -413,6 +413,13 @@ def render_status(cfg: Config) -> str:
         lines.append("")
         lines.append("^ overflowed (not pinned; the next launch is routed as usual):")
         lines.extend(f"  #{r.issue}: {r.overflow}" for r in overflows)
+    early = [r for r in recs if r.early_on]
+    if early:
+        lines.append("")
+        lines.append(
+            "started early (cannot integrate before these merge): "
+            + "  ".join(f"#{r.issue} early on " + ",".join(f"#{u['issue']}" for u in r.early_on) for r in early[:30])
+        )
     lanes = [r for r in recs if r.lane]
     if lanes:
         lines.append("")
@@ -431,6 +438,7 @@ def render_status(cfg: Config) -> str:
     if snap:
         lines.append("")
         lines.append(f"waiting: {' '.join(snap.get('waiting', [])[:15]) or 'none'}")
+        lines.extend(f"  #{n} {why}" for n, why in list(snap.get("deps", {}).items())[:15])
         lines.append(f"blocked (need a human): {' '.join('#' + str(i) for i in snap.get('blocked', [])) or 'none'}")
         awaiting = [r.issue for r in recs if r.status == AWAITING_GREEN]
         if awaiting or cfg.integrate.async_workflows:

@@ -9,7 +9,9 @@ Each tick:
                 to a reviewer agent first (review.py); only its approval makes it ready;
 3. **integrate** -- green PRs are merged by the integrator (never by agents);
 4. **launch** -- queued issues whose dependencies are closed get an agent, as
-                slots, memory and a model that answers allow;
+                slots, memory and a model that answers allow; with
+                ``early_start``, also those whose open dependencies have green
+                PRs, on a synthetic base (early.py);
 5. **budget** -- paid-API spend is checked.
 
 Rules that hold throughout:
@@ -39,6 +41,7 @@ from pathlib import Path
 
 from . import agents, budget, queue, shims, stacks
 from . import config as config_mod
+from . import early as early_mod
 from . import forge as forge_mod
 from . import prompt as prompt_mod
 from .config import Config
@@ -104,6 +107,7 @@ class TickReport:
     waiting: list[str] = field(default_factory=list)
     blocked: list[int] = field(default_factory=list)
     adopted: list[str] = field(default_factory=list)
+    deps: dict[int, str] = field(default_factory=dict)  # issue -> "waiting for #5 (no PR), #6 (PR red)"
     open_: int = 0
     complete: bool = False
 
@@ -136,6 +140,7 @@ class Supervisor:
 
         self.integrator = make_integrator(self)
         self.reviews = Reviews(self)
+        self.early = early_mod.Early(self)
         from .integrate.async_watch import AsyncWatch
 
         self.async_watch = AsyncWatch(self)
@@ -352,6 +357,7 @@ class Supervisor:
             if rec.status in (WAITING_CI, IN_REVIEW, READY):
                 self._watch(rec, report)
         self._review()
+        self.early.tick()  # early dependants: moved dependencies noted, merged ones refreshed onto the base
         if self.cfg.integrate.mode != "none" and not self.dry_run:
             try:
                 self.integrator.tick()
@@ -859,8 +865,7 @@ class Supervisor:
                 report.waiting.append(f"#{entry.issue}(held)")
                 continue
             pending = [d for d in entry.deps if self.issue(d).state != CLOSED]
-            if pending:
-                report.waiting.append(f"#{entry.issue}<-{','.join('#' + str(d) for d in pending)}")
+            if pending and not self._may_start_early(rec, pending, entries, report):
                 continue
             if not rec.started_at and not rec.pr:
                 # Work that already has an open PR (started by hand, or by a runner
@@ -919,6 +924,10 @@ class Supervisor:
                 continue
             try:
                 self.launch(rec, issue, chosen, overflow=overflow)
+            except early_mod.NoEarlyStart as e:
+                self.early.refused(rec, pending, str(e))
+                report.waiting.append(f"#{entry.issue}<-{','.join('#' + str(d) for d in pending)}")
+                continue
             except (GitError, prompt_mod.PromptError, OSError, ValueError) as e:
                 rec.not_before = now() + 600
                 rec.event(f"launch failed: {e}")
@@ -930,6 +939,14 @@ class Supervisor:
             in_use[p2] = in_use.get(p2, 0) + 1
         report.open_ = open_count
         report.complete = open_count == 0 and not any(r.status in ACTIVE for r in self.state.all())
+
+    def _may_start_early(self, rec: IssueRecord, pending: list[int], entries: list[queue.Entry], report: TickReport) -> bool:
+        """Dependencies still open: start early on a synthetic base (SCH-10), or wait and say what for."""
+        if self.early.can_start(rec, pending, entries):
+            return True
+        report.waiting.append(f"#{rec.issue}<-{','.join('#' + str(d) for d in pending)}")
+        report.deps[rec.issue] = self.early.waiting_for(pending, rec)
+        return False
 
     # -- reopened issues (AGT-20) ----------------------------------------------------------------------------
     def _reopened(self, done: list[IssueRecord]) -> set[int]:
@@ -1059,6 +1076,7 @@ class Supervisor:
         agent = agents.get(name, self.cfg.agents.options.get(name))
         branch = rec.branch or self.trees.branch_for(issue.number, issue.title, issue.labels)
         tree = self.trees.prepare(issue.number, branch)
+        early_on = self.early.build(issue.number, tree)  # [] unless it starts early; NoEarlyStart on a conflict
         data_dir = self.state.agent_data / str(issue.number)
         data_dir.mkdir(parents=True, exist_ok=True)
         # Credentials the agent needs in its private data dir (opencode keeps
@@ -1080,6 +1098,7 @@ class Supervisor:
                 text += self._lane_change_note(rec, issue, branch, tree, lane_change)
         else:
             text = self.render_prompt(rec, issue, branch, tree)
+        text += self.early.brief(rec, early_on)
         title = f"{self.cfg.agents.title_prefix} #{issue.number}"
         spec = agent.launch(mid, text, title=title, resume=resume, data_dir=data_dir)
         env = self.agent_env(issue.number, spec)
@@ -1112,6 +1131,9 @@ class Supervisor:
         rec.stalled_since = 0
         rec.hold_model, rec.down_waiting = "", 0.0
         rec.overflow = overflow  # not a pin: the next launch is routed as usual (fail-back)
+        if early_on:
+            rec.early_on, rec.early_refused = early_on, []
+            rec.event("started early on " + ", ".join(f"#{u['issue']} ({u['sha'][:8]})" for u in early_on))
         rec.event(f"launched on {model}" + (" (resumed)" if resume else "") + (f" -- {overflow}" if overflow else ""))
         self.state.put(rec)
         self.say(
@@ -1276,6 +1298,7 @@ class Supervisor:
                 "finished": report.finished,
                 "waiting": report.waiting,
                 "blocked": report.blocked,
+                "deps": {str(k): v for k, v in report.deps.items()},
                 "open": report.open_,
                 "complete": report.complete,
                 "forge_calls": getattr(self.forge, "calls", 0),

@@ -42,6 +42,8 @@ class Direct:
         ready = [r for r in self.sup.state.all() if r.status == READY and r.pr]
         if self.gate.only is not None:
             ready = [r for r in ready if r.issue == self.gate.only]
+        # An early dependant merges only after its dependencies have (SCH-10).
+        ready = [r for r in ready if not self.sup.early.held(r.issue)]
         if not ready:
             return
         ready.sort(key=lambda r: order.index(r.issue) if r.issue in order else len(order))

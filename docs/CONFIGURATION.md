@@ -69,6 +69,20 @@ Durations accept `90`, `"90s"`, `"30m"`, `"4h"` or `"2d"`. Models are always wri
 | `title_prefix` | `"nohalt"` | agent session titles: `<prefix> #<issue>` |
 | `copy_files` | `[]` | files copied into each agent's private data dir (e.g. an opencode `auth.json`) |
 | `options` | `{}` | per-adapter options, below |
+| `early_start` | `false` | start a dependant before its dependencies close, on a synthetic base built from their unmerged PRs. See [Early start](#early-start) |
+| `early_start_on` | `"green"` | the state every open dependency's PR must be in: `green` (its checks are green on its current head) or `approved` (green, and past the `[review]` gate if that issue needs a review) |
+
+### Early start
+
+`14: 13` makes #14 wait until #13 is **closed**: a full release cycle per dependency hop, however long #13's PR has been green. With `early_start = true`, a dependant whose every dependency is closed **or** has a PR in the `early_start_on` state starts at once (SCH-10):
+
+- **A synthetic base.** Its worktree is cut from the base branch, and each unmerged dependency's PR head is merged in, in dependency order (a dependency that needs another comes after it), through the `[integrate.mergers]` drivers. A conflict no driver settles means **no early start**: the issue waits as before, the log says which dependency conflicted in which files, and nohalt does not try those heads again until one of them moves. Only an issue's first launch is built this way.
+- **The prompt** names the dependency branches included, with their PRs and heads, and says they are not merged yet: build on them, do not rewrite them, and expect the PR's diff to include their commits until they merge.
+- **A dependency that moves** (a new push) is noted: the dependant's next launch is told to merge `origin/<dependency branch>` again. An agent that is running, or a PR already waiting, gets the note on its next launch; the refresh below brings in the final version either way.
+- **Never before its dependencies.** A dependant's PR does not integrate until every dependency has merged. `train` batches it only when each open dependency goes into the same batch, ahead of it; `direct` merges it only after its dependencies have merged. A dependency whose PR is closed unmerged, or handed back red, leaves the dependant working but unable to integrate; the log says which.
+- **Onto the real base.** Once every dependency has merged, nohalt merges the base into the dependant's branch (the `refresh_conflicts` path, also when the merge is clean), so its CI runs on the real base; real code conflicts are handed back. From then on it is an ordinary PR. With `integrate.mode = "none"` the agent is told to merge the base instead.
+
+`nohalt status` lists `#14 early on #13` for each early dependant, and each waiting issue with what it waits for: `#14 waiting for #13 (no PR), #12 (PR red)` (also `PR pending`, `PR green` while it waits for approval, `PR closed unmerged`).
 
 ```toml
 [agents.options.opencode]

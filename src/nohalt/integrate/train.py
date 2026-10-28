@@ -14,7 +14,9 @@ batching them by hand cost a night. So, on every tick:
    left out and its issue handed back to rebase. The branch gets the next
    free version, and a PR that closes the issues it carries. CI's full suite
    on the batch is the gate.
-3. With ``windows`` set, a normal batch opens only inside a release window, and
+3. An issue started early on unmerged dependencies (SCH-10) is batched only
+   after them, or together with them.
+4. With ``windows`` set, a normal batch opens only inside a release window, and
    ``per_window`` of them merge per window. Outside, a batch carries hotfixes
    only (a hotfix label, ``<state>/priority``, the fix for a red base), or
    nothing; ``nohalt release-now`` opens one normal batch regardless (DEP-13).
@@ -328,6 +330,7 @@ class Train:
             cands, kind, window, hot = self._schedule(cands)
             if not cands:
                 return
+        cands = self.sup.early.order(cands)  # an early dependant goes in after its dependencies (SCH-10)
         remote, base = self.cfg.project.remote, self.cfg.project.base_branch
         try:
             self._ensure_tree()
@@ -343,6 +346,8 @@ class Train:
         merged: list[tuple[int, int, str]] = []
         ident = ["-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost"]
         for issue, pr in cands:
+            if self.sup.early.held(issue, {i for i, _, _ in merged}):
+                continue  # its dependencies are neither merged nor in this batch
             ok = (
                 subprocess.run(
                     [

@@ -23,7 +23,7 @@ queue.txt ──► scheduler ──► agent in its own worktree ──► PR �
                                per slot, at this commit     to the agent with the failure
 ```
 
-- **Dependency-ordered queue.** `14: 13` means #14 waits until #13 is closed. Order is preference; dependencies are law. Edit it while nohalt runs.
+- **Dependency-ordered queue.** `14: 13` means #14 waits until #13 is closed -- or, with `early_start`, starts once #13's PR is green, on a synthetic base with #13 merged in, and still integrates only after it. Order is preference; dependencies are law. Edit it while nohalt runs.
 - **GitHub or GitLab.** gitlab.com or self-hosted: merge requests, pipeline jobs as checks, `glab` for agents. Subgroups are fine.
 - **Parallel agents, isolated.** One worktree and branch per issue; guard shims on each agent's `PATH` refuse merging, closing issues, pushing to the base branch, `git stash` (worktrees share one stash stack), and machine-wide `pkill`.
 - **A verification lock.** Agents edit in parallel but verify one at a time per test slot (`nohalt verify <worktree> -- '<cmd>'`), with the environment reset to the commit under test.
