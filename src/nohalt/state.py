@@ -64,6 +64,9 @@ class IssueRecord:
     done_at: float = 0.0  # when nohalt saw the issue closed; comments after it are handed over on a reopen
     labelled: bool = False  # the forge carries the blocked label we put there
     swept: list[str] = field(default_factory=list)  # PR head SHAs already handed back
+    waiting_sha: str = ""  # the PR head waiting in waiting_ci since waiting_since ("" once an agent is relaunched)
+    waiting_since: float = 0.0
+    conflict_since: float = 0.0  # that head seen conflicting with the base since then, while in waiting_ci (#82)
     lane: str = ""  # the [[prompt.lane]] chosen at the first launch ("" = no lane); kept across relaunches
     lane_digest: str = ""  # the lanes' configuration it was chosen under ("" = not chosen yet)
     # Early start (early.py): the unmerged dependency heads its synthetic base was built on.

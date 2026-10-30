@@ -67,6 +67,8 @@ Durations accept `90`, `"90s"`, `"30m"`, `"4h"` or `"2d"`. Models are always wri
 | `revive_limit` | `2` | hung restarts before counting as an attempt |
 | `revive_grace` | `"15m"` | wait before relaunching an agent that stopped without a PR (it may have asked a question) |
 | `ci_rounds` | `3` | red or conflicting PRs handed back before blocking |
+| `conflict_wait` | `"15m"` | a PR in `waiting_ci` that has conflicted with the base this long is refreshed (`refresh_conflicts`) or handed back with its conflicted paths, whether or not it has checks: the forge may run no CI on it. That includes a head already handed back once. A red check on a conflicting PR is handed back at once (INT-19) |
+| `waiting_ci_warn` | `"2h"` | `nohalt status` lists heads waiting in `waiting_ci` longer than this. `""`: never |
 | `log_max_mb` | `20` | per-issue agent logs rotate past this |
 | `title_prefix` | `"nohalt"` | agent session titles: `<prefix> #<issue>` |
 | `copy_files` | `[]` | files copied into each agent's private data dir (e.g. an opencode `auth.json`) |

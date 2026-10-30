@@ -623,6 +623,7 @@ class Supervisor:
             rec.pr_sha = pr.head_sha
             rec.status = WAITING_CI
             self.state.put(rec)
+        self._ci_clock(rec, pr)
         try:
             checks = self.forge.checks(pr.head_sha)
         except ForgeError:
@@ -630,6 +631,8 @@ class Supervisor:
         ignored = set(self.cfg.integrate.ignore_checks)
         checks = [c for c in checks if c.name not in ignored]
         v = ci_verdict(checks, self.cfg.integrate.required_checks)
+        if self._stuck_conflict(rec, pr, checks, v):
+            return
         if v == forge_mod.base.RED:
             if pr.head_sha in rec.swept:
                 return
@@ -686,6 +689,18 @@ class Supervisor:
         if v == forge_mod.base.GREEN:
             self.reviews.gate(rec, pr)  # ready, or in review when the issue needs one
 
+    def _ci_clock(self, rec: IssueRecord, pr: PullRequest) -> None:
+        """When this head began waiting in waiting_ci, for `nohalt status` and the conflict clock (#82)."""
+        if rec.status == WAITING_CI and rec.waiting_sha != pr.head_sha:
+            rec.waiting_sha, rec.waiting_since, rec.conflict_since = pr.head_sha, now(), 0.0
+            self.state.put(rec)
+
+    def _stuck_conflict(self, rec: IssueRecord, pr: PullRequest, checks: list[forge_mod.Check], v: str) -> bool:
+        """A conflicting PR whose CI never comes is refreshed or handed back, not left waiting (#82)."""
+        from .integrate.refresh import stuck_conflict
+
+        return stuck_conflict(self, rec, pr, checks, v)
+
     def _conflict_left_to_batch(self, rec: IssueRecord, pr: PullRequest, v: str) -> bool:
         """Train: a green PR whose conflicts the drivers settle goes on to the batch unrefreshed (#69).
 
@@ -738,6 +753,7 @@ class Supervisor:
         rec.not_before = now() + delay
         rec.note = note or why
         rec.last_exit = ""
+        rec.waiting_sha = ""  # back from an agent, its head waits anew (#82)
         rec.event(why)
         self.state.put(rec)
         self.say(f"#{rec.issue}: {why}" + (f"; again in {int(delay // 60)} min" if delay >= 60 else ""))

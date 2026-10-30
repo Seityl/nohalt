@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from conftest import git
+from nohalt.cli import render_status
 from nohalt.integrate import refresh as refresh_mod
 from nohalt.integrate.mergers import effective
 from nohalt.integrate.refresh import (
@@ -442,3 +443,115 @@ def test_a_refresh_that_changes_code_does_not_carry_the_approval(world, repo):
     w.forge.set_checks(out.sha, [("ci", "completed", "success")])
     w.sup._watch(w.rec(1), SimpleNamespace())
     assert w.rec(1).status == IN_REVIEW
+
+
+# -- a conflicting PR in waiting_ci never sits there (#82) -----------------------------------------
+
+CODE_CONFLICT = ({"app.py": "x = 1\n"}, {"app.py": "x = 2\n"})
+BOOKKEEPING = ({"translations.csv": "hello,hola\nbye,adios\n"}, {"translations.csv": "hello,hola\nyes,si\n"})
+
+
+def issue_comments(w) -> list[str]:  # type: ignore[no-untyped-def]
+    return [c[1] for c in w.forge.data()["comments"] if c[0] == 1]
+
+
+def test_a_conflicting_pr_whose_checks_never_come_is_handed_back_after_conflict_wait(world, repo, clock):
+    """INT-19: GitHub runs no PR CI on a conflicting PR, so its required check stays missing: PENDING forever."""
+    head, _ = scenario(repo, *CODE_CONFLICT)
+    w = world(integrate={"mode": "direct", "required_checks": ["tests"]}, agents={"conflict_wait": "15m"})
+    conflicting_pr(w, head)
+    w.forge.set_checks(head, [("lint", "completed", "success")])  # a push-triggered check; `tests` never comes
+    w.sup.tick()
+    rec = w.rec(1)
+    assert rec.status == WAITING_CI and rec.conflict_since and rec.ci_rounds == 0, w.messages
+    clock.advance(14 * 60)
+    w.sup.tick()
+    assert w.rec(1).status == WAITING_CI and not issue_comments(w)
+    clock.advance(2 * 60)
+    w.sup.tick()
+    w.wait_agents()
+    assert remote_sha(repo, "feature/1-x") == head  # a code conflict: nothing pushed
+    assert w.rec(1).ci_rounds == 1
+    note = issue_comments(w)[-1]
+    assert "has conflicted with `main` for 16m" in note and "Left in conflict:\n- `app.py`" in note
+
+
+def test_a_conflicting_pr_without_checks_handed_back_before_is_handed_back_again(world, repo, clock):
+    """The agent came back without moving the head: once per head used to mean never again."""
+    head, _ = scenario(repo, *CODE_CONFLICT)
+    w = world(integrate={"mode": "direct"}, agents={"conflict_wait": "10m", "ci_rounds": 2})
+    conflicting_pr(w, head)
+    w.drive(2)  # no checks at all: handed back at once, as before; the scripted agent pushes nothing
+    assert w.rec(1).ci_rounds == 1 and w.rec(1).status == WAITING_CI, w.rec(1).history
+    w.drive(1)
+    assert w.rec(1).ci_rounds == 1  # waiting again, on a clock restarted when it came back
+    clock.advance(11 * 60)
+    w.drive(2)
+    assert w.rec(1).ci_rounds == 2 and w.rec(1).status == WAITING_CI
+    assert "Left in conflict:\n- `app.py`" in issue_comments(w)[-1]
+    clock.advance(11 * 60)
+    w.drive(1)
+    assert w.rec(1).status == "blocked"  # past ci_rounds: a human, not an endless wait
+
+
+def test_a_red_check_on_a_conflicting_pr_is_handed_back_at_once(world, repo):
+    head, _ = scenario(repo, *CODE_CONFLICT)
+    w = world(integrate={"mode": "direct", "required_checks": ["tests"]})
+    conflicting_pr(w, head)
+    w.forge.set_checks(head, [("lint", "completed", "failure", "https://ci/lint")])  # red, but not `tests`: PENDING
+    w.sup.tick()
+    w.wait_agents()
+    assert w.rec(1).ci_rounds == 1
+    note = issue_comments(w)[-1]
+    assert "CI is red" in note and "lint: failure https://ci/lint" in note and "conflicts with `main`" in note
+
+
+def test_a_conflicting_pr_with_pending_checks_is_refreshed_after_conflict_wait(world, repo, clock):
+    head, _ = scenario(repo, *BOOKKEEPING)
+    w = world(
+        integrate={"mode": "direct", "mergers": {"translations.csv": "keep_both_lines"}},
+        agents={"conflict_wait": "15m"},
+    )
+    conflicting_pr(w, head)
+    w.forge.set_checks(head, [("tests", "in_progress", "")])
+    w.sup.tick()
+    assert remote_sha(repo, "feature/1-x") == head
+    clock.advance(16 * 60)
+    w.sup.tick()
+    new = remote_sha(repo, "feature/1-x")
+    assert new != head, w.messages
+    rec = w.rec(1)
+    assert rec.status == WAITING_CI and rec.pr_sha == new and rec.ci_rounds == 0
+    assert not issue_comments(w)
+
+
+def test_a_pr_no_longer_conflicting_just_waits_for_its_checks(world, repo, clock):
+    head, _ = scenario(repo, *CODE_CONFLICT)
+    w = world(integrate={"mode": "direct"}, agents={"conflict_wait": "5m"})
+    conflicting_pr(w, head)
+    w.forge.set_checks(head, [("tests", "in_progress", "")])
+    w.sup.tick()
+    assert w.rec(1).conflict_since
+    w.forge.add_pull(101, "feature/1-x", head, body="Closes #1", mergeable=None)  # not known: nothing decided
+    w.sup.tick()
+    assert w.rec(1).conflict_since
+    w.forge.add_pull(101, "feature/1-x", head, body="Closes #1", mergeable=True)
+    w.sup.tick()
+    assert not w.rec(1).conflict_since  # the clock stops
+    clock.advance(10 * 60)
+    w.sup.tick()
+    rec = w.rec(1)
+    assert rec.status == WAITING_CI and rec.ci_rounds == 0 and not issue_comments(w)
+
+
+def test_status_flags_a_head_waiting_in_waiting_ci_too_long(world, repo, clock):
+    head, _ = scenario(repo, *CODE_CONFLICT)
+    w = world(integrate={"mode": "direct", "required_checks": ["tests"]}, agents={"conflict_wait": "6h"})
+    conflicting_pr(w, head)
+    w.forge.set_checks(head, [("lint", "completed", "success")])
+    w.sup.tick()
+    assert "WAITING_CI for longer" not in render_status(w.cfg)
+    clock.advance(2 * 3600 + 60)
+    out = render_status(w.cfg)
+    assert "WAITING_CI for longer than 2h 00m" in out
+    assert f"#1: PR #101 at {head[:8]} for 2h 01m, conflicting with the base for 2h 01m" in out
