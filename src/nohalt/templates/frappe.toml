@@ -26,6 +26,7 @@ max_attempts = 2
 
 [models]
 default = "opencode:anthropic/claude-sonnet-4-5"
+# pinned_during_cooldown = "warning"   # pinned issues may still start on a pool a usage *warning* cools down (not a limit)
 
 [stack]
 name = "frappe"

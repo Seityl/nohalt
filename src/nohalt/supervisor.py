@@ -807,8 +807,8 @@ class Supervisor:
         held = self.cfg.models.overflow_reserve.get(pool, 0) if reserve else 0
         return in_use.get(pool, 0) < self._cap(pool) - held
 
-    def _stall_reason(self, model: str, in_use: dict[str, int]) -> str:
-        unavailable = self.capacity.unavailable(model)
+    def _stall_reason(self, model: str, in_use: dict[str, int], warned_ok: bool = False) -> str:
+        unavailable = self.capacity.unavailable(model, warned_ok)
         if unavailable:
             return f"{unavailable} and no fallback or overflow model can start"
         pool = self._pool_of(model)
@@ -924,7 +924,8 @@ class Supervisor:
             model, pinned = self._wanted(rec, issue)
             pool = self._pool_of(model)
             overflow_due = self._overflow_due(rec, pinned)
-            unavailable = self.capacity.unavailable(model)
+            warned_ok = pinned and self.router.pin_through_warning(rec.issue)
+            unavailable = self.capacity.unavailable(model, warned_ok)
             if not self._has_slot(model, in_use) and not overflow_due and not unavailable:
                 self._stall(rec)
                 continue
@@ -941,7 +942,7 @@ class Supervisor:
             if unavailable:  # down or cooling down: elsewhere at once, or wait if pinned
                 chosen, overflow = self._divert(issue, model, pinned, unavailable, in_use)
             else:
-                chosen = self.router.choose(issue, lambda m: self._has_slot(m, in_use), want=(model, pinned))
+                chosen = self.router.choose(issue, lambda m: self._has_slot(m, in_use), want=(model, pinned), warned_ok=warned_ok)
             if not chosen and overflow_due:
                 chosen = self.router.overflow(issue, lambda m: self._has_slot(m, in_use, reserve=True))
                 if chosen:
@@ -952,10 +953,10 @@ class Supervisor:
                 if self._down_block(rec, model, pinned):
                     continue
                 self._stall(rec)
-                self.state.log(f"#{entry.issue} waiting: {self._stall_reason(model, in_use)}")
+                self.state.log(f"#{entry.issue} waiting: {self._stall_reason(model, in_use, warned_ok)}")
                 continue
             try:
-                self.launch(rec, issue, chosen, overflow=overflow)
+                self.launch(rec, issue, chosen, overflow=overflow, cooling=self._pin_cooling(chosen, warned_ok))
             except early_mod.NoEarlyStart as e:
                 self.early.refused(rec, pending, str(e))
                 report.waiting.append(f"#{entry.issue}<-{','.join('#' + str(d) for d in pending)}")
@@ -1104,7 +1105,7 @@ class Supervisor:
             body += f"\n## Note from the supervisor\n\n{rec.note}\n"
         return body
 
-    def launch(self, rec: IssueRecord, issue: Issue, model: str, overflow: str = "") -> None:
+    def launch(self, rec: IssueRecord, issue: Issue, model: str, overflow: str = "", cooling: str = "") -> None:
         name, mid = agents.split_model(model)
         agent = agents.get(name, self.cfg.agents.options.get(name))
         branch = rec.branch or self.trees.branch_for(issue.number, issue.title, issue.labels)
@@ -1164,15 +1165,18 @@ class Supervisor:
         rec.stalled_since = 0
         rec.hold_model, rec.down_waiting = "", 0.0
         rec.overflow = overflow  # not a pin: the next launch is routed as usual (fail-back)
+        rec.pin_cooling = cooling
+        warned = f" -- pinned; {cooling}, a warning: pinned issues still start there" if cooling else ""
         if early_on:
             rec.early_on, rec.early_refused = early_on, []
             rec.event("started early on " + ", ".join(f"#{u['issue']} ({u['sha'][:8]})" for u in early_on))
-        rec.event(f"launched on {model}" + (" (resumed)" if resume else "") + (f" -- {overflow}" if overflow else ""))
+        rec.event(f"launched on {model}" + (" (resumed)" if resume else "") + (f" -- {overflow}" if overflow else "") + warned)
         self.state.put(rec)
         self.say(
             f"#{issue.number}: agent launched on {model} in {tree} ({branch})"
             + (" -- resumed" if resume else "")
             + (f" -- {overflow}" if overflow else "")
+            + warned
         )
 
     def _lane_change_note(self, rec: IssueRecord, issue: Issue, branch: str, tree: Path, change: str) -> str:
@@ -1278,6 +1282,10 @@ class Supervisor:
             delay=self.cfg.agents.provider_backoff,
         )
         return True
+
+    def _pin_cooling(self, model: str, warned_ok: bool) -> str:
+        """The warning cool-down a pinned launch on ``model`` goes through, or "" (#81)."""
+        return self.capacity.unavailable(model) if warned_ok else ""
 
     def _divert(self, issue: Issue, model: str, pinned: bool, why: str, in_use: dict[str, int]) -> tuple[str | None, str]:
         """The routed model is down or cooling down: a fallback or overflow target, now (not a pin)."""
