@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from conftest import git
+from nohalt.integrate import refresh as refresh_mod
 from nohalt.integrate.mergers import effective
 from nohalt.integrate.refresh import (
     CONFLICT,
@@ -328,6 +329,35 @@ def test_train_leaves_a_conflict_its_batch_settles_unrefreshed(world, repo):
     # Not green yet (a conflicted PR may get no CI): then the refresh is what unblocks it.
     w.forge.set_checks(head, [])
     assert not w.sup._conflict_left_to_batch(w.rec(1), pr, "pending")
+
+
+def test_left_to_the_batch_is_logged_once_per_head_and_base(world, repo):
+    """INT-18 (#78): it was logged on every tick, and the trial merge repeated whenever the in-memory cache missed."""
+    head, _ = scenario(repo, {"translations.csv": "hello,hola\nbye,adios\n"}, {"translations.csv": "hello,hola\nyes,si\n"})
+    w = world(integrate={"mode": "train", **TRANSLATIONS})
+    conflicting_pr(w, head)
+    w.forge.set_checks(head, [("ci", "completed", "success")])
+    log = w.sup.state.logs_dir / "nohalt.log"
+
+    def said() -> int:
+        return log.read_text().count("left to the release batch") if log.exists() else 0
+
+    for _ in range(3):
+        w.sup._watch(w.rec(1), SimpleNamespace())
+    assert said() == 1
+    base = remote_sha(repo, "main")
+    assert w.rec(1).left_to_batch == f"{head}:{base}"
+    # The answer is kept with the state, not in the process: a restarted supervisor does not merge again.
+    assert w.sup.state.load("trial_merges.json") == {f"{head}:{base}": True}
+    assert refresh(w.sup, w.rec(1), w.forge.pull(101), dry=True).why == "cached"
+    # The base moves: a new trial merge, said once more.
+    git(repo, "checkout", "-q", "main")
+    commit(repo, {"other.txt": "x\n"}, "base moves")
+    git(repo, "push", "-q", "origin", "main")
+    refresh_mod._fetched.clear()
+    w.sup._watch(w.rec(1), SimpleNamespace())
+    w.sup._watch(w.rec(1), SimpleNamespace())
+    assert said() == 2 and len(w.sup.state.load("trial_merges.json")) == 2
 
 
 def test_train_still_hands_back_a_code_conflict(world, repo):

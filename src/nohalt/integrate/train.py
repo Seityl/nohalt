@@ -24,6 +24,10 @@ batching them by hand cost a night. So, on every tick:
    ``per_window`` of them merge per window. Outside, a batch carries hotfixes
    only (a hotfix label, ``<state>/priority``, the fix for a red base), or
    nothing; ``nohalt release-now`` opens one normal batch regardless (DEP-13).
+6. A candidate whose mergeability the forge has not computed yet is asked
+   again once, a few seconds later (a fresh read starts the computation). Still
+   unknown, it is left out of the batch, and said so, and goes first in the next
+   one (INT-18).
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ if TYPE_CHECKING:
 NETWORK_RERUNS = 3
 RELEASE_NOW = "RELEASE_NOW"  # `nohalt release-now`: one normal batch, whatever the windows say
 RELEASE_NOW_TTL = 12 * 3600  # a request nobody's batch used by then is dropped
+MERGEABLE_WAIT = 5  # seconds for the forge to compute a candidate's mergeability once asked (#78)
 
 
 def _vkey(v: str) -> tuple[int, ...]:
@@ -67,6 +72,7 @@ class Train:
         self.live = LiveWatch(sup)
         self.schedule = Schedule(self.t.windows, self.t.timezone, self.t.days)
         self.clock = now  # tests move time by replacing it
+        self.sleep = time.sleep  # ... and skip the wait for mergeability
 
     def _st(self) -> dict[str, Any]:
         return self.sup.state.load("train.json", {"releases": {}, "parked": [], "reruns": {}})
@@ -276,14 +282,17 @@ class Train:
         held = {int(x) for x in self.sup.state.read_lines("hold") if x.isdigit()}
 
         first = approved_first(self.sup)
+        unknown = st.get("mergeable_first", [])
 
         def rank(rec: IssueRecord) -> tuple[int, float, int]:
             at = order.index(rec.issue) if rec.issue in order else len(order)
             if rec.issue in priority:
                 return (0, priority.index(rec.issue), at)
+            if rec.issue in unknown:
+                return (1, unknown.index(rec.issue), at)  # left out of the last batch, mergeability unknown (INT-18)
             if first and approved(rec, rec.pr_sha):
-                return (1, rec.review_approved_at, at)  # approved, in approval order (INT-17)
-            return (2, 0, at)
+                return (2, rec.review_approved_at, at)  # approved, in approval order (INT-17)
+            return (3, 0, at)
 
         out = []
         recs = sorted((r for r in self.sup.state.all() if r.status == READY and r.pr), key=rank)
@@ -309,6 +318,32 @@ class Train:
                 continue
             out.append((rec.issue, pr))
         return out
+
+    def _mergeability_known(self, cands: list[tuple[int, PullRequest]]) -> list[tuple[int, PullRequest]]:
+        """The candidates whose mergeability the forge has computed, asking once more after ``MERGEABLE_WAIT``.
+
+        A listing does not carry mergeability, and a forge computes it lazily: a PR read as
+        unknown is mergeable a minute later. Each one left out is said, and goes first next time.
+        A failed read is unknown too (API-02).
+        """
+
+        def unknown(pr: PullRequest) -> bool:
+            try:
+                return self.sup.forge.pull(pr.number).mergeable is None
+            except ForgeError:
+                return True
+
+        pending = [c for c in cands if unknown(c[1])]
+        if pending:
+            self.sleep(MERGEABLE_WAIT)
+            pending = [c for c in pending if unknown(c[1])]
+        st = self._st()
+        st["mergeable_first"] = [i for i, _ in pending]
+        self._save(st)
+        for issue, _pr in pending:
+            self.sup.say(f"#{issue}: left out of this batch -- forge has not computed mergeability yet")
+        left = {i for i, _ in pending}
+        return [c for c in cands if c[0] not in left]
 
     def _git(self, *args: str, check: bool = True) -> str:
         return git(self.tree, *args, check=check)
@@ -367,6 +402,9 @@ class Train:
             cands, kind, window, hot = self._schedule(cands)
             if not cands:
                 return
+        cands = self._mergeability_known(cands)
+        if not cands:
+            return
         cands = self.sup.early.order(cands)  # an early dependant goes in after its dependencies (SCH-10)
         remote, base = self.cfg.project.remote, self.cfg.project.base_branch
         try:
