@@ -10,7 +10,7 @@ from nohalt.cli import render_status
 from nohalt.config import ConfigError
 from nohalt.config import from_dict as config_from_dict
 from nohalt.forge import Run
-from nohalt.integrate.async_watch import failing_tests
+from nohalt.integrate.async_watch import failing_tests, read_failures
 from nohalt.state import AWAITING_GREEN, BLOCKED, DONE, QUEUED
 from nohalt.supervisor import Supervisor
 
@@ -229,3 +229,114 @@ def test_failing_tests_are_read_from_pytest_and_unittest_logs():
         "tests/test_b.py::test_two",
         "tests/test_c.py::test_setup",
     ]
+
+
+# -- Frappe's test runner, and failures that could not be read ------------------------------------
+
+_P = "Tests\tRun tests\t2026-10-29T04:12:07.5512345Z "  # `gh run view --log-failed` prefixes every line
+_RED_BADGE = "\x1b[41m {} \x1b[0m"  # click.style(" ERROR ", bg="red"), as Frappe's runner prints it
+_FRAPPE_FAILED = [
+    ("ERROR", "test_a_failed_inspection_raises", "myapp.tests.unit.test_inspection.TestInspection"),
+    ("FAIL", "test_rounding_on_partial_return", "myapp.tests.unit.test_invoice.TestInvoice"),
+    ("FAIL", "test_payment_terms_split", "myapp.tests.unit.test_invoice.TestInvoice"),
+    ("FAIL", "test_reorder_level_per_warehouse", "myapp.stock.doctype.bin.test_bin.TestBin"),
+    ("FAIL", "test_overtime_needs_approval", "myapp.tests.unit.test_timesheet.TestTimesheet"),
+    ("FAIL", "test_report_totals_match_ledger", "myapp.tests.integration.test_ledger.TestLedger"),
+    ("FAIL", "test_portal_hides_draft_orders", "myapp.tests.unit.test_portal.TestPortal"),
+]
+
+
+def _frappe_log(failed: list[tuple[str, str, str]] = _FRAPPE_FAILED, summary: str = "") -> str:
+    """An excerpt of a Frappe runner's failed log as GitHub serves it: colour codes, padded badges, no colon."""
+    out = [
+        "",
+        "myapp.tests.unit.test_invoice.TestInvoice",
+        "   \x1b[32m ✔ \x1b[0m test_grand_total",
+        "   \x1b[31m ✖ \x1b[0m test_rounding_on_partial_return",
+        "   \x1b[37m = \x1b[0m test_legacy_tax_template",
+        "",
+        "",
+    ]
+    for kind, test, cls in failed:
+        out += [
+            "=" * 70,
+            f"{_RED_BADGE.format(kind)} {test} ({cls}.{test})",
+            "-" * 70,
+            "Traceback (most recent call last):",
+            f'  File "/home/runner/work/myapp/apps/myapp/{cls.rsplit(".", 1)[0].replace(".", "/")}.py", line 88, in {test}',
+            "    self.assertEqual(doc.grand_total, 118.0)",
+            "AssertionError: 117.99 != 118.0" if kind == "FAIL" else "frappe.exceptions.ValidationError: Inspection failed",
+            "",
+        ]
+    errors = sum(k == "ERROR" for k, _, _ in failed)
+    out += [
+        "-" * 70,
+        "Ran 412 tests in 1803.214s",
+        "",
+        summary or f"FAILED (failures={len(failed) - errors}, errors={errors}, skipped=38)",
+        "\x1b[31mError: Process completed with exit code 1.\x1b[0m",
+    ]
+    return "".join(f"{_P}{line}\n" for line in out)
+
+
+def test_failing_tests_are_read_from_frappes_runner_log():
+    """CI-10: Frappe's runner prints ` ERROR ` / ` FAIL ` badges in colour, padded and without a colon."""
+    log = _frappe_log()
+    assert "\x1b[41m ERROR \x1b[0m test_a_failed_inspection_raises" in log
+    tests, read, reported = read_failures(log)
+    assert tests == sorted(f"{cls}.{test}" for _, test, cls in _FRAPPE_FAILED)
+    assert (read, reported) == (7, 7)  # failures=6, errors=1: every one was read
+    # The progress lines (` ✖ test_x`, no class) and the class headers are not failures of their own.
+    assert not any(t.endswith(".TestInvoice") for t in tests)
+
+
+def test_a_summary_reporting_more_failures_than_were_read_is_a_shortfall():
+    log = _frappe_log(_FRAPPE_FAILED[:1], summary="FAILED (failures=16, errors=6, skipped=38)")
+    assert read_failures(log)[1:] == (1, 22)
+    assert read_failures(PYTEST_LOG)[1:] == (2, 2)  # `2 failed, 900 passed in 6600s`
+    assert read_failures(PYTEST_LOG.replace("2 failed", "3 failed, 1 error"))[1:] == (2, 4)
+    assert read_failures("no summary at all\n")[1:] == (0, 0)
+
+
+def test_a_test_failing_in_every_job_of_a_matrix_is_not_a_shortfall():
+    one = "FAILED tests/test_a.py::test_one - AssertionError\n===== 1 failed, 9 passed in 3.2s =====\n"
+    log = "".join(f"py{v}\tpytest\t2026-10-29T04:00:00Z {ln}\n" for v in ("3.11", "3.12") for ln in one.splitlines())
+    assert read_failures(log) == (["tests/test_a.py::test_one"], 2, 2)
+
+
+def test_a_frappe_red_run_is_one_issue_listing_every_failure(world):
+    w = _async(world)
+    _red(w, 10, "aaa1111", _frappe_log())
+    w.sup.async_watch.tick()
+    body = next(iter(_issues(w).values()))["body"]
+    assert "Failing tests (7):" in body
+    assert "myapp.tests.unit.test_inspection.TestInspection.test_a_failed_inspection_raises" in body
+    assert "\x1b[" not in body  # the excerpt is plain text
+    assert "may be unrecognised" not in body
+
+
+def test_a_red_run_whose_summary_reports_unread_failures_relaunches(world):
+    """CI-10: 1 of 22 failures was read, so every later red run was "the same 1 failure(s)" and never relaunched."""
+    w = _async(world)
+    unread = _frappe_log(_FRAPPE_FAILED[:1], summary="FAILED (failures=16, errors=6, skipped=38)")
+    _red(w, 10, "aaa1111", unread)
+    w.sup.async_watch.tick()
+    n = int(next(iter(_issues(w))))
+    assert "Parsed 1 of 22 failures; the log format may be unrecognised." in _issues(w)[str(n)]["body"]
+    (w.scripts / f"{n}.txt").write_text("no-change already fixed\nno-change still fixed\n")
+    w.drive(3)
+    assert w.rec(n).status == AWAITING_GREEN
+
+    _red(w, 11, "bbb2222", unread)  # the one readable failure is the same; the 21 others may not be
+    w.sup.async_watch.tick()
+    note = _comments(w, n)[-1]
+    assert "Parsed 1 of 22 failures; the log format may be unrecognised." in note
+    assert "an agent is launched again" in note
+    assert w.rec(n).status == QUEUED and w.rec(n).fresh
+    w.drive(3)
+    assert "Parsed 1 of 22 failures" in w.prompts(n)[1]
+    assert w.rec(n).attempts == 0
+
+    _red(w, 12, "ccc3333", _frappe_log())  # fully read, and nothing the agent has not seen beyond these
+    w.sup.async_watch.tick()
+    assert "may be unrecognised" not in _comments(w, n)[-1]
