@@ -28,6 +28,10 @@ moved every conflicting PR's head, and every moved head restarted its review.
 * A PR in review is never refreshed: it waits for the verdict, like a running
   agent. In ``train`` mode a green PR whose conflicts the drivers settle is not
   refreshed at all (``left_to_batch``): the batch settles them the same way.
+* The answer of each such trial merge is kept per PR head and base
+  (``trial_merges.json``), so a later tick -- or a restarted supervisor -- does
+  not merge again, and "left to the release batch" is logged once per head and
+  base (``rec.left_to_batch``).
 * An approval carries over a refresh that changed, apart from what came from
   the base verbatim, only paths a merge driver owns or ``after_version``
   outputs (``_carry``). CI still has to be green on the new head.
@@ -61,7 +65,8 @@ IDENT = ["-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost"]
 HISTORY_DAYS = 14
 FETCH_EVERY = 30  # seconds between fetches for dry runs: one per tick, not one per PR
 
-_settles: dict[tuple[str, str, str], bool] = {}  # (refresh tree, PR head, base) -> the drivers settle their merge
+TRIALS = "trial_merges.json"  # "<PR head>:<base>" -> the drivers settle their merge; kept across restarts (#78)
+TRIALS_KEPT = 500
 _fetched: dict[str, float] = {}  # refresh tree -> when dry runs last fetched it
 
 
@@ -71,6 +76,7 @@ class Outcome:
     why: str = ""
     files: list[str] = field(default_factory=list)  # left in conflict
     sha: str = ""  # the new head, when refreshed
+    base: str = ""  # the base commit a dry run merged with
 
     @property
     def handled(self) -> bool:
@@ -127,8 +133,9 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
             return Outcome(FAILED, f"{remote}/{branch} not found (a fork?)")
         if head != pr.head_sha:
             return Outcome(DEFERRED, f"{branch} moved to {head[:8]} since the forge was asked")
-        if dry and (str(tree), head, base_sha) in _settles:
-            return Outcome(SETTLES if _settles[(str(tree), head, base_sha)] else CONFLICT, "cached")
+        known = sup.state.load(TRIALS, {}).get(f"{head}:{base_sha}") if dry else None
+        if known is not None:
+            return Outcome(SETTLES if known else CONFLICT, "cached", base=base_sha)
         if _git(tree, "merge-base", "--is-ancestor", base_sha, head).returncode == 0:
             return Outcome(FAILED, f"{branch} already contains {base}: nothing to refresh")
         git(tree, "checkout", "-q", "--detach", base_sha)
@@ -144,7 +151,7 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
         if left:
             _git(tree, "merge", "--abort")
             if dry:
-                _remember(tree, head, base_sha, False)
+                _remember(sup.state, head, base_sha, False)
             return Outcome(CONFLICT, "conflicts no merge driver settles", files=left)
         settled = conflicted
     elif clean or dry:
@@ -155,8 +162,8 @@ def refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest, *, clean: bool =
         return Outcome(FAILED, f"{branch} merges {base} cleanly here")
     if dry:
         _git(tree, "merge", "--abort")
-        _remember(tree, head, base_sha, True)
-        return Outcome(SETTLES, files=settled)
+        _remember(sup.state, head, base_sha, True)
+        return Outcome(SETTLES, files=settled, base=base_sha)
 
     try:
         snapshot = git(tree, "write-tree")
@@ -210,7 +217,10 @@ def left_to_batch(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> bool:
     if sup.cfg.integrate.mode != "train":
         return False
     out = refresh(sup, rec, pr, dry=True)
-    if out.status == SETTLES and out.why != "cached":
+    said = f"{pr.head_sha}:{out.base}"
+    if out.status == SETTLES and rec.left_to_batch != said:  # once per head and base, not every tick (#78)
+        rec.left_to_batch = said
+        sup.state.put(rec)
         sup.state.log(
             f"#{rec.issue}: {sup.pr(pr.number)} conflicts with {sup.cfg.project.base_branch} only in "
             f"{', '.join(out.files) or 'nothing git cannot merge'}; left to the release batch, not refreshed"
@@ -262,10 +272,12 @@ def _diff(tree: Path, a: str, b: str) -> list[str]:
     return [p for p in cp.stdout.split("\0") if p]
 
 
-def _remember(tree: Path, head: str, base_sha: str, settles: bool) -> None:
-    if len(_settles) > 1000:
-        _settles.clear()
-    _settles[(str(tree), head, base_sha)] = settles
+def _remember(state: StateStore, head: str, base_sha: str, settles: bool) -> None:
+    """A trial merge's answer, for every later tick and supervisor with the same head and base."""
+    trials = state.load(TRIALS, {})
+    trials.pop(f"{head}:{base_sha}", None)
+    trials[f"{head}:{base_sha}"] = settles
+    state.save(TRIALS, dict(list(trials.items())[-TRIALS_KEPT:]))
 
 
 def before_hand_back(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> bool:
