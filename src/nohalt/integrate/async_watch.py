@@ -38,21 +38,62 @@ _NOT_BASE = {"pull_request", "pull_request_target", "dynamic"}
 _NO_VERDICT = {"cancelled", "skipped", "neutral", "stale", ""}
 _OK = {"success", "skipped", "neutral", "cancelled"}
 
-# Failing tests in a failed log: pytest's short summary, unittest's (and Frappe's) headers.
+# Failing tests in a failed log: pytest's short summary, unittest's headers, and Frappe's runner's (a
+# coloured ` ERROR ` / ` FAIL ` badge, no colon). Colour codes are stripped first.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _PYTEST = re.compile(r"(?:^|\s)(?:FAILED|ERROR)\s+(\S+::\S+)", re.M)
-_UNITTEST = re.compile(r"(?:^|\s)(?:FAIL|ERROR):\s+(\w+)\s+\(([\w.]+)\)", re.M)
+_UNITTEST = re.compile(r"(?:^|\s)(?:FAIL|ERROR):?\s+(\w+) \(([\w.]+\.\w+)\)", re.M)
+# What the runner says it found: unittest's `FAILED (failures=N, errors=M, ...)`, pytest's `== N failed, ... in 5s ==`.
+_UNITTEST_SUMMARY = re.compile(r"\bFAILED \(([^)]*)\)")
+_PYTEST_SUMMARY = re.compile(r"=+ ([^=]*\bin [\d.]+s\b[^=]*) =+")
+_COUNT = re.compile(r"\b(?:failures|errors)=(\d+)|\b(\d+) (?:failed|errors?)\b")
+# A GitHub `--log-failed` line: `<job>\t<step>\t<timestamp> <text>`. Logs without it are one job.
+_JOB = re.compile(r"^([^\t\n]+)\t[^\t\n]*\t\d{4}-\d\d-\d\dT")
 LOG_BYTES = 2_000_000  # read at most this much of a failed log
 MAX_LISTED = 30  # failing tests listed in an issue or comment
 EXCERPT_LINES = 40
 
 
-def failing_tests(log: str) -> list[str]:
-    log = log[-LOG_BYTES:]
+def _tests(log: str) -> set[str]:
     found = {m.group(1).rstrip(",") for m in _PYTEST.finditer(log)}
     found |= {
         f"{m.group(2)}.{m.group(1)}" if not m.group(2).endswith(m.group(1)) else m.group(2) for m in _UNITTEST.finditer(log)
     }
-    return sorted(found)[:200]
+    return found
+
+
+def _reported(log: str) -> int:
+    """Failures plus errors the runner's own summary lines report (0 when it printed none)."""
+    n = 0
+    for summary in [*_UNITTEST_SUMMARY.findall(log), *_PYTEST_SUMMARY.findall(log)]:
+        n += sum(int(a or b) for a, b in _COUNT.findall(summary))
+    return n
+
+
+def read_failures(log: str) -> tuple[list[str], int, int]:
+    """(failing tests, how many of them were read, how many the runners' summaries report).
+
+    Counted per job, so a test failing in each of a matrix's jobs is one test but one failure per
+    job. Fewer read than reported means the log has failures in a format nohalt does not recognise.
+    """
+    log = _ANSI.sub("", log[-LOG_BYTES:])
+    jobs: dict[str, list[str]] = {}
+    for line in log.splitlines():
+        m = _JOB.match(line)
+        jobs.setdefault(m.group(1) if m else "", []).append(line)
+    found: set[str] = set()
+    read = reported = 0
+    for lines in jobs.values():
+        text = "\n".join(lines)
+        tests, said = _tests(text), _reported(text)
+        found |= tests
+        read += len(tests)
+        reported += max(said, len(tests))
+    return sorted(found)[:200], read, reported
+
+
+def failing_tests(log: str) -> list[str]:
+    return read_failures(log)[0]
 
 
 def _bullets(items: list[str], limit: int = MAX_LISTED) -> str:
@@ -149,8 +190,12 @@ class AsyncWatch:
         return True
 
     # -- red --------------------------------------------------------------------------------------
-    def _failures(self, run: Run) -> tuple[list[str], list[str], str]:
-        """(failing tests, failing jobs, a short excerpt of the failed log). Best effort, bounded."""
+    def _failures(self, run: Run) -> tuple[list[str], list[str], str, str]:
+        """(failing tests, failing jobs, a short excerpt of the failed log, a shortfall note). Best effort, bounded.
+
+        The note is set when the runners' summaries report more failures than were read from the log:
+        the tests are then not the whole story, and a red run must not pass for "the same failures".
+        """
         jobs: list[str] = []
         try:
             jobs = sorted(
@@ -163,23 +208,25 @@ class AsyncWatch:
         except ForgeError:
             pass
         try:
-            log = self.sup.forge.failed_log(run.id)[-LOG_BYTES:]
+            log = _ANSI.sub("", self.sup.forge.failed_log(run.id)[-LOG_BYTES:])
         except ForgeError:
             log = ""
         lines = [ln for ln in log.splitlines() if ln.strip()][-EXCERPT_LINES:]
         excerpt = "\n".join(ln[:300] for ln in lines)[-4000:]
-        return failing_tests(log), jobs, excerpt
+        tests, read, reported = read_failures(log)
+        short = f"Parsed {read} of {reported} failures; the log format may be unrecognised." if reported > read else ""
+        return tests, jobs, excerpt, short
 
     def _red(self, wf: str, w: dict[str, Any], run: Run) -> bool:
         base = self.cfg.project.base_branch
-        tests, jobs, excerpt = self._failures(run)
+        tests, jobs, excerpt, short = self._failures(run)
         sig = tests or [f"job: {j}" for j in jobs]
         n = int(w.get("issue") or 0)
         state = self.sup.issue(n, fresh=True).state if n else ""
         if state == UNKNOWN:
             return False  # never a second issue because the first could not be read
         if state == OPEN:
-            self._again(wf, w, run, n, sig)
+            self._again(wf, w, run, n, sig, short)
             w["failures"] = sig
             return True
         what = ", ".join(f"`{j}`" for j in jobs) or "see the run"
@@ -187,6 +234,7 @@ class AsyncWatch:
             f"The `{wf}` workflow is red on `{base}` at `{run.head_sha}`: [run]({run.url}).\n\n"
             f"Failing jobs: {what}\n\n"
             + (f"Failing tests ({len(tests)}):\n{_bullets(tests)}\n\n" if tests else "")
+            + (f"{short} Read the run's log for the rest.\n\n" if short else "")
             + (f"<details><summary>End of the failed log</summary>\n\n```\n{excerpt}\n```\n</details>\n\n" if excerpt else "")
             + f"`{wf}` does not gate merges (`[integrate] async_workflows`), so `{base}` has moved on since. "
             f"**First check whether the newest `{base}` still fails**: a later commit may already have fixed it. "
@@ -212,22 +260,30 @@ class AsyncWatch:
         self.sup.say(f"async workflow {wf} red on {base} at {run.head_sha[:7]}: opened #{n} at the front of the queue")
         return True
 
-    def _again(self, wf: str, w: dict[str, Any], run: Run, n: int, sig: list[str]) -> None:
-        """A further red run while the workflow's issue is open: comment, and relaunch if the agent has not seen it."""
+    def _again(self, wf: str, w: dict[str, Any], run: Run, n: int, sig: list[str], short: str = "") -> None:
+        """A further red run while the workflow's issue is open: comment, and relaunch if the agent has not seen it.
+
+        A run whose log reports more failures than could be read (``short``) counts as having new ones:
+        "the same failures" would only be the ones nohalt can read.
+        """
         before = set(w.get("failures") or [])
         new, gone = sorted(set(sig) - before), sorted(before - set(sig))
         if not sig:
             delta = "No failing tests could be read from its log."
         elif not new and not gone:
-            delta = f"The same {len(sig)} failure(s) as the last red run."
+            delta = f"The same {len(sig)} failure(s) as the last red run" + (
+                ", among those that could be read." if short else "."
+            )
         else:
             delta = (f"New failures:\n{_bullets(new)}\n\n" if new else "") + (
                 f"No longer failing:\n{_bullets(gone)}\n\n" if gone else ""
             )
             delta += f"{len(sig)} failing in all."
+        if short:
+            delta += f"\n\n{short}"
         rec = self.sup.state.get(n)
         unseen = sorted(set(sig) - set(w.get("acknowledged") or []))
-        relaunch = rec.status == AWAITING_GREEN and bool(unseen)
+        relaunch = rec.status == AWAITING_GREEN and bool(unseen or short)
         tail = ""
         if rec.status == AWAITING_GREEN:
             tail = (
@@ -239,16 +295,22 @@ class AsyncWatch:
             n,
             f"**nohalt:** `{wf}` is red again on `{self.cfg.project.base_branch}` at `{run.head_sha}` ([run]({run.url})).\n\n{delta}{tail}",
         )
-        self.sup.say(f"#{n}: {wf} red again at {run.head_sha[:7]} -- commented" + ("; relaunching" if relaunch else ""))
+        self.sup.say(
+            f"#{n}: {wf} red again at {run.head_sha[:7]} -- commented"
+            + (f"; {short[0].lower()}{short[1:]}" if short else "")
+            + ("; relaunching" if relaunch else "")
+        )
         if relaunch:
             self.sup._requeue(
                 rec,
-                f"{wf} red again at {run.head_sha[:7]} with failures the agent has not seen",
+                f"{wf} red again at {run.head_sha[:7]} with failures the agent has not seen"
+                + (" (some unreadable in its log)" if short else ""),
                 resume=False,
                 fresh=True,
-                note=f"`{wf}` went red again on `{self.cfg.project.base_branch}` at `{run.head_sha}` ({run.url}), "
-                f"with failures your earlier no-change finding did not cover:\n{_bullets(unseen)}\n\n"
-                "Look at these on the newest base. Fix them forward in a pull request, or, if they too are already fixed, "
+                note=f"`{wf}` went red again on `{self.cfg.project.base_branch}` at `{run.head_sha}` ({run.url})"
+                + (f", with failures your earlier no-change finding did not cover:\n{_bullets(unseen)}" if unseen else ".")
+                + (f"\n\n{short} Read the run's log for failures not listed here." if short else "")
+                + "\n\nLook at these on the newest base. Fix them forward in a pull request, or, if they too are already fixed, "
                 "end with `NOHALT-RESULT: no-change -- <reason>` again.",
             )
 
