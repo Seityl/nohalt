@@ -430,6 +430,11 @@ def render_status(cfg: Config) -> str:
         lines.append("")
         lines.append("^ overflowed (not pinned; the next launch is routed as usual):")
         lines.extend(f"  #{r.issue}: {r.overflow}" for r in overflows)
+    pins = [r for r in recs if r.pin_cooling and r.status not in (QUEUED, BLOCKED)]
+    if pins:
+        lines.append("")
+        lines.append('pinned, launched on a pool cooling down for a usage warning ([models] pinned_during_cooldown = "warning"):')
+        lines.extend(f"  #{r.issue}: {r.model}; {r.pin_cooling}" for r in pins[:15])
     early = [r for r in recs if r.early_on]
     if early:
         lines.append("")

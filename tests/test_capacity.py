@@ -320,6 +320,62 @@ def test_during_cooldown_is_checked(tmp_path):
         config_mod.from_dict({"project": {"repo": "o/r"}, "review": {"during_cooldown": "always"}}, root=tmp_path)
 
 
+# -- pinned issues during a warning cool-down (MOD-17) ------------------------------------------------------------
+def pinned_in_cooldown(w, kind: str, hours: float):  # type: ignore[no-untyped-def]
+    cool(w, kind, hours)
+    w.issue(1, "close")
+    w.issue(2, "close")
+    w.sup.router.pin(1, "command:claude")
+    w.sup.tick()
+    return w.rec(1), w.rec(2)
+
+
+def test_a_pinned_issue_starts_through_a_warning_cool_down(world):
+    """MOD-17: with pinned_during_cooldown = "warning", the owner's pin starts on a pool only a warning cools down."""
+    w = usage_world(world, pinned_during_cooldown="warning")
+    r1, r2 = pinned_in_cooldown(w, "warning", 32)
+    assert r1.status == RUNNING and r1.model == "command:claude"
+    assert "command:claude cooling down (seven_day)" in r1.pin_cooling and not r1.overflow
+    assert any("a warning: pinned issues still start there" in e for e in r1.history)
+    assert r2.model == "command:local" and r2.overflow.startswith("capacity:")  # unpinned work still diverts
+    assert any("#1: agent launched on command:claude" in m and "pinned issues still start" in m for m in w.messages)
+    status = cli.render_status(w.cfg)
+    assert "pinned, launched on a pool cooling down for a usage warning" in status
+    assert "#1: command:claude; command:claude cooling down" in status
+    w.wait_agents()
+
+
+def test_a_pinned_issue_waits_through_a_hard_limit_even_with_the_setting(world):
+    w = usage_world(world, pinned_during_cooldown="warning")
+    r1, _ = pinned_in_cooldown(w, "limit", 5)
+    assert not r1.started_at and not r1.pin_cooling
+    assert "pinned, launched on a pool" not in cli.render_status(w.cfg)
+    w.wait_agents()
+
+
+def test_a_limit_during_the_warning_makes_pinned_issues_wait_again(world):
+    w = usage_world(world, pinned_during_cooldown="warning")
+    cool(w, "warning", 32)
+    cool(w, "limit", 5, source="#7")  # sooner than the warning's reset: hardens it without moving it
+    w.issue(1, "close")
+    w.sup.router.pin(1, "command:claude")
+    w.sup.tick()
+    assert not w.rec(1).started_at
+
+
+def test_by_default_a_pinned_issue_waits_through_a_warning(world):
+    w = usage_world(world)
+    r1, r2 = pinned_in_cooldown(w, "warning", 32)
+    assert not r1.started_at and not r1.pin_cooling
+    assert r2.model == "command:local"
+    w.wait_agents()
+
+
+def test_pinned_during_cooldown_is_checked(tmp_path):
+    with pytest.raises(config_mod.ConfigError, match="pinned_during_cooldown"):
+        config_mod.from_dict({"project": {"repo": "o/r"}, "models": {"pinned_during_cooldown": "yes"}}, root=tmp_path)
+
+
 def test_claude_stream_lines_carry_the_window_and_reset():
     from nohalt.agents.claude_stream import render
 
