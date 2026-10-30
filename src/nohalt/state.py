@@ -48,6 +48,7 @@ class IssueRecord:
     not_before: float = 0.0  # backoff: do not relaunch before this time
     stalled_since: float = 0.0  # launchable but no slot for its model since then (overflow clock)
     overflow: str = ""  # why the current launch is on an overflow model; "" when routed as usual
+    pin_cooling: str = ""  # the warning cool-down the current launch was let through, pinned ([models] pinned_during_cooldown)
     hold_model: str = ""  # stopped by its model's usage limit: waits for that model and resumes there (MOD-07)
     down_waiting: float = 0.0  # since when its endpoint failures went uncounted because its model was down
     branch: str = ""

@@ -22,7 +22,10 @@ Capacity (``capacity.py``): a model that is **down** (an endpoint storm, or
 probes failing in a row) or whose pool is **cooling down** after a usage-limit
 signal does not answer, so it is not chosen; an unpinned issue routed to it is
 diverted at once to a fallback or an overflow target (``divert``), with the same
-premium rule overflow keeps. A pinned issue waits.
+premium rule overflow keeps. A pinned issue waits -- unless ``[models]
+pinned_during_cooldown = "warning"`` and only a usage warning cools the pool
+down (``pin_through_warning``): a pin is the owner's choice, so it starts there.
+A hard limit still makes it wait.
 """
 
 from __future__ import annotations
@@ -67,6 +70,10 @@ class Router:
         pins.pop(str(issue), None)
         self.state.save("pins.json", pins)
 
+    def pin_through_warning(self, issue: int) -> bool:
+        """The issue is pinned and ``[models] pinned_during_cooldown = "warning"``: a warning cool-down is no reason to wait (#81)."""
+        return self.cfg.models.pinned_during_cooldown == "warning" and bool(self.pinned(issue))
+
     def approved(self, issue: int) -> bool:
         return issue in set(self.state.load("approved.json", []))
 
@@ -88,7 +95,11 @@ class Router:
         return model
 
     def choose(
-        self, issue: Issue, has_slot: Callable[[str], bool] | None = None, want: tuple[str, bool] | None = None
+        self,
+        issue: Issue,
+        has_slot: Callable[[str], bool] | None = None,
+        want: tuple[str, bool] | None = None,
+        warned_ok: bool = False,
     ) -> str | None:
         """The model to launch with now, or None if nothing suitable answers.
 
@@ -96,12 +107,14 @@ class Router:
         for the wanted model means wait (overflow decides when waiting is
         enough); a fallback is taken only if its own pool has room. ``want``
         overrides routing: ``(model, True)`` holds an issue to one model.
+        ``warned_ok``: a pinned model whose pool only a usage warning cools down
+        may still be chosen (``pin_through_warning``).
         """
         free = has_slot or (lambda _m: True)
         model, pinned = want or self.wanted(issue)
         if not free(model):
             return None
-        if self.prober.answers(model):
+        if self.prober.answers(model, True) if warned_ok and pinned else self.prober.answers(model):
             return model
         if pinned:
             return None

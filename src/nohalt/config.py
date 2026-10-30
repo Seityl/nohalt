@@ -97,6 +97,7 @@ class ModelsCfg:
     down_probe_max: int = 30 * 60  # ... up to this
     down_block_after: int = 6 * 3600  # block for endpoint reasons only when the model and every fallback were down this long
     usage_cooldown: int = 3600  # a pool's cool-down after a usage signal that reports no reset time
+    pinned_during_cooldown: str = "none"  # "warning": a pinned issue may start on a pool cooling down for a usage warning (#81)
 
 
 @dataclass
@@ -403,6 +404,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[agents] max_attempts must be at least 1")
     if cfg.review.max_rounds < 0 or cfg.review.attempts < 1:
         raise ConfigError("[review] max_rounds must be at least 0 and attempts at least 1")
+    if cfg.models.pinned_during_cooldown not in ("none", "warning"):
+        raise ConfigError(f"[models] pinned_during_cooldown must be none or warning, got {cfg.models.pinned_during_cooldown!r}")
     if cfg.review.during_cooldown not in ("none", "warning"):
         raise ConfigError(f"[review] during_cooldown must be none or warning, got {cfg.review.during_cooldown!r}")
     if isinstance(cfg.review.prompt, str):
