@@ -20,7 +20,7 @@ from . import __version__
 from . import config as config_mod
 from . import queue as queue_mod
 from .config import Config, ConfigError
-from .state import AWAITING_GREEN, BLOCKED, IN_REVIEW, QUEUED, RUNNING, FileLock, StateStore
+from .state import AWAITING_GREEN, BLOCKED, IN_REVIEW, QUEUED, RUNNING, WAITING_CI, FileLock, IssueRecord, StateStore
 from .util import now, parse_duration, pid_alive, stamp, tail
 
 if TYPE_CHECKING:
@@ -457,6 +457,7 @@ def render_status(cfg: Config) -> str:
                 for r in reviewed[:15]
             )
         )
+    lines.extend(_waiting_ci_status(cfg, recs))
     warned = [r for r in recs if r.review_cooling]
     if warned:
         lines.append("")
@@ -479,6 +480,21 @@ def render_status(cfg: Config) -> str:
             + ("  -- COMPLETE" if snap.get("complete") else "")
         )
     return "\n".join(lines)
+
+
+def _waiting_ci_status(cfg: Config, recs: list[IssueRecord]) -> list[str]:
+    """Heads waiting in waiting_ci for longer than ``[agents] waiting_ci_warn``: CI that never comes (#82)."""
+    from .integrate.windows import duration
+
+    warn, t = cfg.agents.waiting_ci_warn, now()
+    slow = [r for r in recs if warn and r.status == WAITING_CI and r.waiting_since and t - r.waiting_since >= warn]
+    if not slow:
+        return []
+    out = ["", f"WAITING_CI for longer than {duration(warn)} (no CI coming? read the PR):"]
+    for r in sorted(slow, key=lambda r: r.waiting_since)[:15]:
+        conflict = f", conflicting with the base for {duration(t - r.conflict_since)}" if r.conflict_since else ""
+        out.append(f"  #{r.issue}: PR #{r.pr} at {r.waiting_sha[:8]} for {duration(t - r.waiting_since)}{conflict}")
+    return out
 
 
 def cmd_verify(args: argparse.Namespace) -> int:

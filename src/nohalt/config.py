@@ -63,6 +63,8 @@ class AgentsCfg:
     revive_limit: int = 2
     revive_grace: int = 15 * 60
     ci_rounds: int = 3
+    conflict_wait: int = 15 * 60  # a PR conflicting this long in waiting_ci is refreshed or handed back, checks or not (#82)
+    waiting_ci_warn: int = 2 * 3600  # `nohalt status` flags a head waiting in waiting_ci longer than this. 0: never
     log_max_mb: int = 20
     title_prefix: str = "nohalt"
     pools: dict[str, int] = field(default_factory=dict)  # model prefix -> own slot cap
@@ -295,8 +297,10 @@ _DURATIONS = {
     "down_probe_max",
     "down_block_after",
     "usage_cooldown",
+    "conflict_wait",
+    "waiting_ci_warn",
 }
-_OFF_WHEN_EMPTY = {"overflow_after", "live_timeout"}
+_OFF_WHEN_EMPTY = {"overflow_after", "live_timeout", "waiting_ci_warn"}
 
 
 def _build(cls: type, data: dict[str, Any], where: str) -> Any:

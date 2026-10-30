@@ -45,11 +45,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..forge import ForgeError, PullRequest
+from ..forge import Check, ForgeError, PullRequest
+from ..forge.base import GREEN, PENDING
 from ..state import IN_REVIEW, RUNNING, WAITING_CI, IssueRecord, StateStore
 from ..util import now, run
 from ..worktree import GitError, git
 from .mergers import driver_for, effective, resolve
+from .windows import duration
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -64,10 +66,13 @@ SETTLES = "settles"  # a dry run: the drivers settle every conflict; nothing was
 IDENT = ["-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost"]
 HISTORY_DAYS = 14
 FETCH_EVERY = 30  # seconds between fetches for dry runs: one per tick, not one per PR
+CONFLICT_POLL = 300  # seconds between mergeability reads of one PR whose checks are pending (#82)
+_OK = {"success", "skipped", "neutral", "cancelled"}
 
 TRIALS = "trial_merges.json"  # "<PR head>:<base>" -> the drivers settle their merge; kept across restarts (#78)
 TRIALS_KEPT = 500
 _fetched: dict[str, float] = {}  # refresh tree -> when dry runs last fetched it
+_polled: dict[tuple[str, int], float] = {}  # (state dir, PR number) -> when stuck_conflict last read its mergeability
 
 
 @dataclass
@@ -282,6 +287,10 @@ def _remember(state: StateStore, head: str, base_sha: str, settles: bool) -> Non
 
 def before_hand_back(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> bool:
     """Try a refresh before handing ``pr`` back for conflicts. True: do not hand it back now."""
+    return _try_refresh(sup, rec, pr).handled
+
+
+def _try_refresh(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> Outcome:
     out = refresh(sup, rec, pr)
     base = sup.cfg.project.base_branch
     if out.status == REFRESHED:
@@ -296,7 +305,77 @@ def before_hand_back(sup: Supervisor, rec: IssueRecord, pr: PullRequest) -> bool
         if out.files:
             record_conflicts(sup.state, rec.issue, out.files)
         sup.state.log(f"#{rec.issue}: no refresh for {sup.pr(pr.number)} ({out.why}); handing back")
-    return out.handled
+    return out
+
+
+def stuck_conflict(sup: Supervisor, rec: IssueRecord, pr: PullRequest, checks: list[Check], v: str) -> bool:
+    """A conflicting PR in ``waiting_ci`` does not wait for CI that never comes (#82). True: handled this tick.
+
+    The watcher reads mergeability only when the checks are green or absent, and acts once per head.
+    GitHub runs no pull-request CI on a PR whose merge it cannot build, so a conflicting PR with other
+    checks pending, or with a head handed back already that came back unmoved, waited for hours. So:
+
+    * a red check on a conflicting PR is red: handed back now, with the checks and the conflict;
+    * conflicting for ``[agents] conflict_wait``: refreshed if the merge drivers settle it, otherwise
+      handed back with the paths left in conflict. A head handed back before is handed back again, a
+      round each time, so it ends blocked for a human instead of waiting.
+
+    Anything else (mergeable, not known yet, green or red without a hand-back yet) is left to the watcher.
+    """
+    swept = pr.head_sha in rec.swept
+    if rec.status != WAITING_CI or not (swept or (checks and v == PENDING)):
+        return False
+    if v == GREEN and left_to_batch(sup, rec, pr):
+        return False  # train: the batch settles it, and the watcher sends it on (#69)
+    mergeable = pr.mergeable
+    key = (str(sup.cfg.state_dir), pr.number)
+    if mergeable is None and now() - _polled.get(key, 0) >= CONFLICT_POLL:
+        _polled[key] = now()  # the PR listing carries no mergeability: one read per PR per poll
+        try:
+            mergeable = sup.forge.pull(pr.number).mergeable
+        except ForgeError:
+            return False
+    if mergeable is not False:
+        if mergeable and rec.conflict_since:
+            rec.conflict_since = 0.0
+            sup.state.put(rec)
+        return False
+    base = sup.cfg.project.base_branch
+    if not rec.conflict_since:
+        rec.conflict_since = now()
+        rec.event(f"{sup.pr(pr.number)} conflicts with {base} while waiting for CI")
+        sup.state.put(rec)
+    red = [c for c in checks if c.status == "completed" and c.conclusion not in _OK]
+    if red and not swept:
+        detail = "\n".join(f"- {c.name}: {c.conclusion} {c.url}" for c in red[:10])
+        sup._hand_back(
+            rec,
+            pr,
+            "CI is red and it conflicts with the base branch",
+            f"CI is red on your {sup.pr_long(pr.number)} (head {pr.head_sha[:8]}):\n{detail}\n\n"
+            f"It also conflicts with `{base}`, so no new CI runs on it until that is fixed. Fetch and merge "
+            f"`origin/{base}` into your branch, keeping both sides' behaviour, fix what is red and yours, "
+            "run the tests you touched, push, and stop once pushed.",
+        )
+        return True
+    waited = now() - rec.conflict_since
+    if waited < sup.cfg.agents.conflict_wait:
+        return True  # neither CI nor a hand-back yet: the watcher has nothing to add
+    out = _try_refresh(sup, rec, pr)
+    if out.handled:
+        return True
+    files = "".join(f"\n- `{f}`" for f in out.files[:30])
+    sup._hand_back(
+        rec,
+        pr,
+        f"conflicts with the base branch (waited {duration(waited)} in waiting_ci)",
+        f"Your {sup.pr_long(pr.number)} has conflicted with `{base}` for {duration(waited)}, and the forge runs no CI "
+        f"on it until that is fixed. "
+        + (f"Left in conflict:{files}\n\n" if files else "")
+        + f"Fetch and merge `origin/{base}` into your branch, keeping both sides' behaviour, re-run the tests you "
+        "touched, push, and stop.",
+    )
+    return True
 
 
 def _ensure_tree(cfg: Config, tree: Path) -> None:
