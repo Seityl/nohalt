@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.2](https://github.com/Seityl/nohalt/compare/v0.2.1...v0.2.2) (2026-10-30)
+
+
+### Features
+
+* **models:** pinned issues may start on a pool cooling down for a usage warning ([#83](https://github.com/Seityl/nohalt/issues/83)) ([1d46e3d](https://github.com/Seityl/nohalt/commit/1d46e3d296c140caa6b7123b2be2ef1cd11c9b18))
+* **review:** reviews may run on a pool cooling down for a usage warning ([#77](https://github.com/Seityl/nohalt/issues/77)) ([7429c13](https://github.com/Seityl/nohalt/commit/7429c13f02c0ce33b27f84b24506d65d1f251588))
+* **train:** approved PRs go first, and join a batch whose CI has not started ([#72](https://github.com/Seityl/nohalt/issues/72)) ([786b052](https://github.com/Seityl/nohalt/commit/786b052d78bd1b94ae0dd0e0a6eb752f7a1c542d))
+
+
+### Bug Fixes
+
+* **async:** read Frappe's test log and distrust a failure count below the summary's ([#84](https://github.com/Seityl/nohalt/issues/84)) ([909ab5e](https://github.com/Seityl/nohalt/commit/909ab5ec0e9c678390318f03cca7cf38f850f3db))
+* **review:** a PR-description edit is a change the review gate re-reviews ([#75](https://github.com/Seityl/nohalt/issues/75)) ([7cc325a](https://github.com/Seityl/nohalt/commit/7cc325accf8ed25815a239f6b6e4bbb50f5cf6e2))
+* **train:** unknown mergeability no longer drops a PR silently; left-to-batch logged once ([#85](https://github.com/Seityl/nohalt/issues/85)) ([b98aa8a](https://github.com/Seityl/nohalt/commit/b98aa8accc316e186fcb87cb7fdb624d0e56c232))
+* **watch:** a conflicting PR in waiting_ci is refreshed or handed back, not left waiting ([#86](https://github.com/Seityl/nohalt/issues/86)) ([1e5ae74](https://github.com/Seityl/nohalt/commit/1e5ae74b9501d6fa4757d1df4da01e6028f1476d))
+
 ## [0.2.1](https://github.com/Seityl/nohalt/compare/v0.2.0...v0.2.1) (2026-10-28)
 
 
