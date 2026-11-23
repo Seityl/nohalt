@@ -36,6 +36,8 @@ ci_rounds = 3                # red / conflicting PRs handed back to an agent
 [models]
 default = "opencode:anthropic/claude-sonnet-4-5"
 # pinned_during_cooldown = "warning"   # pinned issues may still start on a pool a usage *warning* cools down (not a limit)
+# fail_back = "relaunch"               # move a running agent off its fallback once the wanted model is back ...
+# fail_back_after = "15m"              # ... and has been available this long (at least 15m)
 fallbacks = []               # tried in order when the default does not answer a probe
 # premium = ["claude-code:opus"]       # only on issues approved with `nohalt route <n> <model> --approve`
 # premium_fallback = "claude-code:sonnet"

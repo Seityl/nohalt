@@ -14,7 +14,8 @@ Two kinds of trouble are about a model, not about any one issue:
   ``rate_limit five_hour rejected`` and the like) cools down the model's pool --
   the ``[agents] pools`` prefix it belongs to, or the model itself -- until the
   reset time the line reports, else for ``usage_cooldown``. New launches avoid a
-  cooling pool. Running agents are not touched. A limit is remembered apart
+  cooling pool. Running agents are not touched (``[models] fail_back`` moves them back
+  once it is over). A limit is remembered apart
   (``hard_until``): with ``[review] during_cooldown = "warning"`` a reviewer may
   still start on a pool that only a warning cools down, never on one at its limit.
 

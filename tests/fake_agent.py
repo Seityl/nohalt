@@ -13,6 +13,7 @@ Each launch pops the first line of ``<script-dir>/<issue>.txt`` and acts it out:
     push-green       commit and push to the branch; its open PR moves to the new head, green
     setup-fail       die the way an agent dies when its CLI is not logged in
     busy <seconds>   run a quiet shell command that long (a test run, not a hang)
+    test <seconds> <after>  run a command named like a test run that long, then sleep <after>
     provider-error   die the way an agent dies when the model server is down
     usage-limit [<reset>]  stop on a subscription usage limit (reset: epoch seconds the window resets)
     usage-warning <reset> <seconds>  report being close to the usage limit, then run that long
@@ -158,6 +159,10 @@ def main() -> int:
         open_pr(forge, issue, action[3:], base=os.environ.get("NOHALT_BASE_BRANCH", "main"))
     elif action == "push-green":
         push_green(forge, issue)
+    elif action.startswith("test "):
+        _, secs, after = action.split()
+        subprocess.run([sys.executable, "-c", f"import time; time.sleep({secs})", "pytest"], check=False)
+        time.sleep(float(after))
     elif action.startswith("busy"):
         secs = action.split()[1]
         subprocess.run(["bash", "-c", f"{sys.executable} -c 'import time; time.sleep({secs})'"], check=False)
