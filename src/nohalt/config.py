@@ -100,6 +100,8 @@ class ModelsCfg:
     down_block_after: int = 6 * 3600  # block for endpoint reasons only when the model and every fallback were down this long
     usage_cooldown: int = 3600  # a pool's cool-down after a usage signal that reports no reset time
     pinned_during_cooldown: str = "none"  # "warning": a pinned issue may start on a pool cooling down for a usage warning (#81)
+    fail_back: str = "off"  # "relaunch": a running agent on another model moves to the wanted one once it is back (#88)
+    fail_back_after: int = 15 * 60  # ... and has been available this long (at least 15m)
 
 
 @dataclass
@@ -297,6 +299,7 @@ _DURATIONS = {
     "down_probe_max",
     "down_block_after",
     "usage_cooldown",
+    "fail_back_after",
     "conflict_wait",
     "waiting_ci_warn",
 }
@@ -410,6 +413,10 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[review] max_rounds must be at least 0 and attempts at least 1")
     if cfg.models.pinned_during_cooldown not in ("none", "warning"):
         raise ConfigError(f"[models] pinned_during_cooldown must be none or warning, got {cfg.models.pinned_during_cooldown!r}")
+    if cfg.models.fail_back not in ("off", "relaunch"):
+        raise ConfigError(f"[models] fail_back must be off or relaunch, got {cfg.models.fail_back!r}")
+    if cfg.models.fail_back_after < 15 * 60:
+        raise ConfigError("[models] fail_back_after must be at least 15m: a model that just came back may not stay")
     if cfg.review.during_cooldown not in ("none", "warning"):
         raise ConfigError(f"[review] during_cooldown must be none or warning, got {cfg.review.during_cooldown!r}")
     if isinstance(cfg.review.prompt, str):

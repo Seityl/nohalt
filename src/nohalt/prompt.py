@@ -241,3 +241,20 @@ def reopen_note(comments: list[Comment], *, since_known: bool, branch: str, old_
         body = c.body if len(c.body) <= 4000 else c.body[:4000] + "\n[... cut; read the issue for the rest]"
         lines.append(f"\n--- {c.author}{when}\n{body}")
     return "\n".join(lines)
+
+
+def fail_back_note(previous: str, branch: str, kept: list[str]) -> str:
+    """What an agent relaunched by a fail-back is told: it continues another model's work (#88)."""
+    lines = [
+        f"You are continuing work that another agent, on {previous}, started on this issue in this worktree. "
+        "It was stopped only so the work could move to the model this issue is routed to, now that it is "
+        "available again: the work is not finished and nothing was judged."
+    ]
+    if kept:
+        lines.append("Its work was kept: " + "; ".join(kept) + ".")
+    lines.append(
+        f"Before changing anything, read `git log` and `git status` on `{branch}`, its pull request if there is one, "
+        "and its comments on the issue, then carry on from where it stopped. A `wip:` commit may be squashed or "
+        "reworded; do not undo work you have not checked."
+    )
+    return "\n".join(lines)

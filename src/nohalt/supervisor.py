@@ -30,6 +30,7 @@ Rules that hold throughout:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -75,6 +76,8 @@ EXITED = "exited"  # agent gone; verdict pending (the forge could not be asked)
 # agent CLIs by name, or a node/bun runtime whose command line names one of them.
 AGENT_NAMES = ("opencode", "claude")
 AGENT_RUNTIMES = {"node", "bun"}
+# A command an agent runs that a fail-back waits for: a verify or a test run (#88).
+VERIFYING = re.compile(r"\b(verify|pytest|run-tests|unittest|tox|nox|jest|vitest|mocha|test|tests)\b")
 
 
 def _is_agent_process(pid: int) -> bool:
@@ -387,6 +390,7 @@ class Supervisor:
         if self.cfg.integrate.async_workflows and not self.dry_run:
             self.async_watch.tick()
         self._capacity_tick()
+        self._fail_back(report)
         self._launch(report)
         if self.cfg.budget.enabled and not self.dry_run:
             self._budget()
@@ -476,7 +480,7 @@ class Supervisor:
 
     def _judge(self, rec: IssueRecord, report: TickReport) -> None:
         """The agent is gone. Decide what that means -- asking the forge, not the agent."""
-        killed = rec.last_exit if rec.last_exit in ("timeout", "hung", "handover", "stopped") else ""
+        killed = rec.last_exit if rec.last_exit in ("timeout", "hung", "handover", "stopped", "fail_back") else ""
         issue = self.issue(rec.issue, fresh=True)
         if issue.state == UNKNOWN:
             if rec.status != EXITED:
@@ -497,6 +501,8 @@ class Supervisor:
             return self._requeue(rec, "moved to another model by the budget guard", resume=True)
         if killed == "stopped":
             return self._requeue(rec, "the supervisor was stopped", resume=True)
+        if killed == "fail_back":
+            return self._failed_back(rec)
         if agent and agent.usage_limited(log_tail):
             return self._usage_limited(rec, agent, log_tail)
         if not killed and agent and ran_for < 300 and agent.setup_failed(log_tail):
@@ -843,6 +849,17 @@ class Supervisor:
         after = self.cfg.models.overflow_after
         return bool(after and not pinned and rec.stalled_since and now() - rec.stalled_since >= after)
 
+    def _slots_in_use(self) -> dict[str, int]:
+        """Pool prefix -> running agents and reviewers in it."""
+        in_use: dict[str, int] = {}
+        for r in self.state.all():
+            if r.status == RUNNING:
+                p = self._pool_of(r.model)
+                in_use[p] = in_use.get(p, 0) + 1
+        for p, n in self.reviews.in_use().items():
+            in_use[p] = in_use.get(p, 0) + n
+        return in_use
+
     def _launch(self, report: TickReport) -> None:
         try:
             entries = queue.load(self.cfg.queue_file)
@@ -851,13 +868,7 @@ class Supervisor:
             return
         stopping = self.state.has("STOP") or self.state.has("PAUSE")
         records = {r.issue: r for r in self.state.all()}
-        in_use: dict[str, int] = {}
-        for r in records.values():
-            if r.status == RUNNING:
-                p = self._pool_of(r.model)
-                in_use[p] = in_use.get(p, 0) + 1
-        for p, n in self.reviews.in_use().items():
-            in_use[p] = in_use.get(p, 0) + n
+        in_use = self._slots_in_use()
 
         reopened = self._reopened([records[e.issue] for e in entries if e.issue in records and records[e.issue].status == DONE])
         open_count = 0
@@ -1173,6 +1184,7 @@ class Supervisor:
         pids[str(issue.number)] = _pid_start(proc.pid)
         self.state.save("pids.json", pids)
 
+        self._fail_back_launched(rec, model)
         rec.status, rec.pid, rec.model, rec.started_at = RUNNING, proc.pid, model, now()
         rec.branch, rec.worktree, rec.log = branch, str(tree), str(log)
         rec.resume = rec.fresh = False
@@ -1322,6 +1334,89 @@ class Supervisor:
             "this is the model endpoints, not the issue -- `nohalt status` shows what is down",
         )
         return True
+
+    # -- fail-back: a running agent moves to the wanted model once it is back (#88) -------------------------------
+    def _fail_back(self, report: TickReport) -> None:
+        """``[models] fail_back = "relaunch"``: stop an agent on another model at a safe point and relaunch it on the wanted one."""
+        if self.cfg.models.fail_back != "relaunch" or self.dry_run or self.state.has("STOP") or self.state.has("PAUSE"):
+            return
+        for rec in self.state.all():
+            if rec.status != RUNNING or not self._alive(rec):
+                continue
+            target = self._fail_back_due(rec)
+            if not target:
+                continue
+            if self._verifying(rec.pid):
+                self.state.log(f"#{rec.issue}: fail-back to {target} deferred: a verify or test command is running")
+                continue
+            rec.failed_back = f"from {rec.model} to {target} after {self._ago(now() - rec.started_at)}"
+            self._kill(rec, "fail_back", f"failing back to {target}, available again")
+            self._judge(rec, report)
+            self._fail_back_relaunch(self.state.get(rec.issue), target)
+
+    def _fail_back_due(self, rec: IssueRecord) -> str:
+        """The model a running agent should move to now, or "". Keeps the clock: since when that model can take it."""
+        issue = self.issue(rec.issue)
+        model, pinned = self._wanted(rec, issue)
+        since = rec.fail_back_since
+        if model == rec.model or issue.state == UNKNOWN:
+            rec.fail_back_since = 0.0
+        else:
+            warned_ok = pinned and self.router.pin_through_warning(rec.issue)
+            in_use = self._slots_in_use()
+            own = self._pool_of(rec.model)
+            in_use[own] = in_use.get(own, 1) - 1  # its own slot is freed by the move
+            back = self._has_slot(model, in_use) and self.router.prober.answers(model, warned_ok)
+            rec.fail_back_since = (since or now()) if back else 0.0
+        if rec.fail_back_since != since:
+            self.state.put(rec)
+        due = rec.fail_back_since and now() - rec.fail_back_since >= self.cfg.models.fail_back_after
+        return model if due else ""
+
+    def _verifying(self, pid: int) -> bool:
+        """Is the agent running a verify or test command now? A fail-back waits for it to finish."""
+        for p in descendants(pid):
+            if _is_agent_process(p):
+                continue
+            try:
+                cmd = Path(f"/proc/{p}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError:
+                continue
+            if VERIFYING.search(cmd):
+                return True
+        return False
+
+    def _failed_back(self, rec: IssueRecord) -> None:
+        """The agent was stopped to fail back: keep its work, requeue it as no attempt and not finished."""
+        moved = rec.failed_back or f"from {rec.model}"
+        tree = Path(rec.worktree) if rec.worktree else None
+        try:
+            kept = self.trees.save_work(rec.issue, tree, rec.branch, f"stopped to fail back {moved}") if tree else []
+        except GitError as e:
+            kept = [f"saving its work failed ({e}); what it left is in the worktree"]
+        self.say(f"#{rec.issue}: work of the stopped agent: " + ("; ".join(kept) or "nothing uncommitted, nothing to push"))
+        self._requeue(rec, f"failed back {moved}", resume=True, note=prompt_mod.fail_back_note(rec.model, rec.branch, kept))
+
+    def _fail_back_relaunch(self, rec: IssueRecord, model: str) -> None:
+        """Relaunch at once on the wanted model, before a queued issue takes its free slot. On failure, the queue relaunches it."""
+        if rec.status != QUEUED:
+            return
+        try:
+            self.launch(rec, self.issue(rec.issue), model)
+        except (early_mod.NoEarlyStart, GitError, prompt_mod.PromptError, OSError, ValueError) as e:
+            self.say(f"#{rec.issue}: relaunch on {model} failed ({e}); it waits in the queue")
+
+    def _fail_back_launched(self, rec: IssueRecord, model: str) -> None:
+        """A launch: the fail-back clock starts over; the fail-back mark stays only on the launch that failed back."""
+        rec.fail_back_since = 0.0
+        if not rec.failed_back.startswith(f"from {rec.model} to {model} "):
+            rec.failed_back = ""
+
+    @staticmethod
+    def _ago(seconds: float) -> str:
+        from .capacity import ago
+
+        return ago(seconds)
 
     # -- 5. budget -------------------------------------------------------------------------------------------
     def _budget(self) -> None:

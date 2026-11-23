@@ -160,24 +160,35 @@ class Worktrees:
         name = f"nohalt/rescued-{issue}-{stamp().replace(' ', 'T').replace(':', '').replace('-', '')}"
         current = git(tree, "rev-parse", "--abbrev-ref", "HEAD", check=False)
         git(tree, "checkout", "-q", "-b", name)
+        self._commit_all(tree, f"nohalt: work left uncommitted on {current} by #{issue}")
+        return name
+
+    def _commit_all(self, tree: Path, message: str) -> None:
+        """Commit everything uncommitted in ``tree`` except the shared paths, as nohalt."""
         for rel in self.cfg.project.shared_paths:
             git(tree, "rm", "-q", "--cached", "--ignore-unmatch", rel, check=False)
         git(tree, "add", "-A")
         for rel in self.cfg.project.shared_paths:
             git(tree, "reset", "-q", "--", rel, check=False)
-        git(
-            tree,
-            "-c",
-            "user.name=nohalt",
-            "-c",
-            "user.email=nohalt@localhost",
-            "commit",
-            "-q",
-            "--no-verify",
-            "-m",
-            f"nohalt: work left uncommitted on {current} by #{issue}",
-        )
-        return name
+        git(tree, "-c", "user.name=nohalt", "-c", "user.email=nohalt@localhost", "commit", "-q", "--no-verify", "-m", message)
+
+    def save_work(self, issue: int, tree: Path, branch: str, why: str) -> list[str]:
+        """Keep a stopped agent's work for the next one: a ``wip:`` commit of what is uncommitted, then a push.
+
+        Returns what was done, in words for the next agent. Nothing is lost when
+        the push fails: the next agent works in the same tree.
+        """
+        done: list[str] = []
+        if self.dirty(tree):
+            self._commit_all(tree, f"wip: #{issue} {why}")
+            done.append("its uncommitted changes were committed as `wip:`")
+        if self.commits_ahead(tree):
+            try:
+                git(tree, "push", "-q", self.remote, f"HEAD:refs/heads/{branch}")
+                done.append(f"its commits were pushed to `{branch}`")
+            except GitError as e:
+                done.append(f"its commits are in the worktree; the push failed ({str(e)[:200]})")
+        return done
 
     def remove(self, issue: int) -> str:
         """Remove an issue's worktree, rescuing uncommitted work first."""

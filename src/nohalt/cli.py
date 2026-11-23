@@ -430,6 +430,11 @@ def render_status(cfg: Config) -> str:
         lines.append("")
         lines.append("^ overflowed (not pinned; the next launch is routed as usual):")
         lines.extend(f"  #{r.issue}: {r.overflow}" for r in overflows)
+    failed_back = [r for r in recs if r.failed_back and r.status not in (QUEUED, BLOCKED)]
+    if failed_back:
+        lines.append("")
+        lines.append("failed back to the wanted model once it was available again ([models] fail_back):")
+        lines.extend(f"  #{r.issue}: failed back {r.failed_back}" for r in failed_back[:15])
     pins = [r for r in recs if r.pin_cooling and r.status not in (QUEUED, BLOCKED)]
     if pins:
         lines.append("")
